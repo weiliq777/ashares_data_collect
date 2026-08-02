@@ -1,0 +1,12 @@
+CREATE INDEX IF NOT EXISTS idx_tushare_daily_raw_trade_date ON tushare_daily_raw (trade_date);
+CREATE INDEX IF NOT EXISTS idx_tushare_daily_raw_code ON tushare_daily_raw (ts_code);
+CREATE INDEX IF NOT EXISTS idx_tushare_daily_basic_raw_trade_date ON tushare_daily_basic_raw (trade_date);
+CREATE INDEX IF NOT EXISTS idx_tushare_daily_basic_raw_code ON tushare_daily_basic_raw (ts_code);
+CREATE INDEX IF NOT EXISTS idx_tushare_adj_factor_raw_trade_date ON tushare_adj_factor_raw (trade_date);
+CREATE INDEX IF NOT EXISTS idx_tushare_adj_factor_raw_code ON tushare_adj_factor_raw (ts_code);
+CREATE INDEX IF NOT EXISTS idx_tushare_trade_cal_raw_date ON tushare_trade_cal_raw (cal_date);
+CREATE INDEX IF NOT EXISTS idx_daily_kline_trade_date ON daily_kline (trade_date);
+CREATE INDEX IF NOT EXISTS idx_valuation_daily_trade_date ON valuation_daily (trade_date);
+CREATE INDEX IF NOT EXISTS idx_adj_factor_daily_trade_date ON adj_factor_daily (trade_date);
+CREATE INDEX IF NOT EXISTS idx_financial_indicator_report_date ON stock_financial_indicator (report_date);
+CREATE INDEX IF NOT EXISTS idx_financial_indicator_announce_date ON stock_financial_indicator (announce_date);

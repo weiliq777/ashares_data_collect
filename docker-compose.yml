@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ashares-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ashares
+      POSTGRES_PASSWORD: ashares_password
+      POSTGRES_DB: ashares
+    ports:
+      - "15432:5432"
+    volumes:
+      - ashares_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ashares -d ashares"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  opensearch:
+    image: opensearchproject/opensearch:3.7.0
+    container_name: ashares-opensearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "9200:9200"
+    volumes:
+      - ashares_osdata:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:3.7.0
+    container_name: ashares-opensearch-dashboards
+    restart: unless-stopped
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      - "15601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: ashares-rsshub-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ashares_rsshub_redis:/data
+
+  rsshub:
+    image: diygod/rsshub:chromium-bundled
+    container_name: ashares-rsshub
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: redis
+      REDIS_URL: redis://redis:6379/
+      CACHE_EXPIRE: "3600"
+    ports:
+      - "11200:1200"
+    depends_on:
+      - redis
+
+volumes:
+  ashares_pgdata:
+  ashares_osdata:
+  ashares_rsshub_redis:
