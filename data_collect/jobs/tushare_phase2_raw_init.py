@@ -144,11 +144,13 @@ def _save_frame(table: str, frame: pd.DataFrame, batch_id: str) -> int:
         else:
             raise ValueError(f"不支持的 Raw 表: {table}")
         rows.append(values)
-    placeholders = ", ".join(["%s"] * len(rows[0]))
     sql = f'INSERT INTO "{table}" ({", ".join(columns)}) VALUES %s ON CONFLICT DO NOTHING'
     with get_connection() as conn, conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=1000)
-        inserted = cur.rowcount
+        inserted = 0
+        for offset in range(0, len(rows), 1000):
+            page = rows[offset : offset + 1000]
+            execute_values(cur, sql, page, page_size=len(page))
+            inserted += max(cur.rowcount, 0)
         conn.commit()
     logger.debug("saved table=%s attempted=%s inserted=%s", table, len(rows), inserted)
     return inserted
