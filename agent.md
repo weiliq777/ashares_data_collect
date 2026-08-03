@@ -1,5 +1,9 @@
 # Finance_cn Agent Notes
 
+## 阶段二故障记录（2026-08-04）
+
+`tushare_phase2_raw_init.py --retry-empty` 曾把所有已存在 checkpoint 都当作可重试对象，可能重复请求 `done` 日期并浪费 Tushare 配额。现已增加精确状态读取，仅重试 `status='empty'`；Raw 表保持不可变，修复只作用于后续任务筛选逻辑。
+
 ## 当前目标
 
 以 Tushare 为主要数据源，建立可追溯、可断点续传的 A 股数据仓库，为基本面筛选、趋势分析、估值分析和风险计算提供事实数据。
