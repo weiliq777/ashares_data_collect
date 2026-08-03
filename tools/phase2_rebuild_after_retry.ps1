@@ -38,8 +38,9 @@ foreach ($task in $tasks) {
     if ($startupErrors) {
         Write-SequenceLog "$($task.Name) startup error detected; inspect logs"
     }
-    Wait-Process -Id $process.Id
-    if ($process.ExitCode -ne 0) {
+    Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+    $process.Refresh()
+    if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
         Write-SequenceLog "$($task.Name) exited code=$($process.ExitCode)"
         exit $process.ExitCode
     }

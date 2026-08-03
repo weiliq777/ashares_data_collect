@@ -35,8 +35,9 @@ foreach ($dataset in $datasets) {
     if ($startupErrors) {
         Write-SequenceLog "$dataset retry startup error detected; inspect $stdout and $stderr"
     }
-    Wait-Process -Id $process.Id
-    if ($process.ExitCode -ne 0) {
+    Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+    $process.Refresh()
+    if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
         Write-SequenceLog "$dataset retry exited code=$($process.ExitCode)"
         exit $process.ExitCode
     }
