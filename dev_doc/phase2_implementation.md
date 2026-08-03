@@ -87,6 +87,14 @@ Feature 任务：`data_collect/jobs/tushare_phase2_features.py`。
 
 后台启动时必须先检查 `logs/phase2_*` 的启动日志；失败通过 checkpoint 续传，不得全量重跑。
 
+如果历史接口对交易日返回空响应，不直接认定为“完整无数据”。可以使用补采模式只重试 `empty` checkpoint：
+
+```powershell
+.\.venv\Scripts\python.exe -m data_collect.jobs.tushare_phase2_raw_init --dataset stk_limit --start-date 20210802 --end-date 20260803 --pause 1.0 --retry-empty
+```
+
+`tools/phase2_retry_empty.ps1` 会在 Raw 顺序任务结束后依次补采 `stock_st`、`suspend_d`、`stk_limit` 的空日期；补采完成后由 `tools/phase2_rebuild_after_retry.ps1` 再次重建 Standard、PIT 和 Feature。
+
 ## 验收标准
 
 - Raw 业务键和哈希无重复。

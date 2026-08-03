@@ -156,7 +156,7 @@ def _save_frame(table: str, frame: pd.DataFrame, batch_id: str) -> int:
     return inserted
 
 
-def _run_date_dataset(dataset: str, pro, start: str, end: str, lookback_days: int | None, pause: float, batch_id: str):
+def _run_date_dataset(dataset: str, pro, start: str, end: str, lookback_days: int | None, pause: float, batch_id: str, retry_empty: bool = False):
     api_name, table = DATE_DATASETS[dataset]
     dates = _trade_dates(start, end, lookback_days)
     total = 0
@@ -164,8 +164,11 @@ def _run_date_dataset(dataset: str, pro, start: str, end: str, lookback_days: in
     for index, day in enumerate(dates, 1):
         # 历史初始化使用 checkpoint 跳过已完成日期；lookback 模式用于日常回补，
         # 必须重新请求最近日期，以便捕获收盘后补发/修订的数据。Raw 仍按哈希幂等追加。
-        if lookback_days is None and _checkpoint_done(dataset, day):
+        if lookback_days is None and not retry_empty and _checkpoint_done(dataset, day):
             logger.info("skip completed dataset=%s key=%s", dataset, day)
+            continue
+        if retry_empty and not _checkpoint_done(dataset, day):
+            logger.info("skip non-empty checkpoint dataset=%s key=%s", dataset, day)
             continue
         try:
             frame = call_api(getattr(pro, api_name), trade_date=day)
@@ -243,6 +246,7 @@ def run(
     lookback_days: int | None = None,
     limit_stocks: int | None = None,
     pause: float = 0.5,
+    retry_empty: bool = False,
 ) -> str:
     end = end_date or date.today().strftime("%Y%m%d")
     allowed = {"stock_st", "suspend_d", "stk_limit", "namechange", "dividend", "index_daily"}
@@ -253,7 +257,7 @@ def run(
     pro = get_pro()
     batch_id = f"phase2-{dataset}-{uuid.uuid4().hex}"
     if dataset in DATE_DATASETS:
-        count = _run_date_dataset(dataset, pro, start_date, end, lookback_days, pause, batch_id)
+        count = _run_date_dataset(dataset, pro, start_date, end, lookback_days, pause, batch_id, retry_empty)
     elif dataset in EVENT_DATASETS:
         count = _run_event_dataset(dataset, pro, start_date, end, limit_stocks, pause, batch_id)
     else:
@@ -269,8 +273,13 @@ def main() -> None:
     parser.add_argument("--lookback-days", type=int)
     parser.add_argument("--limit-stocks", type=int)
     parser.add_argument("--pause", type=float, default=0.5)
+    parser.add_argument(
+        "--retry-empty",
+        action="store_true",
+        help="仅重试 checkpoint 为 empty 的交易日，不重新请求已完成日期",
+    )
     args = parser.parse_args()
-    print(run(args.dataset, args.start_date, args.end_date, args.lookback_days, args.limit_stocks, args.pause))
+    print(run(args.dataset, args.start_date, args.end_date, args.lookback_days, args.limit_stocks, args.pause, args.retry_empty))
 
 
 if __name__ == "__main__":

@@ -96,4 +96,6 @@ Raw 表是不可变事实层：任何任务不得删除、更新、覆盖或清�
 
 故障预防：分批读取数据库时，不能在同一游标上执行 `fetchmany` 后再执行写入 SQL；应使用独立读写连接或先安全缓存批次。Tushare 网络 EOF 必须记录失败 checkpoint，并按业务键续传，不能把已完成批次全部重跑。
 
+阶段二空响应规则：历史交易日接口返回 `empty` 不能直接视为完整无数据；Raw 序列结束后使用 `tools/phase2_retry_empty.ps1` 只补采空 checkpoint，随后使用 `tools/phase2_rebuild_after_retry.ps1` 重建派生层。
+
 每日增量规则：最近 5 个交易日允许重复回补；正式任务使用 `data_collect.jobs.tushare_market_incremental_by_date` 按交易日获取全市场数据，不得逐股票请求；每次抓取完整响应写入不可变 `tushare_market_raw_version`，现有 `*_raw` 只做首次业务记录的幂等追加；Standard 按交易日重建。历史初始化仍可按股票断点续传。不得用 checkpoint=done 永久跳过需要修复的回补日期。
