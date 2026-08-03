@@ -38,6 +38,8 @@ Raw/Standard → 生命周期/状态 → PIT → Feature → Research/Backtest
 
 所有 Raw 保存完整 `payload`、`payload_hash`、`batch_id`、来源和抓取时间；重复请求不会重复插入，也不会修改历史 Raw。
 
+说明：`stk_limit` 接口单次最多 5,800 行，而单个交易日全市场通常约 5,400 行，因此历史同步必须按交易日请求；不能用多年区间请求替代，否则可能因接口上限截断结果。
+
 ## Standard、PIT 和 Feature
 
 Standard/PIT 任务：`data_collect/jobs/tushare_phase2_standard.py`。
