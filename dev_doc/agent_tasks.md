@@ -79,5 +79,5 @@
 - 时间：2026-08-04
 - 目标：补齐历史状态、公司行为、指数 Raw，并建立生命周期、PIT 和 Feature v1。
 - 状态：进行中
-- 当前结果：阶段二迁移、同步任务、Standard/PIT/Feature 代码已完成首版；`stock_st` 已完成，`suspend_d` 正在按交易日后台同步，价格/估值/财务 Feature 已完成初步构建。
-- 下一步：依次完成 `stk_limit`、`namechange`、`dividend`、`index_daily` Raw，同步完成后重建状态/PIT/分红 Feature，执行质量、未来函数和幂等验收。
+- 当前结果：阶段二迁移、同步任务、Standard/PIT/Feature 代码已完成首版；`stock_st`、`suspend_d`、`stk_limit` 主同步完成，`namechange` 正在按股票 checkpoint 后台同步。
+- 下一步：完成 `namechange`、`dividend`、`index_daily`，补采空响应交易日，重建状态/PIT/Feature，并执行质量、未来函数和幂等验收。

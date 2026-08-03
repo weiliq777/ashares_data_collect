@@ -106,12 +106,12 @@ Feature 任务：`data_collect/jobs/tushare_phase2_features.py`。
 - 质量脚本额外检查财务 PIT 未来穿越、可买/可卖 NULL、非正价格可交易和阶段二失败 checkpoint。
 - 下一阶段才能进入 Research、Backtest 和模拟组合。
 
-## 当前进度
+## 当前进度（2026-08-04）
 
-- 接口能力验证：已完成。
-- SQL/任务代码：已完成第一版，已通过 Python 语法检查。
-- `stock_st` 五年 Raw：已完成。
-- `suspend_d` 五年 Raw：后台同步中。
-- `stk_limit`、`namechange`、`dividend`、`index_daily`：等待前序历史任务完成后依次同步。
-- 价格、估值、公司财务 Feature：已完成初步构建并完成抽样检查。
-- 状态/PIT/分红 Feature：等待对应 Raw 完成后构建和验收。
+- 接口能力验证、SQL/任务代码和 Python 语法检查：已完成。
+- `stock_st`、`suspend_d`、`stk_limit` 五年 Raw：主同步已完成；其中少量 `empty` 交易日由后续补采链处理，不能直接视为无数据。
+- `namechange`：后台串行同步中，完成后继续 `dividend`、`index_daily`；所有事件接口按股票 checkpoint 续传。
+- 后台编排：`tools/phase2_resume_and_finish.ps1`，按 Raw → 空响应补采 → Standard/PIT → Feature 顺序执行，Tushare 请求不并发。
+- 价格、估值、公司财务 Feature：已有初步构建和抽样检查；Raw 全部完成后必须再次全量重建。
+- 状态/PIT/分红/指数 Feature：等待本轮 Raw 和空响应补采结束后统一重建和验收。
+- 阶段二当前仍未验收完成；必须通过 Raw 覆盖、重复键、未来函数、单位、可交易性和幂等检查后，才能进入 Research/Backtest。
