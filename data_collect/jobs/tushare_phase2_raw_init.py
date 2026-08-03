@@ -80,14 +80,18 @@ def _checkpoint(dataset: str, key: str, status: str, rows: int = 0, error: str |
         conn.commit()
 
 
-def _checkpoint_done(dataset: str, key: str) -> bool:
+def _checkpoint_status(dataset: str, key: str) -> str | None:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT status FROM tushare_history_checkpoint WHERE dataset=%s AND checkpoint_key=%s",
             (dataset, key),
         )
         row = cur.fetchone()
-    return bool(row and row[0] in {"done", "empty"})
+    return row[0] if row else None
+
+
+def _checkpoint_done(dataset: str, key: str) -> bool:
+    return _checkpoint_status(dataset, key) in {"done", "empty"}
 
 
 def _trade_dates(start: str, end: str, lookback_days: int | None = None) -> list[str]:
@@ -167,9 +171,11 @@ def _run_date_dataset(dataset: str, pro, start: str, end: str, lookback_days: in
         if lookback_days is None and not retry_empty and _checkpoint_done(dataset, day):
             logger.info("skip completed dataset=%s key=%s", dataset, day)
             continue
-        if retry_empty and not _checkpoint_done(dataset, day):
-            logger.info("skip non-empty checkpoint dataset=%s key=%s", dataset, day)
-            continue
+        if retry_empty:
+            status = _checkpoint_status(dataset, day)
+            if status != "empty":
+                logger.info("skip non-empty checkpoint dataset=%s key=%s status=%s", dataset, day, status)
+                continue
         try:
             frame = call_api(getattr(pro, api_name), trade_date=day)
             rows = 0 if frame is None else len(frame)
