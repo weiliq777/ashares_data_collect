@@ -218,6 +218,36 @@ data_backend:
 - 历史筛选不会使用公告日之后的数据。
 - 策略层只依赖统一标准表。
 - 权限不足时明确报告失败接口，不产生静默空数据。
+
+## 12. 当前实现状态修订（2026-08-03）
+
+本文件前面的阶段清单是迁移初始计划；以本节和 `dev_doc/development_plan_3_phases.md` 为当前执行基线。
+
+已落地：
+
+```text
+历史行情/估值/复权因子/交易日历 Raw
+四张财务 Raw
+tushare_market_raw_version
+tushare_financial_raw_version 表结构
+daily_kline / valuation_daily / adj_factor_daily
+financial_income_standard
+financial_balance_sheet_standard
+financial_cash_flow_standard
+Raw-first 历史转换和每日增量代码
+```
+
+当前仍在验收：
+
+```text
+adj_factor 独立失败重试
+每日增量重复运行与修正版本验证
+全量数据质量报告
+删除 Standard 后从 Raw 完整重建
+财务版本回填和三张财务 Standard 全量转换
+```
+
+每日行情增量默认回补最近 5 个交易日；`daily`、`daily_basic` 和 `adj_factor` 均先写 Raw/版本层，再按交易日重建 Standard。任何 Tushare Raw 表不得被更新、删除或覆盖。
 - OpenSearch 新闻系统继续独立运行。
 
 ## 12. 最终流程

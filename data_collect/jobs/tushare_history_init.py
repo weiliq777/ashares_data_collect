@@ -163,6 +163,8 @@ def _save_financial(pro, codes, start, end, limit_stocks=None, batch_size=25, ba
 def run(start_date=None, end_date=None, limit_stocks=None, max_days=None, include_financial=True,
         normalize_standard=False,
         batch_size=100, batch_pause=2.0, financial_batch_size=25, financial_batch_pause=5.0, **kwargs):
+    if normalize_standard:
+        raise ValueError("历史初始化已固定为 raw-only；请先完成 Raw 初始化，再运行 tushare_raw_to_standard")
     today = datetime.now().date()
     start = start_date or today.replace(year=today.year - 5).strftime("%Y%m%d")
     end = end_date or today.strftime("%Y%m%d")
@@ -204,7 +206,8 @@ def run(start_date=None, end_date=None, limit_stocks=None, max_days=None, includ
                 raise
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT stock_code FROM stock_basic_info WHERE list_status='L' ORDER BY stock_code")
+            # 历史初始化必须保留 L/D/P/G 全部股票；研究范围和可交易性由后续 PIT 层判断。
+            cur.execute("SELECT stock_code FROM stock_basic_info WHERE list_status IN ('L','D','P','G') ORDER BY stock_code")
             codes = [r[0] for r in cur.fetchall()]
     adj_rows = _save_adj_factor(pro, codes, start, end, limit_stocks, batch_size, batch_pause, normalize_standard)
     financial_rows = (_save_financial(pro, codes, start, end, limit_stocks, financial_batch_size, financial_batch_pause, normalize_standard)

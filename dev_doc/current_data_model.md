@@ -383,11 +383,11 @@ QMT/MiniQMT               当前不启用
 |---|---|---|
 | 复权因子 `adj_factor` | raw 表和标准表已建立，raw 初始化正在补齐 | 完成初始化后可用于严格复权收益分析 |
 | `trade_cal`持久化 | raw 表和标准表已建立 | 已支持离线审计和任务重放 |
-| 财务全市场覆盖 | 已验证并落库少量股票，当前不是全市场历史财务库 | 暂时不能对全市场执行可靠的5年ROE筛选 |
+| 财务全市场覆盖 | 四张财务 Raw 已按 5,874 只股票完成历史初始化，三张报表 Standard 正在全量同步 | Standard 全量质量验收和 PIT 完成前，不直接用于正式历史筛选 |
 | `revenue_yoy`、`netprofit_yoy` | 标准表已预留，但当前指标请求未完整填充 | 后续需增加接口字段或由利润表计算 |
-| 三大报表标准层 | 当前保存原始JSON，尚未拆成统一字段表 | 可以审计和重算，但策略暂不应直接查询JSON |
+| 三大报表标准层 | 三张 Standard 表结构已建立，已完成样本验证，正式全量同步进行中 | 全量质量验收前，策略暂不直接依赖全部财务字段 |
 | PE/PB历史分位 | 已有每日估值快照，尚未形成分位计算任务 | 还不能直接输出“历史20%/30%分位”结论 |
-| 日线历史完整性 | 当前已采集一个交易日全市场样本 | 趋势分析前仍需补齐所需历史窗口 |
+| 日线历史完整性 | 五年行情 Raw/Standard 已完成历史转换；每日增量按最近 5 个交易日回补 | 仍需完成增量修正验证和最终质量报告 |
 
 因此，当前模型已经足以作为“数据仓库主模型”，但还没有达到“全市场完整选股生产库”的状态。后续生产化顺序应为：
 
@@ -433,3 +433,25 @@ Tushare cashflow       -> tushare_cashflow_raw
 ```
 
 历史初始化和每日同步必须先落 raw，再生成标准表。`tushare_history_init.py` 当前默认 raw-only；标准化转换应独立执行。断点记录在 `tushare_history_checkpoint`，相关索引由 `sql/015_tushare_indexes.sql` 建立。
+## 12. 每日增量与 Raw 版本层
+
+新增 `tushare_market_raw_version`，保存 `daily`、`daily_basic`、`adj_factor`、`trade_cal` 每次成功抓取的完整 JSON、业务键、批次号、抓取时间和 SHA-256。现有 `*_raw` 表只做首次业务记录的幂等追加，不更新或删除历史记录。
+
+每日任务 `data_collect/jobs/tushare_daily_incremental.py` 默认回补最近 5 个交易日：先写 Raw 版本，再重建对应日期的 Standard，并核对 Raw 最新版本行数与 Standard 行数。重复运行允许生成新抓取版本，但不会产生重复 Standard 主键。
+## 13. 财务报表 Standard 设计冻结
+
+三张财务报表保持独立事实表：
+
+```text
+tushare_income_raw       -> financial_income_standard
+tushare_balancesheet_raw -> financial_balance_sheet_standard
+tushare_cashflow_raw     -> financial_cash_flow_standard
+```
+
+`financial_income_standard` 用于收入、营业利润、净利润和 EPS；`financial_balance_sheet_standard` 用于资产负债率、现金、应收、存货、商誉和债务风险；`financial_cash_flow_standard` 用于经营现金流、投资现金流、融资现金流、资本开支和现金质量。
+
+三张表均需保留 `stock_code`、`report_date`、`announce_date`、`f_ann_date`、`report_type`、`comp_type`、`end_type`、`update_flag`、`source`、`record_version`、`quality_status` 和 `fetched_at`。金额、股数、比例等字段必须明确单位；第一版只标准化核心分析字段，未映射字段继续保留在 Raw。
+
+财务数据必须先经过不可变 Raw 版本层。PIT 生成 `effective_announce_date`：优先使用 `f_ann_date`，为空时使用 `ann_date`；两个原始日期都必须保留。Standard 保留所有报表口径和修订版本，研究默认筛选合并报表，不能按报告期直接覆盖旧记录。
+
+当前状态：三张财务报表 Raw、财务 Raw 版本表和三张 Standard 表结构已建立；现有财务 Raw 的版本回填、Standard 正式全量转换和质量验收尚未完成，不能提前宣称财务阶段已全部完成。

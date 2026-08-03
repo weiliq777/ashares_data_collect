@@ -14,6 +14,8 @@ Tushare 原始接口 -> raw 原始表 -> 标准化表 -> 策略/分析层
 
 ## 关键目录和文件
 
+说明表名时必须同时附带业务含义；涉及 Raw 表时注明对应的 Tushare 接口和原始数据用途，避免只给出技术名称。
+
 - `config.yaml`：数据库、Tushare、OpenSearch、RSSHub 配置
 - `docker-compose.yml`：PostgreSQL、OpenSearch、Dashboards、Redis、RSSHub
 - `data_collect/providers/tushare_client.py`：Tushare 客户端、限流和重试
@@ -22,6 +24,11 @@ Tushare 原始接口 -> raw 原始表 -> 标准化表 -> 策略/分析层
 - `data_collect/jobs/a_share_valuation_tushare.py`：每日增量估值
 - `data_collect/jobs/a_share_financial_tushare.py`：财务指标和财务原始表
 - `data_collect/jobs/tushare_history_init.py`：历史初始化、断点、批次暂停
+- `data_collect/jobs/tushare_daily_incremental.py`：历史兼容的 Raw-first 每日增量
+- `data_collect/jobs/tushare_market_incremental_by_date.py`：正式每日增量，按交易日批量获取全市场 daily/daily_basic/adj_factor
+- `data_collect/jobs/tushare_raw_to_standard.py`：Raw 离线重建 Standard
+- `data_collect/jobs/tushare_rebuild_validation.py`：Raw 到独立验证表的全量重建验收
+- `data_collect/jobs/tushare_data_quality.py`：阶段一聚合质量检查
 - `data_collect/normalize/`：接口数据到标准模型的转换
 - `data_collect/utils/db.py`：PostgreSQL 写入、幂等和表结构对齐
 - `sql/012_create_tushare_standard.sql`：标准表和已接入财务原始表
@@ -69,6 +76,8 @@ Windows 保留了 5432、5601、2100 等端口，当前主机映射为：
 
 以后所有 Tushare 接口请求都必须先保存一份完整原始响应到对应的 `*_raw` 表，再进行标准化转换。禁止接口请求后直接写入标准表。
 
+Raw 表是不可变事实层：任何任务不得删除、更新、覆盖或清理 `*_raw` 表中的历史记录。字段映射、单位转换和错误修复只能通过重新生成 Standard 表完成；如需修复 Raw，必须新增版本记录或单独建立迁移方案，不得直接改写原始数据。
+
 原因：Tushare 接口会消耗积分；保留完整 raw 数据后，字段映射、单位换算或标准模型发生错误时，可以直接从数据库重新转换和恢复，不必重复请求接口。
 
 新增 Tushare 接口时必须同步完成：
@@ -77,3 +86,7 @@ Windows 保留了 5432、5601、2100 等端口，当前主机映射为：
 2. 使用 raw 表主键和幂等写入，避免重复数据。
 3. 再建立独立的 raw 到标准表转换逻辑。
 4. 在 `current_data_model.md` 中记录接口、raw 表、标准表和字段映射关系。
+
+故障预防：分批读取数据库时，不能在同一游标上执行 `fetchmany` 后再执行写入 SQL；应使用独立读写连接或先安全缓存批次。Tushare 网络 EOF 必须记录失败 checkpoint，并按业务键续传，不能把已完成批次全部重跑。
+
+每日增量规则：最近 5 个交易日允许重复回补；正式任务使用 `data_collect.jobs.tushare_market_incremental_by_date` 按交易日获取全市场数据，不得逐股票请求；每次抓取完整响应写入不可变 `tushare_market_raw_version`，现有 `*_raw` 只做首次业务记录的幂等追加；Standard 按交易日重建。历史初始化仍可按股票断点续传。不得用 checkpoint=done 永久跳过需要修复的回补日期。

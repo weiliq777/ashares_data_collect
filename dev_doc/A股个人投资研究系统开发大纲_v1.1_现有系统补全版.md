@@ -1494,3 +1494,32 @@ Backtest：信号 / 订单 / 成交 / 现金 / 持仓 / 公司行动
 9. 当前系统模型说明（2026-08-02）：已存在标准表、市场Raw、财务Raw、交易日历、复权因子、OpenSearch新闻公告及历史初始化检查点。
 10. Tushare官方：`suspend_d`每日停复牌、`stock_st`历史ST列表、`namechange`历史名称变化、`stk_limit`每日涨跌停价格。
 11. Tushare官方：`dividend`分红送股、`fina_audit`财务审计意见、`forecast`业绩预告。
+## 22. 当前实现状态修订（2026-08-03）
+
+本节用于覆盖本文早期“尚未落地”的状态描述，当前执行以本节、`development_plan_3_phases.md` 和 `current_data_model.md` 为准。
+
+已落地的阶段一基础设施：
+
+```text
+历史行情/估值/复权因子/交易日历 Raw
+四张财务 Raw
+tushare_market_raw_version
+tushare_financial_raw_version
+daily_kline / valuation_daily / adj_factor_daily
+financial_income_standard
+financial_balance_sheet_standard
+financial_cash_flow_standard
+Raw-first 历史转换、财务版本回填和每日增量代码
+```
+
+当前仍需验收：
+
+```text
+adj_factor 失败重试
+每日增量重复运行和修正版本
+全量质量报告
+Standard 删除后从 Raw 完整重建
+财务版本回填、全量转换和 PIT
+```
+
+Raw 表的规则已冻结：现有 `*_raw` 只做首次业务记录的幂等追加，版本表追加每次不同内容的抓取记录；任何 Raw 历史记录不得更新、删除或覆盖。每日行情默认回补最近 5 个交易日，先写 Raw/版本层，再按交易日重建 Standard。

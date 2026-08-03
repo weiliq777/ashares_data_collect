@@ -128,3 +128,20 @@ Raw 表和任务批次 → 行情历史初始化 → 财务历史初始化
 ```
 
 阶段一首个里程碑：删除一张 Standard 测试表后，可以通过一个命令从 Raw 完整重建，并核对行数、主键、单位、日期覆盖和质量报告一致。通过后再进入历史状态和 PIT 开发。
+## 阶段一补充冻结：财务报表标准化规则
+
+`income`、`balancesheet`、`cashflow` 先完整保存 Raw，再分别建立 Standard 财务事实表，不合并成一张大表：
+
+```text
+tushare_income_raw       -> financial_income_standard
+tushare_balancesheet_raw -> financial_balance_sheet_standard
+tushare_cashflow_raw     -> financial_cash_flow_standard
+```
+
+财务 Raw 还需增加不可变版本表，保留 `report_date`、`ann_date`、`f_ann_date`、`report_type`、`comp_type`、`end_type`、`update_flag`、原始 `payload`、`payload_hash`、`batch_id` 和 `fetched_at`。现有 Raw 表不得更新或删除。
+
+财务 Standard 必须保留报告期、公告日、报表口径和版本信息；PIT 层生成 `effective_announce_date`，优先使用接口提供的 `f_ann_date`，为空时回退到 `ann_date`，同时保留两个原始日期。Standard 保留全部报告记录，研究默认使用合并报表，不能在 Raw/Standard 阶段静默覆盖其他口径或修订版本。
+
+第一版 Standard 只映射选股、风险和现金流质量所需的核心字段，其余字段继续保留在 Raw。金额、股数、比例必须显式记录单位，不做未经确认的倍数换算。财务 Standard 主键不能只使用股票代码和报告期，必须包含公告日、报表口径、版本和来源等维度。
+
+当前状态：四张财务 Raw、财务 Raw 版本表和三张财务 Standard 均已完成；市场 Raw/Standard 也已完成全量质量检查。阶段一已通过 Raw→Standard 独立重建验收，后续进入历史状态、公司行为和 PIT 层开发。
