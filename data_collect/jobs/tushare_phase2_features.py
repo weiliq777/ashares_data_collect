@@ -38,7 +38,8 @@ def rebuild_price() -> int:
     WITH base AS (
         SELECT d.stock_code AS ts_code, d.trade_date, d.close AS raw_close,
                d.amount, d.volume, a.adj_factor,
-               d.close * COALESCE(a.adj_factor, 1.0) AS adj_close_base
+               CASE WHEN a.adj_factor IS NOT NULL
+                    THEN d.close * a.adj_factor END AS adj_close_base
         FROM daily_kline d
         LEFT JOIN LATERAL (
             SELECT adj_factor
@@ -56,14 +57,14 @@ def rebuild_price() -> int:
         WINDOW w AS (PARTITION BY ts_code ORDER BY trade_date)
     ), metrics AS (
         SELECT *,
-            AVG(raw_close) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
-            AVG(raw_close) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS ma60,
-            AVG(raw_close) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120,
+            AVG(adj_close_base) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+            AVG(adj_close_base) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS ma60,
+            AVG(adj_close_base) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120,
             STDDEV_SAMP(return_1d)
                 OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS volatility_20d,
             AVG(amount) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS amount_ma20,
             volume / NULLIF(AVG(volume) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0) AS volume_ratio_20d,
-            COUNT(*) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS available_observation_count
+            COUNT(adj_close_base) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS available_observation_count
         FROM returns
     )
     SELECT ts_code, trade_date, raw_close, adj_close_base, return_1d, return_20d,
@@ -242,11 +243,13 @@ def rebuild_company_financial() -> int:
     LEFT JOIN LATERAL (
         SELECT n_cashflow_act FROM financial_cash_flow_standard c
         WHERE c.stock_code=f.stock_code AND c.report_date=f.report_date
+          AND (f.announce_date IS NULL OR c.announce_date <= f.announce_date)
         ORDER BY c.announce_date DESC NULLS LAST, c.financial_id DESC LIMIT 1
     ) cf ON TRUE
     LEFT JOIN LATERAL (
         SELECT net_profit FROM financial_income_standard i
         WHERE i.stock_code=f.stock_code AND i.report_date=f.report_date
+          AND (f.announce_date IS NULL OR i.announce_date <= f.announce_date)
         ORDER BY i.announce_date DESC NULLS LAST, i.financial_id DESC LIMIT 1
     ) inc ON TRUE
     ON CONFLICT (ts_code, report_date, source_record_key, record_version) DO UPDATE SET

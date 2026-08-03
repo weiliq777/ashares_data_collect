@@ -101,9 +101,9 @@ def rebuild_status_daily() -> int:
           ON l.ts_code = u.stock_code AND l.trade_date = u.trade_date
     )
     SELECT trade_date, stock_code, TRUE, is_st, is_suspended,
-           (close_price IS NOT NULL AND NOT is_suspended) AS is_tradeable,
+           (close_price IS NOT NULL AND close_price > 0 AND NOT is_suspended) AS is_tradeable,
            CASE
-             WHEN close_price IS NULL THEN 'NO_PRICE'
+             WHEN close_price IS NULL OR close_price <= 0 THEN 'NO_PRICE'
              WHEN up_limit IS NOT NULL AND close_price >= up_limit - 0.0001 THEN 'UP_LIMIT'
              WHEN down_limit IS NOT NULL AND close_price <= down_limit + 0.0001 THEN 'DOWN_LIMIT'
              ELSE 'NONE'
@@ -112,12 +112,13 @@ def rebuild_status_daily() -> int:
            NULLIF(concat_ws(',',
                CASE WHEN is_st THEN 'ST' END,
                CASE WHEN is_suspended THEN 'SUSPENDED' END,
-               CASE WHEN close_price IS NULL THEN 'NO_PRICE' END,
+               CASE WHEN close_price IS NULL OR close_price <= 0 THEN 'NO_PRICE' END,
                CASE WHEN up_limit IS NOT NULL AND close_price >= up_limit - 0.0001 THEN 'UP_LIMIT' END,
                CASE WHEN down_limit IS NOT NULL AND close_price <= down_limit + 0.0001 THEN 'DOWN_LIMIT' END
            ), '') AS status_reason,
            'tushare',
            CASE WHEN close_price IS NULL THEN 'MISSING_SOURCE'
+                WHEN close_price <= 0 THEN 'WARNING'
                 WHEN is_suspended OR is_st THEN 'WARNING' ELSE 'VALID' END
     FROM flags
     ON CONFLICT (trade_date, ts_code) DO UPDATE SET
@@ -168,8 +169,8 @@ def rebuild_tradeability() -> int:
         (trade_date, ts_code, is_tradeable, can_buy, can_sell, is_suspended,
          limit_status, blocked_reason, quality_status, source_asof_date)
     SELECT trade_date, ts_code, is_tradeable,
-           is_tradeable AND limit_status <> 'UP_LIMIT',
-           is_tradeable AND limit_status <> 'DOWN_LIMIT',
+           is_tradeable AND COALESCE(limit_status, 'NONE') <> 'UP_LIMIT',
+           is_tradeable AND COALESCE(limit_status, 'NONE') <> 'DOWN_LIMIT',
            is_suspended, limit_status,
            NULLIF(concat_ws(',',
              CASE WHEN NOT is_tradeable THEN 'NOT_TRADEABLE' END,

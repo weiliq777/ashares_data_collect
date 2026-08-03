@@ -131,6 +131,45 @@ def run() -> dict:
             result[table] = inspect_table(table, keys)
         except Exception as exc:
             result[table] = {"error": str(exc)}
+    result["phase2_invariants"] = inspect_phase2_invariants()
+    return result
+
+
+def inspect_phase2_invariants() -> dict:
+    """检查阶段二的时间可见性和交易状态不变量；只读聚合查询。"""
+    queries = {
+        "financial_future_rows": """
+            SELECT COUNT(*) FROM pit.financial_asof
+            WHERE effective_announce_date IS NOT NULL
+              AND effective_announce_date > decision_date
+        """,
+        "tradeability_null_buy_sell": """
+            SELECT COUNT(*) FROM pit.security_tradeability_daily
+            WHERE is_tradeable IS TRUE AND (can_buy IS NULL OR can_sell IS NULL)
+        """,
+        "nonpositive_price_tradeable_rows": """
+            SELECT COUNT(*) FROM std.security_status_daily
+            WHERE is_tradeable IS TRUE AND (close_price IS NULL OR close_price <= 0)
+        """,
+        "missing_adj_factor_feature_rows": """
+            SELECT COUNT(*) FROM feature.price_daily_v1
+            WHERE quality_status = 'MISSING_SOURCE'
+        """,
+        "raw_phase2_failed_checkpoints": """
+            SELECT COUNT(*) FROM tushare_history_checkpoint
+            WHERE dataset IN ('stock_st','suspend_d','stk_limit','namechange','dividend','index_daily')
+              AND status = 'failed'
+        """,
+    }
+    result = {}
+    with get_connection() as conn, conn.cursor() as cur:
+        for name, sql in queries.items():
+            try:
+                cur.execute(sql)
+                result[name] = cur.fetchone()[0]
+            except Exception as exc:
+                conn.rollback()
+                result[name] = {"error": str(exc)}
     return result
 
 

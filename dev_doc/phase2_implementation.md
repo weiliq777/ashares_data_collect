@@ -68,6 +68,9 @@ Feature 任务：`data_collect/jobs/tushare_phase2_features.py`。
 4. 非有限浮点值 `NaN` 在 Feature 层转为 NULL，并标记 `WARNING`。
 5. Raw 不允许删除、更新、覆盖；派生表允许重建。
 6. 分红 JSON 中的 `pay_date`、`div_listdate`、`imp_ann_date` 按 Tushare 的 `YYYYMMDD` 解析为 Standard 日期；原始 JSON 保持不变。
+7. 日常回补模式必须重新请求最近交易日，即使 checkpoint 已完成；Raw 通过 `payload_hash` 幂等追加，用于接收收盘后补发或修订数据。
+8. 趋势均线使用有复权因子的 `adj_close_base`；复权因子缺失时复权价格和相关收益/均线不伪造为原始收盘价。
+9. 收盘价为空、零或负数的记录保留为事实，但不得判定为可交易；财务特征关联利润表和现金流量表时不得使用指标公告日之后的修订记录。
 
 ## 后台运行命令
 
@@ -92,6 +95,7 @@ Feature 任务：`data_collect/jobs/tushare_phase2_features.py`。
 - 财务公告日之后才进入 PIT。
 - 价格、估值和财务 Feature 可重复计算。
 - 复权因子缺失时标记 `MISSING_SOURCE`，不伪造数据。
+- 质量脚本额外检查财务 PIT 未来穿越、可买/可卖 NULL、非正价格可交易和阶段二失败 checkpoint。
 - 下一阶段才能进入 Research、Backtest 和模拟组合。
 
 ## 当前进度

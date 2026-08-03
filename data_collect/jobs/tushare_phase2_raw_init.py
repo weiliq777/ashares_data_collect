@@ -162,7 +162,9 @@ def _run_date_dataset(dataset: str, pro, start: str, end: str, lookback_days: in
     total = 0
     logger.info("phase2 date dataset started dataset=%s dates=%s", dataset, len(dates))
     for index, day in enumerate(dates, 1):
-        if _checkpoint_done(dataset, day):
+        # 历史初始化使用 checkpoint 跳过已完成日期；lookback 模式用于日常回补，
+        # 必须重新请求最近日期，以便捕获收盘后补发/修订的数据。Raw 仍按哈希幂等追加。
+        if lookback_days is None and _checkpoint_done(dataset, day):
             logger.info("skip completed dataset=%s key=%s", dataset, day)
             continue
         try:
