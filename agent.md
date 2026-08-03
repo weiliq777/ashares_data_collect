@@ -29,11 +29,15 @@ Tushare 原始接口 -> raw 原始表 -> 标准化表 -> 策略/分析层
 - `data_collect/jobs/tushare_raw_to_standard.py`：Raw 离线重建 Standard
 - `data_collect/jobs/tushare_rebuild_validation.py`：Raw 到独立验证表的全量重建验收
 - `data_collect/jobs/tushare_data_quality.py`：阶段一聚合质量检查
+- `data_collect/jobs/tushare_phase2_raw_init.py`：阶段二公司状态、公司行为和指数 Raw 历史同步
+- `data_collect/jobs/tushare_phase2_standard.py`：阶段二 Standard、生命周期和 PIT 重建
+- `data_collect/jobs/tushare_phase2_features.py`：阶段二价格、估值、财务和股东回报 Feature 重建
 - `data_collect/normalize/`：接口数据到标准模型的转换
 - `data_collect/utils/db.py`：PostgreSQL 写入、幂等和表结构对齐
 - `sql/012_create_tushare_standard.sql`：标准表和已接入财务原始表
 - `sql/013_create_tushare_history.sql`：交易日历、复权因子和初始化断点表
 - `sql/014_create_tushare_market_raw.sql`：行情、估值、复权因子、交易日历原始表
+- `sql/018_create_phase2_model.sql`：阶段二 Raw、Standard、PIT、Feature 和注册表
 - `dev_doc/current_data_model.md`：当前完整表模型和数据来源说明
 - `dev_doc/tushare_history_initialization.md`：历史初始化和每日同步流程
 - `dev_doc/agent_tasks.md`：简明任务清单、状态和下一步
@@ -55,6 +59,7 @@ Windows 保留了 5432、5601、2100 等端口，当前主机映射为：
 4. 清理数据前先确认目标表，默认保留基础资料和新闻数据。
 5. 修改数据库模型后，必须同步更新 `current_data_model.md` 和对应 SQL 迁移文件。
 6. 原始数据用于重算和审计，策略代码优先读取标准化表。
+7. 阶段二执行顺序固定为：公司状态/公司行为 Raw → Standard 状态和生命周期 → PIT 股票池/可交易性/财务快照 → Feature；未完成上游 Raw 时不得宣称下游全量完成。
 
 ## Agent 工作模式
 
@@ -86,6 +91,8 @@ Raw 表是不可变事实层：任何任务不得删除、更新、覆盖或清�
 2. 使用 raw 表主键和幂等写入，避免重复数据。
 3. 再建立独立的 raw 到标准表转换逻辑。
 4. 在 `current_data_model.md` 中记录接口、raw 表、标准表和字段映射关系。
+
+阶段二补充规则：`stock_st` 只表达 ST/风险状态，不能直接等同于不可交易；`suspend_d`、`stk_limit` 和日线价格共同决定当日可交易性；`namechange` 生成名称有效区间；`dividend` 的 `ex_date` 不晚于决策日才可进入股东回报 Feature；指数数据可用于基准和超额收益，但不进入个股 PIT。
 
 故障预防：分批读取数据库时，不能在同一游标上执行 `fetchmany` 后再执行写入 SQL；应使用独立读写连接或先安全缓存批次。Tushare 网络 EOF 必须记录失败 checkpoint，并按业务键续传，不能把已完成批次全部重跑。
 

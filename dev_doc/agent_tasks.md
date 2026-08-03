@@ -73,3 +73,11 @@
 - 状态：已完成
 - 当前结果：计划已保存至 `dev_doc/development_plan_3_phases.md`，并补充 PIT、可交易状态、公司行为、回测和 AI 边界约束。
 - 下一步：完成 T-001/T-002 的全量质量报告和 Raw 重建验收，再进入 PIT。
+
+## T-009｜阶段二 PIT 与 Feature
+
+- 时间：2026-08-04
+- 目标：补齐历史状态、公司行为、指数 Raw，并建立生命周期、PIT 和 Feature v1。
+- 状态：进行中
+- 当前结果：阶段二迁移、同步任务、Standard/PIT/Feature 代码已完成首版；`stock_st` 已完成，`suspend_d` 正在按交易日后台同步，价格/估值/财务 Feature 已完成初步构建。
+- 下一步：依次完成 `stk_limit`、`namechange`、`dividend`、`index_daily` Raw，同步完成后重建状态/PIT/分红 Feature，执行质量、未来函数和幂等验收。

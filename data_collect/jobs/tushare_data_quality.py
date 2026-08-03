@@ -27,6 +27,23 @@ CHECKS = {
     "financial_income_standard": ("source", "source_record_key", "record_version"),
     "financial_balance_sheet_standard": ("source", "source_record_key", "record_version"),
     "financial_cash_flow_standard": ("source", "source_record_key", "record_version"),
+    "tushare_stock_st_raw": ("ts_code", "trade_date", "type", "payload_hash"),
+    "tushare_namechange_raw": ("ts_code", "payload_hash"),
+    "tushare_suspend_d_raw": ("ts_code", "trade_date", "suspend_type", "payload_hash"),
+    "tushare_stk_limit_raw": ("ts_code", "trade_date", "payload_hash"),
+    "tushare_dividend_raw": ("ts_code", "payload_hash"),
+    "tushare_index_daily_raw": ("ts_code", "trade_date", "payload_hash"),
+    "std.security_lifecycle": ("ts_code", "effective_from", "effective_to", "source"),
+    "std.security_status_daily": ("trade_date", "ts_code"),
+    "std.dividend_event": ("source", "source_record_key", "record_version"),
+    "std.index_daily_tushare": ("ts_code", "trade_date", "source"),
+    "pit.universe_daily": ("trade_date", "ts_code"),
+    "pit.security_tradeability_daily": ("trade_date", "ts_code"),
+    "pit.financial_asof": ("decision_date", "ts_code"),
+    "feature.price_daily_v1": ("ts_code", "trade_date"),
+    "feature.valuation_daily_v1": ("ts_code", "trade_date"),
+    "feature.company_financial_v1": ("ts_code", "report_date", "source_record_key", "record_version"),
+    "feature.shareholder_return_v1": ("ts_code", "asof_date"),
 }
 DATE_COLUMNS = {
     "stock_basic_info": "list_date",
@@ -42,28 +59,55 @@ DATE_COLUMNS = {
     "financial_income_standard": "report_date",
     "financial_balance_sheet_standard": "report_date",
     "financial_cash_flow_standard": "report_date",
+    "tushare_stock_st_raw": "trade_date",
+    "tushare_namechange_raw": "start_date",
+    "tushare_suspend_d_raw": "trade_date",
+    "tushare_stk_limit_raw": "trade_date",
+    "tushare_dividend_raw": "ex_date",
+    "tushare_index_daily_raw": "trade_date",
+    "std.security_lifecycle": "effective_from",
+    "std.security_status_daily": "trade_date",
+    "std.dividend_event": "ex_date",
+    "std.index_daily_tushare": "trade_date",
+    "pit.universe_daily": "trade_date",
+    "pit.security_tradeability_daily": "trade_date",
+    "pit.financial_asof": "decision_date",
+    "feature.price_daily_v1": "trade_date",
+    "feature.valuation_daily_v1": "trade_date",
+    "feature.company_financial_v1": "report_date",
+    "feature.shareholder_return_v1": "asof_date",
 }
+
+
+def _qualified_table(table: str) -> str:
+    parts = table.split(".")
+    if len(parts) == 1:
+        return f'"{parts[0]}"'
+    if len(parts) == 2:
+        return f'"{parts[0]}"."{parts[1]}"'
+    raise ValueError(f"非法表名: {table}")
 
 
 def inspect_table(table: str, keys: tuple[str, ...]) -> dict:
     with get_connection() as conn, conn.cursor() as cur:
         date_column = DATE_COLUMNS.get(table, "trade_date")
+        qualified = _qualified_table(table)
+        table_name = table.split(".")[-1]
         if date_column:
-            cur.execute(f'SELECT COUNT(*), MIN("{date_column}"), MAX("{date_column}") FROM "{table}"')
+            cur.execute(f'SELECT COUNT(*), MIN("{date_column}"), MAX("{date_column}") FROM {qualified}')
             count, date_min, date_max = cur.fetchone()
         else:
-            cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+            cur.execute(f'SELECT COUNT(*) FROM {qualified}')
             count = cur.fetchone()[0]
             date_min = date_max = None
         key_expr = ", ".join(f'"{key}"' for key in keys)
-        cur.execute(f'SELECT COUNT(*) FROM (SELECT {key_expr}, COUNT(*) FROM "{table}" GROUP BY {key_expr} HAVING COUNT(*) > 1) duplicates')
+        cur.execute(f'SELECT COUNT(*) FROM (SELECT {key_expr}, COUNT(*) FROM {qualified} GROUP BY {key_expr} HAVING COUNT(*) > 1) duplicates')
         duplicate_groups = cur.fetchone()[0]
-        cur.execute(f'SELECT COUNT(*) FROM "{table}" WHERE payload IS NULL') if table.startswith("tushare_") else cur.execute("SELECT 0")
+        cur.execute(f'SELECT COUNT(*) FROM {qualified} WHERE payload IS NULL') if table_name.startswith("tushare_") else cur.execute("SELECT 0")
         null_payload = cur.fetchone()[0]
         price_quality = {}
         if table in {"tushare_daily_raw", "daily_kline"}:
-            prefix = "payload->>" if table.startswith("tushare_") else '"'
-            if table.startswith("tushare_"):
+            if table_name.startswith("tushare_"):
                 cur.execute("""SELECT COUNT(*) FROM "tushare_daily_raw"
                     WHERE COALESCE((payload->>'open')::numeric, 0) = 0
                        OR COALESCE((payload->>'high')::numeric, 0) = 0
