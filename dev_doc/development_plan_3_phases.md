@@ -112,6 +112,8 @@ backtest_fill, backtest_position, backtest_cash_ledger, portfolio_simulation
 
 外部证据候选由 `data_collect/jobs/research_evidence_candidates.py` 只读检索，返回 OpenSearch 文档身份、来源、时间、URL 和摘要片段，并标记 `REVIEW_REQUIRED`；它不会自动写入 `research.evidence_reference`。真实联调时，当前 3 个成员的股票标签没有命中，名称文本命中不能直接视为证据，必须人工核验后再调用 `add_evidence`。因此 Research 观察池框架已完成，外部证据人工复核和 Backtest 输入设计仍未完成。
 
+Backtest 设计约束：当前正式 FROZEN 快照只有截止日 `2026-08-03`，只能用于该日期的研究和观察池，不能单独支撑历史回测。历史回测必须先生成多个历史截止日的 FROZEN 快照，或建立引用多个日快照的 Backtest Dataset Manifest；随后才冻结 Backtest 表结构、输入契约和回测引擎。回测必须处理费用、停牌、涨跌停、分红、退市以及信号时间与成交时间，不接入自动下单。
+
 主要工作：
 
 1. 生成结构化股票研究快照并关联公告、新闻和研报证据。
