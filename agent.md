@@ -52,7 +52,8 @@ Tushare 原始接口 -> raw 原始表 -> 标准化表 -> 策略/分析层
 - `sql/025_research_lineage_sources.sql`：生命周期 Standard 来源哈希字段与 pgcrypto 迁移
 - `sql/026_create_research_watchlist.sql`：Research 观察池、观察池成员和证据引用表
 - `data_collect/jobs/research_watchlist.py`：只读快照生成观察池和写入证据引用元数据
-- `sql/027_research_audit_immutability.sql`：ACTIVE 观察池、成员和证据的追加式审计约束
+- `data_collect/jobs/research_evidence_candidates.py`：只读检索 OpenSearch 外部证据候选，不自动入库
+- `sql/027_research_audit_immutability.sql`：ACTIVE 追加式、ARCHIVED 全不可变的观察池审计约束
 - `data_collect/normalize/`：接口数据到标准模型的转换
 - `data_collect/utils/db.py`：PostgreSQL 写入、幂等和表结构对齐
 - `sql/012_create_tushare_standard.sql`：标准表和已接入财务原始表

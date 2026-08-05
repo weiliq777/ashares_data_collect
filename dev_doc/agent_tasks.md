@@ -4,7 +4,7 @@
 - 时间：2026-08-05
 - 目标：按 ACTIVE 观察池成员与快照截止日，只读检索 OpenSearch 新闻/公告候选。
 - 状态：已完成
-- 当前结果：新增 `data_collect/jobs/research_evidence_candidates.py`，返回 `document_index/document_id/url` 等元数据并标记 `REVIEW_REQUIRED`，不自动写入证据表。真实联调未命中三只成员的股票标签，名称搜索结果不能直接当作证据。
+- 当前结果：新增 `data_collect/jobs/research_evidence_candidates.py`，返回 `document_index/document_id/url` 等元数据并标记 `REVIEW_REQUIRED`，不自动写入证据表；`news_search` 默认输出保持兼容，候选模式可显式返回 OpenSearch 文档身份。专项回归 47 passed，真实联调未命中三只成员的股票标签，名称搜索结果不能直接当作证据。
 - 下一步：人工核验后用 `add_evidence` 绑定 supporting/contrary/context；正式回测仍暂缓。
 
 更新时间：2026-08-05

@@ -106,6 +106,12 @@ backtest_fill, backtest_position, backtest_cash_ledger, portfolio_simulation
 
 阶段三当前实现边界：`research_watchlist.py` 只消费已通过质量门禁的快照，默认要求 `FROZEN`；`allow_preview` 仅用于联调 `VALIDATED` 快照。观察池使用固定 `watchlist-v1` 规则保存价值质量/成长趋势分轨、总人数上限、去重结果和结构化理由。`research.evidence_reference` 只保存 OpenSearch、URL 或人工材料的引用定位、内容哈希和正反方角色，不复制正文。详见 `dev_doc/research_watchlist.md`。
 
+当前实现状态（2026-08-05）：正式 FROZEN 快照为
+`9afb9a08-da75-439b-8b4a-fcc688df3787`，截止日为 `2026-08-03`，包含 5,535 条股票快照、8 张输入统计和 44,280 条血缘记录；正式观察池
+`01b53411-155e-4672-9548-189396e7a3e0` 已激活，包含 3 个 `value_quality` 成员和 9 条 PostgreSQL 快照事实引用。`sql/027_research_audit_immutability.sql` 已保证 ACTIVE 成员/证据只能追加，ARCHIVED 观察池、成员和证据全部不可变。
+
+外部证据候选由 `data_collect/jobs/research_evidence_candidates.py` 只读检索，返回 OpenSearch 文档身份、来源、时间、URL 和摘要片段，并标记 `REVIEW_REQUIRED`；它不会自动写入 `research.evidence_reference`。真实联调时，当前 3 个成员的股票标签没有命中，名称文本命中不能直接视为证据，必须人工核验后再调用 `add_evidence`。因此 Research 观察池框架已完成，外部证据人工复核和 Backtest 输入设计仍未完成。
+
 主要工作：
 
 1. 生成结构化股票研究快照并关联公告、新闻和研报证据。
