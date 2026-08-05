@@ -218,6 +218,7 @@ config.yaml
 !.env.example
 
 # Local data, exports, archives and runtime state
+backups/
 data/
 tempdata/
 news_spool/

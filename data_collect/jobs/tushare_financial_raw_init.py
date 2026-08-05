@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import time
+import uuid
 from datetime import date
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
@@ -67,17 +68,29 @@ def _checkpoint(dataset, key, status, rows=0, error=None):
         conn.commit()
 
 
-def _save_raw(table, frame) -> int:
+def _save_raw(table, frame, batch_id=None) -> int:
     if frame is None or frame.empty:
         return 0
+    records = frame.astype(object).where(pd.notna(frame), None).to_dict("records")
     with get_connection() as conn, conn.cursor() as cur:
-        for row in frame.astype(object).where(pd.notna(frame), None).to_dict("records"):
+        for row in records:
             clean = {key: value for key, value in row.items()}
             cur.execute(f'''INSERT INTO "{table}" (ts_code, ann_date, end_date, payload)
                 VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
                         (clean.get("ts_code"), _date_value(clean.get("ann_date")), _date_value(clean.get("end_date")),
                          json.dumps(clean, ensure_ascii=False, default=str, allow_nan=False)))
         conn.commit()
+    if table == "tushare_fina_indicator_raw":
+        from data_collect.jobs.tushare_fina_indicator_version import save_indicator_versions
+
+        save_indicator_versions(
+            records,
+            batch_id=batch_id,
+        )
+    else:
+        from data_collect.jobs.tushare_financial_raw_version_backfill import save_financial_versions
+
+        save_financial_versions(table.removeprefix("tushare_").removesuffix("_raw"), records, batch_id=batch_id)
     return len(frame)
 
 
@@ -97,6 +110,7 @@ def run(dataset: str, start_date: str | None = None, end_date: str | None = None
     codes = _codes()[: int(limit_stocks or 10**9)]
     pro = get_pro()
     api = getattr(pro, dataset)
+    batch_id = f"financial-raw-{uuid.uuid4().hex}"
     total = 0
     logger.info("financial raw init started dataset=%s table=%s stocks=%s start=%s end=%s", dataset, table, len(codes), start, end)
     for index, code in enumerate(codes, 1):
@@ -105,7 +119,7 @@ def run(dataset: str, start_date: str | None = None, end_date: str | None = None
             continue
         try:
             frame = call_api(api, ts_code=code, start_date=start, end_date=end)
-            rows = _save_raw(table, frame)
+            rows = _save_raw(table, frame, batch_id=batch_id)
             total += rows
             _checkpoint(checkpoint_dataset, key, "done", rows)
             if index % int(batch_size) == 0:

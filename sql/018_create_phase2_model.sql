@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS std.security_lifecycle (
     source VARCHAR(30) NOT NULL,
     source_record_key VARCHAR(180) NOT NULL,
     record_version BIGINT NOT NULL DEFAULT 0,
+    source_payload_hash CHAR(64),
     quality_status VARCHAR(30) NOT NULL DEFAULT 'UNVERIFIED',
     fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (ts_code, effective_from, effective_to, source)
@@ -149,6 +150,7 @@ CREATE TABLE IF NOT EXISTS std.dividend_event (
     report_date DATE,
     announce_date DATE,
     implementation_status VARCHAR(20),
+    -- Tushare dividend fields are per-share values; cash_div is after-tax.
     stock_div DOUBLE PRECISION,
     stock_bonus_rate DOUBLE PRECISION,
     stock_conversion_rate DOUBLE PRECISION,
@@ -179,6 +181,7 @@ CREATE TABLE IF NOT EXISTS std.index_daily_tushare (
     pre_close DOUBLE PRECISION,
     change DOUBLE PRECISION,
     pct_chg DOUBLE PRECISION,
+    -- Tushare vol is hands and amount is thousand yuan; stored here as shares/yuan.
     volume DOUBLE PRECISION,
     amount DOUBLE PRECISION,
     source VARCHAR(30) NOT NULL,
@@ -330,6 +333,7 @@ CREATE TABLE IF NOT EXISTS feature.shareholder_return_v1 (
     feature_id BIGSERIAL PRIMARY KEY,
     ts_code VARCHAR(20) NOT NULL,
     asof_date DATE NOT NULL,
+    -- Sum of Tushare per-share after-tax cash_div over the trailing 12 months (yuan/share).
     cash_div_12m DOUBLE PRECISION,
     dividend_event_count_3y INTEGER,
     dividend_year_count_3y INTEGER,

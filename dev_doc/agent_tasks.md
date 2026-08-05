@@ -1,6 +1,12 @@
 # Agent 任务清单
 
-更新时间：2026-08-03
+更新时间：2026-08-05
+
+## T-011｜历史行情缺口补采与派生层重建
+
+- 时间：2026-08-04
+- 状态：已完成
+- 结果：补齐 `daily`、`daily_basic` 缺失交易日，核心行情 Raw 覆盖 1212/1212；Standard、PIT、Feature 已重建，质量审计通过。
 
 ## T-008｜阶段一数据质量与 Raw→Standard 验收
 
@@ -74,10 +80,66 @@
 - 当前结果：计划已保存至 `dev_doc/development_plan_3_phases.md`，并补充 PIT、可交易状态、公司行为、回测和 AI 边界约束。
 - 下一步：完成 T-001/T-002 的全量质量报告和 Raw 重建验收，再进入 PIT。
 
+## T-010｜基线冻结与日常增量改造
+
+- 时间：2026-08-04
+- 目标：历史数据验收后建立冻结基线，并将后续行情/阶段二增量改为按日期或事件窗口请求。
+- 状态：已完成
+- 当前结果：新增 `tushare_data_release`、`tushare_release.py`、`tushare_phase2_incremental.py`；行情接口按日请求，触及接口上限自动按代码分片；分红按公告日期窗口；Raw 继续哈希幂等追加。216 只股票历史复权因子缺口已全部修复，生命周期 Standard NULL 区间重复已清理，Standard/价格 Feature 已重建，最终质量审计通过。
+- 验证结果：真实接口 dry-run 验证 `adj_factor` 单日 5549 行；`stock_st` 209 行；`suspend_d` 10 行；`stk_limit` 触发 5800 上限后分片成功；重复真实写入未增加 Raw 行数。
+- 下一步：以 `baseline_20260731` 为增量起点，运行正式每日增量并进入 Research/Backtest 前的研究快照设计。
+
 ## T-009｜阶段二 PIT 与 Feature
 
 - 时间：2026-08-04
 - 目标：补齐历史状态、公司行为、指数 Raw，并建立生命周期、PIT 和 Feature v1。
-- 状态：进行中
-- 当前结果：阶段二迁移、同步任务、Standard/PIT/Feature 代码已完成首版；`stock_st`、`suspend_d`、`stk_limit` 主同步完成，`namechange` 正在按股票 checkpoint 后台同步。
-- 下一步：完成 `namechange`、`dividend`、`index_daily`，补采空响应交易日，重建状态/PIT/Feature，并执行质量、未来函数和幂等验收。
+- 状态：历史基线和日常闭环完成
+- 当前结果：阶段二迁移、六类 Raw 同步任务、Standard/PIT/Feature 代码和历史串行后台编排已完成首版；历史事件 Raw 已按 checkpoint 处理，日常增量已改为独立按日/事件窗口任务。
+- 关键约束：Raw 只追加、不修改、不删除；历史初始化按原接口粒度断点执行，日常状态类按交易日、分红按公告日期窗口、名称变更低频按日期窗口、指数按代码区间请求；`empty` 响应单独补采；所有派生表允许重建但不得反写 Raw。
+- 当前结果：六类阶段二 Raw、历史 Standard/PIT/Feature 和 `baseline_20260803` 已完成验收；空响应按合法状态保留。日常增量后的 Feature 依赖重建、生命周期区间归并、分红业务版本选择、财务版本同步和自动质量门禁均已接通并通过当前库验收。
+
+## T-012｜财务指标版本链路与阶段二最终验收
+
+- 时间：2026-08-04
+- 目标：将 `tushare_fina_indicator_raw` 接入版本 Raw、Standard、PIT 和 Feature，完成可审计的财务事实链路。
+- 状态：已完成
+- 实施范围：新增 `fina_indicator_raw_version` 和 `fina_indicator_standard`；明确 `or_yoy` 为营业收入同比、`tr_yoy` 为营业总收入同比、`q_sales_yoy` 为单季度营业收入同比；保留 `ann_date`、版本号、`payload_hash` 及原始字段。
+- 约束：PIT/Feature 停止直接读取 `stock_financial_indicator`；使用 `COALESCE(f_ann_date, ann_date)`，不得伪造 `f_ann_date`；旧 `stock_financial_indicator` 先作为只读兼容表保留。新旧 PIT 差异不要求逐行相同，但必须能由公告日、版本和指标口径解释并审计。
+- 当前结果：已创建 `fina_indicator_raw_version`、`fina_indicator_standard`，完成现有 115,646 条 Raw 回填；`or_yoy`、`tr_yoy`、`q_sales_yoy` 已进入 Standard、PIT 和 Feature，财务 PIT/Feature 已按新链路重建，重复写入幂等验证通过。
+- 验收结果：Raw→Standard 对账、版本可追溯、`revenue_yoy` 映射、未来函数、重复键和重建幂等全部通过；已创建并验证 `baseline_20260803`，旧 `baseline_20260731` 保留为 superseded 审计记录。
+- 下一步：进入 Research/Backtest 前的研究快照设计；仍不自动下单。
+
+## T-013｜阶段二日常持续运行闭环
+
+- 时间：2026-08-05
+- 目标：补齐日常增量从数据获取、Raw 版本、Standard/PIT 到 Feature 的完整依赖链，并建立可阻断错误发布的质量门禁。
+- 状态：已完成
+- 财务增量：`income`、`balancesheet`、`cashflow` 按公告日期窗口增量；`fina_indicator` 按股票、公告日/报告期范围和最近若干季度回补，遵守单次 100 条限制，使用分页、checkpoint 和重试。
+- 生命周期：使用 `namechange.start_date/end_date`，对开放 `end_date` 通过下一条 `start_date - 1 天` 推导，生成同一证券同一日期最多一个有效区间。
+- 分红：区分预案和实施；按业务键保留版本，只有 `div_proc='实施'` 且 `ex_date <= decision_date` 的有效事件进入股东回报 PIT/Feature。
+- 依赖重建：行情增量后重建价格/估值 Feature；分红增量后重建股东回报 Feature；财务增量后重建财务 Standard/PIT/Feature；任务失败不得发布新基线。
+- 验收：补充生命周期重叠、分红业务去重、增量后派生同步、质量门禁和阶段二专项测试；通过后才进入 Research/Backtest。
+- 已实现：三张财务报表实时写入同步版本层；财务增量任务按接口语义分流，`fina_indicator` 按报告期季度切片并对 100 条上限拒绝截断；生命周期 Standard 已归并为非重叠区间；分红 Standard 按业务键取最新版本，股东回报仅使用“实施”且已除权事件；行情、分红、财务增量均接入派生重建编排；发布校验改为质量门禁先行。
+- 当前结果：已用 3 只股票完成四接口真实财务增量验证：`income`、`balancesheet`、`cashflow` 均真实请求并记录 empty checkpoint，`fina_indicator` 真实写入 5 条 Raw/版本记录；随后自动重建财务 Standard/PIT/Feature（财务 PIT 6,198,431 行、公司财务 Feature 115,651 行）。质量门禁仍通过，版本血缘和未来函数检查均为 0。
+- 备注：31 条上游“实施但缺少 ex_date”的原始分红记录作为 Standard WARNING 保留，因无除权日不会进入股东回报 Feature，不阻断发布；全量 pytest 574 passed、1 skipped、2 个既有通知前缀测试失败，与本任务无关。
+- 下一步：补充正式调度接线，再建立 Research 发布快照；仍不自动下单。
+
+## T-014｜阶段三 Research 快照可复现基础
+
+- 时间：2026-08-05
+- 目标：建立 Research 快照 Manifest、输入切片哈希、逐行血缘、一致性生成和数据库冻结机制。
+- 状态：已完成基础实现与血缘补强，暂不生成正式快照
+- 当前结果：新增 `sql/024_create_research_snapshot.sql`、`sql/025_research_lineage_sources.sql`、`research_snapshot.py` 和专项测试；数据库迁移已应用。事务回滚验证真实执行 build→validate→freeze，5,535 行单日快照、8 张输入统计和 8 个血缘组均通过，回滚后无残留数据；派生来源已写入稳定哈希与 v1 版本，生命周期已补齐 Raw record_id/payload_hash 血缘。
+- 测试口径：新增血缘回归测试后，`tests/test_research_snapshot.py` 单独 6 passed；与 `tests/test_phase2_business_rules.py` 合计 12 passed。
+- 约束：Research 生成器可读取通过质量门禁的 PIT/Feature；Research/Backtest 只允许读取 `FROZEN` 快照；正式快照待 Research 表和观察池完成后生成。
+- 下一步：开发 Research 观察池和证据引用，再生成第一份正式 FROZEN 快照。
+
+## T-015｜阶段三 Research 观察池与证据引用
+
+- 时间：2026-08-05
+- 目标：在快照之上建立可解释观察池和 OpenSearch/URL 证据引用，不接入自动交易。
+- 状态：已完成最小实现，暂不生成正式快照
+- 当前结果：新增 `sql/026_create_research_watchlist.sql`、`sql/027_research_audit_immutability.sql`、`research_watchlist.py` 和观察池专项测试；默认只消费 FROZEN，预览模式显式允许 VALIDATED；规则版本为 `watchlist-v1`，支持价值质量/成长趋势两条轨道、总人数上限、去重和结构化理由；证据表只保存来源定位、内容哈希和正反方角色，不复制正文。
+- 审计约束：ACTIVE 观察池只能归档，ACTIVE/ARCHIVED 成员和证据只能追加；应用层和数据库触发器均校验股票属于快照，绑定观察池时必须属于观察池成员。
+- 验证：事务内生成并激活 1 个 FROZEN 观察池、写入 1 条证据引用；成员/证据修改删除、观察池删除和快照外股票引用均被阻断，回滚后无残留。
+- 下一步：清理并提交全部代码后，重新确认 `baseline_20260803=validated`，生成第一份正式 FROZEN 快照，再创建正式观察池。

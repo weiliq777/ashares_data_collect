@@ -24,6 +24,8 @@ CHECKS = {
     "tushare_balancesheet_raw": ("ts_code", "ann_date", "end_date"),
     "tushare_cashflow_raw": ("ts_code", "ann_date", "end_date"),
     "tushare_financial_raw_version": ("dataset", "business_key", "payload_hash"),
+    "fina_indicator_raw_version": ("business_key", "payload_hash"),
+    "fina_indicator_standard": ("source", "source_record_key", "record_version", "payload_hash"),
     "financial_income_standard": ("source", "source_record_key", "record_version"),
     "financial_balance_sheet_standard": ("source", "source_record_key", "record_version"),
     "financial_cash_flow_standard": ("source", "source_record_key", "record_version"),
@@ -44,6 +46,7 @@ CHECKS = {
     "feature.valuation_daily_v1": ("ts_code", "trade_date"),
     "feature.company_financial_v1": ("ts_code", "report_date", "source_record_key", "record_version"),
     "feature.shareholder_return_v1": ("ts_code", "asof_date"),
+    "ops.feature_registry": ("feature_name", "feature_version"),
 }
 DATE_COLUMNS = {
     "stock_basic_info": "list_date",
@@ -56,6 +59,8 @@ DATE_COLUMNS = {
     "tushare_balancesheet_raw": "end_date",
     "tushare_cashflow_raw": "end_date",
     "tushare_financial_raw_version": "end_date",
+    "fina_indicator_raw_version": "end_date",
+    "fina_indicator_standard": "report_date",
     "financial_income_standard": "report_date",
     "financial_balance_sheet_standard": "report_date",
     "financial_cash_flow_standard": "report_date",
@@ -76,6 +81,7 @@ DATE_COLUMNS = {
     "feature.valuation_daily_v1": "trade_date",
     "feature.company_financial_v1": "report_date",
     "feature.shareholder_return_v1": "asof_date",
+    "ops.feature_registry": None,
 }
 
 
@@ -132,6 +138,92 @@ def run() -> dict:
         except Exception as exc:
             result[table] = {"error": str(exc)}
     result["phase2_invariants"] = inspect_phase2_invariants()
+    result["phase2_checkpoint_completeness"] = inspect_phase2_checkpoint_completeness()
+    return result
+
+
+def inspect_phase2_checkpoint_completeness() -> dict:
+    """检查二阶段六类 Raw 任务是否已覆盖预期 checkpoint；空响应是合法状态。"""
+    result = {}
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH date_bounds AS (
+                SELECT dataset, MIN(to_date(checkpoint_key, 'YYYYMMDD')) AS start_date,
+                       MAX(to_date(checkpoint_key, 'YYYYMMDD')) AS end_date
+                FROM tushare_history_checkpoint
+                WHERE dataset IN ('stock_st', 'suspend_d', 'stk_limit')
+                  AND checkpoint_key ~ '^[0-9]{8}$'
+                GROUP BY dataset
+            ), expected_dates AS (
+                SELECT b.dataset, COUNT(c.cal_date) AS expected
+                FROM date_bounds b
+                LEFT JOIN tushare_trade_cal_raw c
+                  ON c.exchange = 'SSE'
+                 AND (c.payload->>'is_open')::int = 1
+                 AND c.cal_date BETWEEN b.start_date AND b.end_date
+                GROUP BY b.dataset
+            ), actual_dates AS (
+                SELECT dataset, COUNT(*) FILTER (WHERE status IN ('done','empty')) AS actual,
+                       COUNT(*) FILTER (WHERE status = 'failed') AS failed
+                FROM tushare_history_checkpoint
+                WHERE dataset IN ('stock_st', 'suspend_d', 'stk_limit')
+                GROUP BY dataset
+            )
+            SELECT e.dataset, e.expected, COALESCE(a.actual, 0), COALESCE(a.failed, 0)
+            FROM expected_dates e
+            LEFT JOIN actual_dates a USING (dataset)
+            ORDER BY e.dataset
+            """
+        )
+        for dataset, expected, actual, failed in cur.fetchall():
+            result[dataset] = {
+                "expected": expected,
+                "completed": actual,
+                "missing": max(expected - actual, 0),
+                "failed": failed,
+            }
+
+        cur.execute(
+            """
+            SELECT d.dataset,
+                   MAX(s.stock_count) AS expected,
+                   COUNT(c.checkpoint_key) FILTER (WHERE c.status IN ('done','empty')) AS completed,
+                   COUNT(*) FILTER (WHERE c.status = 'failed') AS failed
+            FROM (VALUES ('namechange'), ('dividend')) AS d(dataset)
+            CROSS JOIN (SELECT COUNT(*) AS stock_count
+                        FROM stock_basic_info
+                        WHERE list_status IN ('L','D','P','G')) s
+            LEFT JOIN tushare_history_checkpoint c ON c.dataset = d.dataset
+            GROUP BY d.dataset, s.stock_count
+            ORDER BY d.dataset
+            """
+        )
+        for dataset, expected, completed, failed in cur.fetchall():
+            result[dataset] = {
+                "expected": expected,
+                "completed": completed,
+                "missing": max(expected - completed, 0),
+                "failed": failed,
+            }
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS expected,
+                   COUNT(*) FILTER (WHERE status IN ('done','empty')) AS completed,
+                   COUNT(*) FILTER (WHERE status = 'failed') AS failed
+            FROM (VALUES ('000300.SH'), ('000905.SH'), ('000852.SH'), ('000016.SH')) AS d(ts_code)
+            LEFT JOIN tushare_history_checkpoint c
+              ON c.dataset = 'index_daily' AND c.checkpoint_key = d.ts_code
+            """
+        )
+        expected, completed, failed = cur.fetchone()
+        result["index_daily"] = {
+            "expected": expected,
+            "completed": completed,
+            "missing": max(expected - completed, 0),
+            "failed": failed,
+        }
     return result
 
 
@@ -159,6 +251,34 @@ def inspect_phase2_invariants() -> dict:
             SELECT COUNT(*) FROM tushare_history_checkpoint
             WHERE dataset IN ('stock_st','suspend_d','stk_limit','namechange','dividend','index_daily')
               AND status = 'failed'
+        """,
+        "fina_indicator_standard_missing_or_yoy": """
+            SELECT COUNT(*) FROM fina_indicator_raw_version r
+            WHERE (r.payload ? 'or_yoy')
+              AND NOT EXISTS (
+                  SELECT 1 FROM fina_indicator_standard s
+                  WHERE s.source_record_key = r.business_key
+                    AND s.payload_hash = r.payload_hash
+              )
+        """,
+        "fina_indicator_standard_missing_lineage": """
+            SELECT COUNT(*) FROM fina_indicator_standard
+            WHERE source_record_key IS NULL OR payload_hash IS NULL OR record_version IS NULL
+        """,
+        "financial_pit_missing_lineage": """
+            SELECT COUNT(*) FROM pit.financial_asof
+            WHERE effective_announce_date IS NOT NULL
+              AND (source_record_key IS NULL OR payload_hash IS NULL OR record_version IS NULL)
+        """,
+        "financial_feature_missing_revenue_mapping": """
+            SELECT COUNT(*) FROM fina_indicator_standard s
+            WHERE s.or_yoy IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM feature.company_financial_v1 f
+                  WHERE f.source_record_key = s.source_record_key
+                    AND f.record_version = s.record_version
+                    AND f.revenue_yoy = s.or_yoy
+              )
         """,
     }
     result = {}

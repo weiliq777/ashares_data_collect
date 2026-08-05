@@ -28,31 +28,63 @@ def _execute(sql: str, params=None) -> int:
 
 def rebuild_lifecycle() -> int:
     _execute("TRUNCATE TABLE std.security_lifecycle RESTART IDENTITY")
-    stock_sql = """
+    # namechange 是名称历史的权威来源；同一证券同一开始日只保留最新 Raw 快照。
+    # 开放 end_date 用下一次 start_date - 1 天推导，避免与下一段名称重叠。
+    lifecycle_sql = """
     INSERT INTO std.security_lifecycle
         (ts_code, symbol, name, exchange, market, list_status, list_date, delist_date,
-         effective_from, effective_to, source, source_record_key, quality_status)
-    SELECT stock_code, symbol, name, split_part(stock_code, '.', 2), market, list_status,
-           list_date, delist_date, COALESCE(list_date, DATE '1990-01-01'), delist_date,
-           source, stock_code || ':stock_basic',
-           CASE WHEN list_date IS NULL THEN 'WARNING' ELSE 'VALID' END
-    FROM stock_basic_info
+         effective_from, effective_to, source, source_record_key, record_version,
+         source_payload_hash, quality_status)
+    WITH ranked AS (
+        SELECT DISTINCT ON (n.ts_code, n.start_date)
+               n.ts_code, n.start_date, n.end_date, n.payload->>'name' AS name,
+               n.payload_hash, n.source, n.fetched_at, n.record_id
+        FROM tushare_namechange_raw n
+        WHERE n.start_date IS NOT NULL
+        ORDER BY n.ts_code, n.start_date, n.fetched_at DESC, n.record_id DESC
+    ), chained AS (
+        SELECT r.*, LEAD(r.start_date) OVER (PARTITION BY r.ts_code ORDER BY r.start_date) AS next_start
+        FROM ranked r
+    ), named AS (
+        SELECT c.ts_code, b.symbol, c.name, split_part(c.ts_code, '.', 2) AS exchange,
+               b.market, b.list_status, b.list_date, b.delist_date,
+               GREATEST(c.start_date, COALESCE(b.list_date, c.start_date)) AS effective_from,
+               NULLIF(LEAST(COALESCE(c.end_date, DATE '9999-12-31'),
+                            COALESCE(c.next_start - 1, DATE '9999-12-31'),
+                            COALESCE(b.delist_date, DATE '9999-12-31')),
+                      DATE '9999-12-31') AS effective_to,
+               c.source, c.ts_code || ':namechange:' || c.payload_hash AS source_record_key,
+               c.record_id AS record_version, c.payload_hash AS source_payload_hash,
+               CASE WHEN c.next_start IS NULL AND c.end_date IS NULL THEN 'VALID' ELSE 'VALID' END AS quality_status,
+               c.fetched_at
+        FROM chained c
+        LEFT JOIN stock_basic_info b ON b.stock_code = c.ts_code
+    ), fallback AS (
+        SELECT b.stock_code AS ts_code, b.symbol, b.name, split_part(b.stock_code, '.', 2),
+               b.market, b.list_status, b.list_date, b.delist_date,
+               COALESCE(b.list_date, DATE '1990-01-01'), b.delist_date,
+               b.source, b.stock_code || ':stock_basic',
+               1::bigint,
+               CASE WHEN r.payload IS NULL THEN NULL
+                    ELSE encode(digest(convert_to(r.payload::text, 'UTF8'), 'sha256'), 'hex') END,
+               CASE WHEN b.list_date IS NULL THEN 'WARNING' ELSE 'VALID' END, b.fetched_at
+        FROM stock_basic_info b
+        LEFT JOIN tushare_stock_basic_raw r ON r.ts_code = b.stock_code
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tushare_namechange_raw n
+            WHERE n.ts_code=b.stock_code AND n.start_date IS NOT NULL
+        )
+    ), all_rows AS (
+        SELECT * FROM named WHERE effective_from <= COALESCE(effective_to, DATE '9999-12-31')
+        UNION ALL SELECT * FROM fallback
+    )
+    SELECT ts_code, symbol, name, exchange, market, list_status, list_date, delist_date,
+           effective_from, effective_to, source, source_record_key, record_version,
+           source_payload_hash, quality_status
+    FROM all_rows
     ON CONFLICT DO NOTHING
     """
-    name_sql = """
-
-    INSERT INTO std.security_lifecycle
-        (ts_code, symbol, name, exchange, market, list_status, list_date, delist_date,
-         effective_from, effective_to, source, source_record_key, quality_status)
-    SELECT n.ts_code, b.symbol, n.payload->>'name', split_part(n.ts_code, '.', 2), b.market,
-           b.list_status, b.list_date, b.delist_date,
-           COALESCE(n.start_date, b.list_date, DATE '1990-01-01'), n.end_date,
-           n.source, n.ts_code || ':namechange:' || n.payload_hash, 'VALID'
-    FROM tushare_namechange_raw n
-    LEFT JOIN stock_basic_info b ON b.stock_code = n.ts_code
-    ON CONFLICT DO NOTHING
-    """
-    return _execute(stock_sql) + _execute(name_sql)
+    return _execute(lifecycle_sql)
 
 
 def rebuild_status_daily() -> int:
@@ -196,7 +228,7 @@ def rebuild_dividend() -> int:
         (ts_code, report_date, announce_date, implementation_status, stock_div,
          stock_bonus_rate, stock_conversion_rate, cash_div, cash_div_tax,
          record_date, ex_date, pay_date, div_list_date, implementation_announce_date,
-         source, source_record_key, record_version, quality_status)
+        source, source_record_key, record_version, business_key, payload_hash, quality_status)
     SELECT ts_code, end_date, ann_date, div_proc,
            NULLIF(payload->>'stk_div', '')::double precision,
            NULLIF(payload->>'stk_bo_rate', '')::double precision,
@@ -207,9 +239,19 @@ def rebuild_dividend() -> int:
            to_date(NULLIF(payload->>'pay_date', ''), 'YYYYMMDD'),
            to_date(NULLIF(payload->>'div_listdate', ''), 'YYYYMMDD'),
            to_date(NULLIF(payload->>'imp_ann_date', ''), 'YYYYMMDD'),
-           source, ts_code || ':' || payload_hash, 0,
+           source, business_key, record_id, business_key, payload_hash,
            CASE WHEN div_proc = '实施' AND ex_date IS NULL THEN 'WARNING' ELSE 'VALID' END
-    FROM tushare_dividend_raw
+    FROM (
+      SELECT DISTINCT ON (ts_code, end_date, ann_date, div_proc, record_date, ex_date, (payload->>'imp_ann_date'))
+             record_id, ts_code, end_date, ann_date, div_proc, record_date, ex_date,
+             payload, source, payload_hash,
+             ts_code || ':' || COALESCE(end_date::text,'') || ':' || COALESCE(ann_date::text,'') || ':' ||
+             COALESCE(div_proc,'') || ':' || COALESCE(record_date::text,'') || ':' ||
+             COALESCE(ex_date::text,'') || ':' || COALESCE((payload->>'imp_ann_date'),'') AS business_key
+      FROM tushare_dividend_raw
+      ORDER BY ts_code, end_date, ann_date, div_proc, record_date, ex_date, (payload->>'imp_ann_date'),
+               fetched_at DESC, record_id DESC
+    ) d
     ON CONFLICT (source, source_record_key, record_version) DO UPDATE SET
       report_date=EXCLUDED.report_date, announce_date=EXCLUDED.announce_date,
       implementation_status=EXCLUDED.implementation_status, stock_div=EXCLUDED.stock_div,
@@ -217,6 +259,7 @@ def rebuild_dividend() -> int:
       record_date=EXCLUDED.record_date, ex_date=EXCLUDED.ex_date,
       pay_date=EXCLUDED.pay_date, div_list_date=EXCLUDED.div_list_date,
       implementation_announce_date=EXCLUDED.implementation_announce_date,
+      business_key=EXCLUDED.business_key, payload_hash=EXCLUDED.payload_hash,
       quality_status=EXCLUDED.quality_status, fetched_at=CURRENT_TIMESTAMP
     """
     return _execute(sql)
@@ -254,27 +297,40 @@ def rebuild_financial_asof() -> int:
     INSERT INTO pit.financial_asof
         (decision_date, ts_code, report_date, effective_announce_date, ann_date,
          f_ann_date, report_type, comp_type, record_version, source_record_key,
-         roe, roa, debt_to_assets, revenue_yoy, netprofit_yoy, quality_status)
-    SELECT f.trade_date, f.stock_code, f.report_date, f.announce_date, f.announce_date,
-        NULL, NULL, NULL, 0,
-        f.stock_code || ':' || f.report_date || ':' || COALESCE(f.announce_date::text, ''),
-        f.roe, f.roa, f.debt_to_assets, f.revenue_yoy, f.netprofit_yoy,
-        CASE WHEN f.announce_date IS NULL THEN 'MISSING_SOURCE' ELSE 'VALID' END
+         roe, roa, debt_to_assets, revenue_yoy, netprofit_yoy, or_yoy, tr_yoy,
+         q_sales_yoy, payload_hash, quality_status)
+    SELECT f.trade_date, f.ts_code, f.report_date, f.effective_announce_date,
+        f.ann_date, f.f_ann_date, f.report_type, f.comp_type, f.record_version,
+        f.source_record_key, f.roe, f.roa, f.debt_to_assets, f.or_yoy,
+        f.netprofit_yoy, f.or_yoy, f.tr_yoy, f.q_sales_yoy, f.payload_hash,
+        f.quality_status
     FROM (
-        SELECT DISTINCT ON (d.trade_date, f.stock_code)
-            d.trade_date, f.stock_code, f.report_date, f.announce_date,
-            f.roe, f.roa, f.debt_to_assets, f.revenue_yoy, f.netprofit_yoy,
-            f.fetched_at
-        FROM (SELECT DISTINCT trade_date FROM daily_kline) d
-        JOIN stock_financial_indicator f
-          ON f.announce_date IS NOT NULL AND f.announce_date <= d.trade_date
-        ORDER BY d.trade_date, f.stock_code, f.announce_date DESC, f.report_date DESC, f.fetched_at DESC
+        SELECT d.trade_date, i.ts_code, i.report_date, i.effective_announce_date,
+               i.ann_date, i.f_ann_date, i.report_type, i.comp_type, i.record_version,
+               i.source_record_key, i.roe, i.roa, i.debt_to_assets, i.or_yoy,
+               i.tr_yoy, i.q_sales_yoy, i.netprofit_yoy, i.payload_hash,
+               i.quality_status, i.fetched_at
+        FROM (SELECT DISTINCT stock_code, trade_date FROM daily_kline) d
+        JOIN LATERAL (
+            SELECT i.*
+            FROM fina_indicator_standard i
+            WHERE i.ts_code = d.stock_code
+              AND i.effective_announce_date IS NOT NULL
+              AND i.effective_announce_date <= d.trade_date
+            ORDER BY i.effective_announce_date DESC, i.report_date DESC,
+                     i.record_version DESC, i.fetched_at DESC
+            LIMIT 1
+        ) i ON TRUE
     ) f
     ON CONFLICT (decision_date, ts_code) DO UPDATE SET
       report_date=EXCLUDED.report_date, effective_announce_date=EXCLUDED.effective_announce_date,
-      ann_date=EXCLUDED.ann_date, roe=EXCLUDED.roe, roa=EXCLUDED.roa,
-      debt_to_assets=EXCLUDED.debt_to_assets, revenue_yoy=EXCLUDED.revenue_yoy,
-      netprofit_yoy=EXCLUDED.netprofit_yoy, quality_status=EXCLUDED.quality_status,
+      ann_date=EXCLUDED.ann_date, f_ann_date=EXCLUDED.f_ann_date,
+      report_type=EXCLUDED.report_type, comp_type=EXCLUDED.comp_type,
+      record_version=EXCLUDED.record_version, source_record_key=EXCLUDED.source_record_key,
+      roe=EXCLUDED.roe, roa=EXCLUDED.roa, debt_to_assets=EXCLUDED.debt_to_assets,
+      revenue_yoy=EXCLUDED.revenue_yoy, netprofit_yoy=EXCLUDED.netprofit_yoy,
+      or_yoy=EXCLUDED.or_yoy, tr_yoy=EXCLUDED.tr_yoy, q_sales_yoy=EXCLUDED.q_sales_yoy,
+      payload_hash=EXCLUDED.payload_hash, quality_status=EXCLUDED.quality_status,
       calculated_at=CURRENT_TIMESTAMP
     """
     return _execute(sql)

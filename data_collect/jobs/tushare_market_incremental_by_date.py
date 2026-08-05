@@ -18,6 +18,7 @@ import pandas as pd
 
 from data_collect.jobs.tushare_daily_incremental import (
     _assert_standard_count,
+    _codes,
     _checkpoint,
     _date,
     _rebuild_market_date,
@@ -26,6 +27,7 @@ from data_collect.jobs.tushare_daily_incremental import (
 )
 from data_collect.normalize.tushare_daily import normalize_daily, normalize_daily_basic
 from data_collect.providers.tushare_client import call_api, get_pro
+from data_collect.utils.db import get_connection
 
 
 logger = logging.getLogger("tushare_market_incremental_by_date")
@@ -50,6 +52,33 @@ DATASETS = {
     "adj_factor": ("adj_factor_daily", "adj_factor"),
 }
 
+# Tushare 单次返回上限。达到上限时不能默认为数据完整。
+ROW_LIMITS = {
+    "daily": 6000,
+    "daily_basic": 6000,
+    "adj_factor": 6000,
+}
+
+
+def _validated_baseline_cutoff(explicit: str | None = None):
+    """读取已验收历史基线，增量任务不跨越冻结点。"""
+    if explicit:
+        return _date(explicit)
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT baseline_cutoff_date
+               FROM tushare_data_release
+               WHERE status='validated'
+               ORDER BY validated_at DESC NULLS LAST, release_id DESC
+               LIMIT 1"""
+        )
+        row = cur.fetchone()
+    if not row:
+        raise RuntimeError(
+            "未找到 validated 数据基线；请先建立历史发布点，或显式传入 baseline_cutoff"
+        )
+    return row[0]
+
 
 def _normalize_for_count(dataset: str, frame: pd.DataFrame) -> pd.DataFrame:
     if dataset == "daily":
@@ -66,6 +95,37 @@ def _filter_sample(frame: pd.DataFrame, sample_codes: set[str] | None) -> pd.Dat
     return frame[frame[column].isin(sample_codes)].copy()
 
 
+def _request_market_frame(pro, dataset: str, day: str) -> pd.DataFrame:
+    """按日请求；命中接口上限时按代码分片，避免静默截断。"""
+    api = getattr(pro, DATASETS[dataset][1])
+    frame = call_api(api, trade_date=day)
+    limit = ROW_LIMITS[dataset]
+    if frame is None or len(frame) < limit:
+        return frame
+
+    logger.warning(
+        "dataset=%s trade_date=%s rows=%s reached limit=%s; fallback to code chunks",
+        dataset,
+        day,
+        len(frame),
+        limit,
+    )
+    chunks = []
+    codes = _codes()
+    for offset in range(0, len(codes), 1000):
+        code_batch = ",".join(codes[offset : offset + 1000])
+        if not code_batch:
+            continue
+        part = call_api(api, ts_code=code_batch, trade_date=day)
+        if part is not None and not part.empty:
+            chunks.append(part)
+    if not chunks:
+        return pd.DataFrame(columns=frame.columns)
+    key = [column for column in ("ts_code", "trade_date") if column in chunks[0].columns]
+    result = pd.concat(chunks, ignore_index=True)
+    return result.drop_duplicates(subset=key) if key else result
+
+
 def _sync_one_date(
     pro,
     dataset: str,
@@ -75,11 +135,10 @@ def _sync_one_date(
     dry_run: bool = False,
 ) -> int:
     standard_table, api_name = DATASETS[dataset]
-    api = getattr(pro, api_name)
     checkpoint_dataset = f"{dataset}_incremental_by_date"
 
     # 关键点：三类接口均按 trade_date 请求全市场，不再传入 ts_code 循环股票。
-    frame = call_api(api, trade_date=day)
+    frame = _request_market_frame(pro, dataset, day)
     frame = _filter_sample(frame, sample_codes)
     rows = 0 if frame is None else len(frame)
     if frame is None or frame.empty:
@@ -88,6 +147,10 @@ def _sync_one_date(
         if not dry_run:
             _checkpoint(checkpoint_dataset, day, "empty", 0, message)
         return 0
+
+    limit = ROW_LIMITS[dataset]
+    if rows >= limit and not sample_codes:
+        raise RuntimeError(f"{dataset} {day} 分片后仍达到接口上限 {limit}，拒绝标记完成")
 
     if dry_run:
         transformed = _normalize_for_count(dataset, frame)
@@ -123,6 +186,8 @@ def run(
     dataset: str = "all",
     limit_stocks: int | None = None,
     dry_run: bool = False,
+    baseline_cutoff: str | None = None,
+    rebuild_derived: bool = True,
 ) -> str:
     """同步最近交易日。
 
@@ -142,12 +207,15 @@ def run(
     if calendar is None or calendar.empty:
         return "没有找到需要同步的交易日"
 
+    cutoff = _validated_baseline_cutoff(baseline_cutoff)
+    calendar = calendar[pd.to_datetime(calendar["cal_date"]) > pd.Timestamp(cutoff)]
+    if calendar.empty:
+        return f"最近 {lookback_days} 个交易日均不晚于历史基线 {cutoff}，无需增量"
+
     days = calendar["cal_date"].astype(str).tolist()
     selected = list(DATASETS) if dataset == "all" else [dataset]
     sample_codes = None
     if limit_stocks:
-        from data_collect.jobs.tushare_daily_incremental import _codes
-
         sample_codes = set(_codes()[: int(limit_stocks)])
         logger.warning("sample mode enabled: only %s stocks", len(sample_codes))
 
@@ -183,7 +251,10 @@ def run(
                 raise
             time.sleep(float(batch_pause))
 
-    return f"按交易日增量完成 batch_id={batch_id} dates={days} versions={total}"
+    if rebuild_derived and not dry_run and total:
+        from data_collect.jobs.tushare_derived_rebuild import rebuild_after_market
+        rebuild_after_market()
+    return f"按交易日增量完成 batch_id={batch_id} dates={days} versions={total} derived_rebuilt={rebuild_derived and not dry_run and bool(total)}"
 
 
 def main() -> None:
@@ -194,6 +265,11 @@ def main() -> None:
     parser.add_argument("--dataset", choices=["all", *DATASETS], default="all")
     parser.add_argument("--limit-stocks", type=int)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--baseline-cutoff",
+        help="显式指定历史基线截止日 YYYYMMDD；未指定时读取数据库 validated 基线",
+    )
+    parser.add_argument("--no-rebuild-derived", action="store_true")
     args = parser.parse_args()
     print(
         run(
@@ -203,6 +279,8 @@ def main() -> None:
             dataset=args.dataset,
             limit_stocks=args.limit_stocks,
             dry_run=args.dry_run,
+            baseline_cutoff=args.baseline_cutoff,
+            rebuild_derived=not args.no_rebuild_derived,
         )
     )
 

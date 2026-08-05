@@ -97,9 +97,9 @@ flowchart LR
 
 该表与`daily_kline`通过`stock_code + trade_date`关联，但估值不是行情字段，不能混入日线表。
 
-### 2.4 `stock_financial_indicator`：统一财务指标
+### 2.4 `stock_financial_indicator`：旧版兼容指标表
 
-来源：Tushare `fina_indicator`。
+来源：Tushare `fina_indicator` 的历史兼容 Standard。当前仅只读保留；PIT/Feature 不再直接读取此表。
 
 主键：`(stock_code, report_date, announce_date, source)`。
 
@@ -135,8 +135,10 @@ flowchart LR
 | `ocf_to_or` | `fina_indicator.ocf_to_or` |
 | `eps` | `fina_indicator.eps` |
 | `bps` | `fina_indicator.bps` |
-| `revenue_yoy` | `fina_indicator`或由`income`计算 |
+| `revenue_yoy` | `fina_indicator.or_yoy` |
 | `netprofit_yoy` | `fina_indicator`或由`income`计算 |
+
+说明：`revenue_yoy` 已由 `or_yoy` 写入 `fina_indicator_standard`、PIT 和 Feature。Tushare 原始字段仍需区分：`tr_yoy` 为营业总收入同比、`or_yoy` 为营业收入同比、`q_sales_yoy` 为单季度营业收入同比。严格实现“连续四个季度营收同比增长”时，优先使用 `q_sales_yoy`，并保留 `ann_date`、`end_date` 后进入 PIT，不能直接用年度同比字段替代。
 
 ## 3. Tushare原始数据表
 
@@ -261,9 +263,10 @@ OpenSearch中的公告和新闻用于：
 erDiagram
     stock_basic_info ||--o{ daily_kline : "stock_code"
     stock_basic_info ||--o{ valuation_daily : "stock_code"
-    stock_basic_info ||--o{ stock_financial_indicator : "stock_code"
+    stock_basic_info ||--o{ stock_financial_indicator : "legacy stock_code"
     stock_basic_info ||--o{ tushare_stock_basic_raw : "stock_code=ts_code"
-    stock_financial_indicator ||--o{ tushare_fina_indicator_raw : "code/report/announce"
+    tushare_fina_indicator_raw ||--o{ fina_indicator_raw_version : "payload_hash"
+    fina_indicator_raw_version ||--o{ fina_indicator_standard : "record_id/payload_hash"
     stock_basic_info ||--o{ tushare_income_raw : "stock_code=ts_code"
     stock_basic_info ||--o{ tushare_balancesheet_raw : "stock_code=ts_code"
     stock_basic_info ||--o{ tushare_cashflow_raw : "stock_code=ts_code"
@@ -278,7 +281,7 @@ daily_kline.trade_date
         +
 valuation_daily.trade_date
         +
-stock_financial_indicator.announce_date <= trade_date
+fina_indicator_standard.effective_announce_date <= trade_date
 ```
 
 这样可以回答：某个交易日当时已知的财务质量、估值和趋势是什么。
@@ -306,7 +309,11 @@ valuation_daily
 ```text
 Tushare fina_indicator
         ├── tushare_fina_indicator_raw
-        └── stock_financial_indicator
+        └── fina_indicator_raw_version
+                ↓
+        fina_indicator_standard
+                ↓
+        pit.financial_asof → feature.company_financial_v1
 
 Tushare income
         └── tushare_income_raw
@@ -321,8 +328,8 @@ Tushare cashflow
 ### 最终分析
 
 ```text
-stock_financial_indicator
-    → ROE/负债率/现金流过滤
+fina_indicator_standard / feature.company_financial_v1
+    → ROE/负债率/营收同比/现金流过滤
 
 valuation_daily
     → PE/PB/市值/换手率过滤
@@ -384,7 +391,7 @@ QMT/MiniQMT               当前不启用
 | 复权因子 `adj_factor` | raw 表和标准表已建立，raw 初始化正在补齐 | 完成初始化后可用于严格复权收益分析 |
 | `trade_cal`持久化 | raw 表和标准表已建立 | 已支持离线审计和任务重放 |
 | 财务全市场覆盖 | 四张财务 Raw 已按 5,874 只股票完成历史初始化，三张报表 Standard 正在全量同步 | Standard 全量质量验收和 PIT 完成前，不直接用于正式历史筛选 |
-| `revenue_yoy`、`netprofit_yoy` | 标准表已预留，但当前指标请求未完整填充 | 后续需增加接口字段或由利润表计算 |
+| `revenue_yoy`、`netprofit_yoy` | `revenue_yoy` 已映射自 `or_yoy`；`tr_yoy`、`q_sales_yoy` 单独保留，并经 PIT 控制可用日期 | 可用于成长筛选；“连续四个季度增长”必须使用 `q_sales_yoy` |
 | 三大报表标准层 | 三张 Standard 表结构已建立，已完成样本验证，正式全量同步进行中 | 全量质量验收前，策略暂不直接依赖全部财务字段 |
 | PE/PB历史分位 | 已有每日估值快照，尚未形成分位计算任务 | 还不能直接输出“历史20%/30%分位”结论 |
 | 日线历史完整性 | 五年行情 Raw/Standard 已完成历史转换；每日增量按最近 5 个交易日回补 | 仍需完成增量修正验证和最终质量报告 |
@@ -426,7 +433,7 @@ Tushare daily          -> tushare_daily_raw          -> daily_kline
 Tushare daily_basic    -> tushare_daily_basic_raw    -> valuation_daily
 Tushare adj_factor     -> tushare_adj_factor_raw     -> adj_factor_daily
 Tushare trade_cal      -> tushare_trade_cal_raw      -> trading_calendar
-Tushare fina_indicator -> tushare_fina_indicator_raw -> stock_financial_indicator
+Tushare fina_indicator -> tushare_fina_indicator_raw -> fina_indicator_raw_version -> fina_indicator_standard -> pit.financial_asof -> feature.company_financial_v1
 Tushare income         -> tushare_income_raw
 Tushare balancesheet   -> tushare_balancesheet_raw
 Tushare cashflow       -> tushare_cashflow_raw
@@ -437,7 +444,7 @@ Tushare cashflow       -> tushare_cashflow_raw
 
 新增 `tushare_market_raw_version`，保存 `daily`、`daily_basic`、`adj_factor`、`trade_cal` 每次成功抓取的完整 JSON、业务键、批次号、抓取时间和 SHA-256。现有 `*_raw` 表只做首次业务记录的幂等追加，不更新或删除历史记录。
 
-每日任务 `data_collect/jobs/tushare_daily_incremental.py` 默认回补最近 5 个交易日：先写 Raw 版本，再重建对应日期的 Standard，并核对 Raw 最新版本行数与 Standard 行数。重复运行允许生成新抓取版本，但不会产生重复 Standard 主键。
+正式每日任务 `data_collect/jobs/tushare_market_incremental_by_date.py` 默认回补最近 5 个交易日：按交易日请求 `daily`、`daily_basic`、`adj_factor`，先写 Raw 版本，再重建对应日期的 Standard，并核对 Raw 最新版本行数与 Standard 行数。接口达到返回上限时自动按股票代码分片，拒绝静默截断；重复运行允许生成新抓取版本，但不会产生重复 Standard 主键。旧的 `tushare_daily_incremental.py` 仅作历史兼容或排障使用。
 ## 13. 财务报表 Standard 设计冻结
 
 三张财务报表保持独立事实表：
@@ -450,11 +457,11 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 
 `financial_income_standard` 用于收入、营业利润、净利润和 EPS；`financial_balance_sheet_standard` 用于资产负债率、现金、应收、存货、商誉和债务风险；`financial_cash_flow_standard` 用于经营现金流、投资现金流、融资现金流、资本开支和现金质量。
 
-三张表均需保留 `stock_code`、`report_date`、`announce_date`、`f_ann_date`、`report_type`、`comp_type`、`end_type`、`update_flag`、`source`、`record_version`、`quality_status` 和 `fetched_at`。金额、股数、比例等字段必须明确单位；第一版只标准化核心分析字段，未映射字段继续保留在 Raw。
+三张表均需保留 `stock_code`、`report_date`、`announce_date`、`f_ann_date`、`report_type`、`comp_type`、`end_type`、`update_flag`、`source`、`record_version`、`payload_hash`、`quality_status` 和 `fetched_at`。金额、股数、比例等字段必须明确单位；第一版只标准化核心分析字段，未映射字段继续保留在 Raw。`payload_hash` 用于确认 Standard 行可从对应版本 Raw 重建。
 
 财务数据必须先经过不可变 Raw 版本层。PIT 生成 `effective_announce_date`：优先使用 `f_ann_date`，为空时使用 `ann_date`；两个原始日期都必须保留。Standard 保留所有报表口径和修订版本，研究默认筛选合并报表，不能按报告期直接覆盖旧记录。
 
-历史记录：三张财务报表 Raw、财务 Raw 版本表和三张 Standard 表结构已建立；当前实际进度和阶段二新增对象见本文末尾的“阶段二新增模型”与 `dev_doc/phase2_implementation.md`。
+历史记录：三张财务报表 Raw、财务 Raw 版本表和三张 Standard 表结构已建立；`fina_indicator` 另有独立的 `fina_indicator_raw_version` 和 `fina_indicator_standard`，用于保留指标口径、版本和 `payload_hash`。PIT/Feature 正式使用新的指标 Standard，旧 `stock_financial_indicator` 仅作只读兼容表保留。当前实际进度和阶段二新增对象见本文末尾的“阶段二新增模型”与 `dev_doc/phase2_implementation.md`。
 
 ## 14. 阶段二新增模型（2026-08-04）
 
@@ -466,7 +473,7 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 | `suspend_d` | `tushare_suspend_d_raw`：停复牌事件 | `std.security_status_daily`、`pit.security_tradeability_daily`：可交易判断 |
 | `stk_limit` | `tushare_stk_limit_raw`：每日涨跌停价格 | 同上：买卖限制判断 |
 | `namechange` | `tushare_namechange_raw`：名称变更区间 | `std.security_lifecycle`：历史名称/生命周期 |
-| `dividend` | `tushare_dividend_raw`：分红送转原始事件 | `std.dividend_event`、`feature.shareholder_return_v1` |
+| `dividend` | `tushare_dividend_raw`：分红送转原始事件 | `std.dividend_event`：按 `business_key` 取最新有效版本；`feature.shareholder_return_v1`：仅使用实施且 `ex_date` 已到期事件 |
 | `index_daily` | `tushare_index_daily_raw`：指数日线 | `std.index_daily_tushare`：基准和超额收益 |
 
 阶段二 PIT/Feature：
@@ -477,3 +484,26 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 - `feature.price_daily_v1`、`feature.valuation_daily_v1`、`feature.company_financial_v1`、`feature.shareholder_return_v1`：分别提供价格趋势、估值分位、财务质量和股东回报特征，均记录质量状态和来源日期。
 
 阶段二当前进度以 `dev_doc/phase2_implementation.md` 和 `dev_doc/agent_tasks.md` 为准；旧的阶段一状态描述仅作历史记录，不代表当前进度。
+
+阶段二执行约束：历史验收后通过 `tushare_data_release` 冻结基线；正式行情增量使用 `tushare_market_incremental_by_date` 按交易日请求 `daily`、`daily_basic`、`adj_factor`，成功后自动重建状态/PIT、价格和估值 Feature；阶段二增量使用 `tushare_phase2_incremental`，其中状态类按交易日、分红按公告日期窗口、名称变更低频按日期窗口、指数按代码和日期区间请求，成功后自动重建受影响 Feature。财务增量使用 `tushare_financial_incremental`，报表按公告日期窗口、`fina_indicator` 按股票和报告期窗口请求，成功后重建财务 Standard/PIT/Feature。接口达到返回上限时必须分片并验证，不能静默标记完成。Raw 使用 checkpoint、完整 payload 和 payload_hash 幂等追加，所有 Standard、PIT、Feature 均可重建，任何派生任务不得修改或删除 Raw。`std.security_lifecycle` 使用名称变更区间归并，`std.dividend_event` 按业务键选择有效版本。
+
+新增控制表 `tushare_data_release`：记录历史基线标签、截止日、验收状态和质量报告哈希。`draft` 仅用于准备，`validated` 才能被增量任务自动读取；`superseded` 保留历史发布审计记录。
+
+## 15. Research 快照模型（2026-08-05）
+
+阶段三使用 `research.snapshot_manifest` 作为 Research/Backtest 的不可变边界。
+快照生成器可以读取通过质量门禁的 PIT/Feature，但 Research 分析和 Backtest
+只能读取 `FROZEN` 快照。一个 `snapshot_id` 只对应一个
+`research_cutoff_date`，`research.stock_snapshot_daily.research_date` 由数据库触发器
+强制等于该截止日。
+
+新增对象和详细契约见 `dev_doc/research_snapshot.md`：
+
+- `research.snapshot_manifest`：基线标签、Schema 版本、Git commit/dirty/diff、质量哈希、输入汇总哈希和状态；
+- `research.snapshot_input`：本次实际切片的筛选条件、字段集合、哈希算法、行数、日期范围和内容哈希；
+- `research.stock_snapshot_daily`：指定截止日的个股研究输入；
+- `research.snapshot_lineage`：字段组到来源表、记录键、版本和 payload 哈希的血缘。派生 PIT/Feature v1 记录使用实际字段哈希和 v1 版本；财务、生命周期使用真实 Raw/Standard 版本链路；非缺失来源缺少版本或哈希时由快照校验拒绝。
+
+`sql/024_create_research_snapshot.sql` 通过触发器禁止非法状态流转、删除 Manifest，
+以及 `FROZEN` 后修改/删除所有子表。生成器使用 `REPEATABLE READ`，输入内容发生变化
+时校验失败，必须重新构建。正式回测只接受 `FROZEN` 快照，当前只完成基础实现和回滚验证，尚未生成正式快照。

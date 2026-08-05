@@ -73,6 +73,25 @@ feature.company_financial_v1
 
 验收：任意历史日可还原股票池，财务数据不穿越，特征可从 raw/standard 重算。
 
+### 阶段二本轮实现补充（2026-08-04）
+
+阶段二已冻结为以下可重建流水线：
+
+```text
+六类状态/公司行为/指数 Raw
+→ 空响应补采
+→ Standard 状态与公司行为
+→ PIT 股票池、可交易性、财务 as-of
+→ Feature v1
+→ 质量、未来函数、单位和幂等验收
+```
+
+本轮新增的 Raw 接口为 `stock_st`、`suspend_d`、`stk_limit`、`namechange`、`dividend` 和 `index_daily`。历史初始化可以按股票断点执行；日常增量按接口能力选择：状态类按交易日，分红按公告日期窗口，名称变更低频按日期窗口，指数按代码和日期区间。所有任务使用 checkpoint 续传；完整原始 JSON、哈希、批次和抓取时间必须保留，Raw 禁止更新或删除。
+
+对应派生对象为 `std.security_lifecycle`、`std.security_status_daily`、`std.dividend_event`、`std.index_daily_tushare`、`pit.universe_daily`、`pit.security_tradeability_daily`、`pit.financial_asof`，以及 `feature.price_daily_v1`、`feature.valuation_daily_v1`、`feature.company_financial_v1`、`feature.shareholder_return_v1` 和 `ops.feature_registry`。
+
+阶段二由 `tools/phase2_resume_and_finish.ps1` 串行编排，避免并发触发接口流控；完成后由只读质量任务检查 Raw 覆盖、重复键、空响应、财务未来函数、单位、可交易性、缺失复权因子和重建幂等性。阶段二未通过验收前，不进入 Research、Backtest 和 Portfolio。
+
 ## 阶段三：Research、Backtest 与 Portfolio
 
 目标：形成研究快照、可解释回测和人工确认的模拟组合流程。
@@ -85,6 +104,8 @@ backtest_strategy, backtest_run, backtest_signal, backtest_order
 backtest_fill, backtest_position, backtest_cash_ledger, portfolio_simulation
 ```
 
+阶段三当前实现边界：`research_watchlist.py` 只消费已通过质量门禁的快照，默认要求 `FROZEN`；`allow_preview` 仅用于联调 `VALIDATED` 快照。观察池使用固定 `watchlist-v1` 规则保存价值质量/成长趋势分轨、总人数上限、去重结果和结构化理由。`research.evidence_reference` 只保存 OpenSearch、URL 或人工材料的引用定位、内容哈希和正反方角色，不复制正文。详见 `dev_doc/research_watchlist.md`。
+
 主要工作：
 
 1. 生成结构化股票研究快照并关联公告、新闻和研报证据。
@@ -94,6 +115,26 @@ backtest_fill, backtest_position, backtest_cash_ledger, portfolio_simulation
 5. AI 只负责解释、摘要、反方证据和风险提示，不直接下单。
 
 验收：回测可按数据和特征版本重算，包含交易成本和不可成交情况，研究结论可追溯。
+
+阶段三第一主线冻结为 Research 快照可复现基础：
+
+```text
+024 快照表结构
+→ Manifest/输入切片统计
+→ REPEATABLE READ 一致性生成
+→ source lineage
+→ validate
+→ FROZEN
+→ Research 观察池
+→ Backtest
+```
+
+第一版一个 `snapshot_id` 只允许一个 `research_cutoff_date`。快照生成器可以读取通过
+质量门禁的 PIT/Feature；Research 和 Backtest 只能读取 `FROZEN` 快照。输入哈希只覆盖
+实际使用的切片和字段，并保存筛选条件、字段集合、哈希算法、行数、日期范围和内容哈希。
+Manifest 必须绑定 validated 数据基线、Schema 版本、Git 版本、质量报告哈希和输入汇总哈希。
+工作区有未提交修改时必须记录 `diff_hash` 或代码归档；数据库触发器保证非法状态跳转和
+`FROZEN` 后的更新/删除失败。详细实施契约见 `dev_doc/research_snapshot.md`。
 
 ## 当前执行顺序
 

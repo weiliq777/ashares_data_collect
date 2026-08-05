@@ -59,7 +59,19 @@ def _done(dataset, key):
         cur.execute("SELECT status FROM tushare_history_checkpoint WHERE dataset=%s AND checkpoint_key=%s",
                     (dataset, key))
         row = cur.fetchone()
-    return bool(row and row[0] == "done")
+        if not row or row[0] != "done":
+            return False
+        # A historical checkpoint is not proof that Raw still contains the
+        # snapshot.  Validate date-based market checkpoints against Raw so a
+        # stale checkpoint cannot permanently hide a missing trade date.
+        raw_table = {
+            "daily": "tushare_daily_raw",
+            "valuation": "tushare_daily_basic_raw",
+        }.get(dataset)
+        if raw_table:
+            cur.execute(f"SELECT 1 FROM {raw_table} WHERE trade_date=%s LIMIT 1", (_date(key),))
+            return cur.fetchone() is not None
+    return True
 
 
 def _save_market_raw(table, df, key_fields):
@@ -185,6 +197,11 @@ def run(start_date=None, end_date=None, limit_stocks=None, max_days=None, includ
             try:
                 raw_df = call_api(api, trade_date=day)
                 raw_table = "tushare_daily_raw" if dataset == "daily" else "tushare_daily_basic_raw"
+                if raw_df is None or raw_df.empty:
+                    message = "Tushare 返回空响应；不标记为 done，等待缺口补采"
+                    logger.warning("market dataset empty dataset=%s trade_date=%s", dataset, day)
+                    _checkpoint(dataset, day, "empty", 0, message)
+                    continue
                 _save_market_raw(raw_table, raw_df, ["ts_code", "trade_date"])
                 df = normalizer(raw_df)
                 if limit_stocks and not df.empty and normalize_standard:

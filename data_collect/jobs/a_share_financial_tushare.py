@@ -8,14 +8,17 @@ from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.utils.db import get_connection, save_to_postgres
 
 
-INDICATOR_FIELDS = "ts_code,ann_date,end_date,roe,roa,debt_to_assets,grossprofit_margin,netprofit_margin,ocf_to_or,eps,bps"
+INDICATOR_FIELDS = (
+    "ts_code,ann_date,end_date,roe,roa,debt_to_assets,grossprofit_margin,"
+    "netprofit_margin,ocf_to_or,eps,bps,or_yoy,tr_yoy,q_sales_yoy,netprofit_yoy"
+)
 
 
 def _date(v):
     return pd.to_datetime(v, format="%Y%m%d", errors="coerce").date() if v else None
 
 
-def _save_raw(table, rows):
+def _save_raw(table, rows, batch_id=None):
     if not rows:
         return 0
     with get_connection() as conn:
@@ -24,6 +27,14 @@ def _save_raw(table, rows):
                 clean = {k: (None if pd.isna(v) else v) for k, v in row.items()}
                 cur.execute(f'''INSERT INTO "{table}" (ts_code, ann_date, end_date, payload) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING''', (row["ts_code"], _date(row.get("ann_date")), _date(row.get("end_date")), json.dumps(clean, ensure_ascii=False, allow_nan=False)))
         conn.commit()
+    if table == "tushare_fina_indicator_raw":
+        from data_collect.jobs.tushare_fina_indicator_version import save_indicator_versions
+
+        save_indicator_versions(rows, batch_id=batch_id)
+    else:
+        from data_collect.jobs.tushare_financial_raw_version_backfill import save_financial_versions
+
+        save_financial_versions(table.removeprefix("tushare_").removesuffix("_raw"), rows, batch_id=batch_id)
     return len(rows)
 
 

@@ -219,14 +219,18 @@ def rebuild_company_financial() -> int:
     sql = """
     INSERT INTO feature.company_financial_v1
         (ts_code, report_date, effective_announce_date, ann_date, f_ann_date, roe, roa,
-         debt_to_assets, revenue_yoy, netprofit_yoy, operating_cashflow, net_profit,
+         debt_to_assets, revenue_yoy, or_yoy, tr_yoy, q_sales_yoy, netprofit_yoy,
+         operating_cashflow, net_profit,
          operating_cashflow_to_profit, grossprofit_margin, netprofit_margin,
-         quality_status, source_record_key, record_version)
-    SELECT f.stock_code, f.report_date, f.announce_date, f.announce_date, NULL,
+         quality_status, source_record_key, record_version, payload_hash)
+    SELECT f.ts_code, f.report_date, f.effective_announce_date, f.ann_date, f.f_ann_date,
            NULLIF(f.roe, 'NaN'::double precision),
            NULLIF(f.roa, 'NaN'::double precision),
            NULLIF(f.debt_to_assets, 'NaN'::double precision),
-           NULLIF(f.revenue_yoy, 'NaN'::double precision),
+           NULLIF(f.or_yoy, 'NaN'::double precision),
+           NULLIF(f.or_yoy, 'NaN'::double precision),
+           NULLIF(f.tr_yoy, 'NaN'::double precision),
+           NULLIF(f.q_sales_yoy, 'NaN'::double precision),
            NULLIF(f.netprofit_yoy, 'NaN'::double precision),
            NULLIF(cf.n_cashflow_act, 'NaN'::double precision),
            NULLIF(inc.net_profit, 'NaN'::double precision),
@@ -234,28 +238,30 @@ def rebuild_company_financial() -> int:
              / NULLIF(NULLIF(inc.net_profit, 'NaN'::double precision), 0),
            NULLIF(f.grossprofit_margin, 'NaN'::double precision),
            NULLIF(f.netprofit_margin, 'NaN'::double precision),
-           CASE WHEN f.announce_date IS NULL THEN 'MISSING_SOURCE'
+           CASE WHEN f.effective_announce_date IS NULL THEN 'MISSING_SOURCE'
                 WHEN f.roe = 'NaN'::double precision OR f.debt_to_assets = 'NaN'::double precision
                   OR cf.n_cashflow_act = 'NaN'::double precision OR inc.net_profit = 'NaN'::double precision
                 THEN 'WARNING' ELSE 'VALID' END,
-           f.stock_code || ':' || f.report_date || ':' || COALESCE(f.announce_date::text, ''), 0
-    FROM stock_financial_indicator f
+           f.source_record_key, f.record_version, f.payload_hash
+    FROM fina_indicator_standard f
     LEFT JOIN LATERAL (
         SELECT n_cashflow_act FROM financial_cash_flow_standard c
-        WHERE c.stock_code=f.stock_code AND c.report_date=f.report_date
-          AND (f.announce_date IS NULL OR c.announce_date <= f.announce_date)
+        WHERE c.stock_code=f.ts_code AND c.report_date=f.report_date
+          AND (f.effective_announce_date IS NULL OR c.announce_date <= f.effective_announce_date)
         ORDER BY c.announce_date DESC NULLS LAST, c.financial_id DESC LIMIT 1
     ) cf ON TRUE
     LEFT JOIN LATERAL (
         SELECT net_profit FROM financial_income_standard i
-        WHERE i.stock_code=f.stock_code AND i.report_date=f.report_date
-          AND (f.announce_date IS NULL OR i.announce_date <= f.announce_date)
+        WHERE i.stock_code=f.ts_code AND i.report_date=f.report_date
+          AND (f.effective_announce_date IS NULL OR i.announce_date <= f.effective_announce_date)
         ORDER BY i.announce_date DESC NULLS LAST, i.financial_id DESC LIMIT 1
     ) inc ON TRUE
     ON CONFLICT (ts_code, report_date, source_record_key, record_version) DO UPDATE SET
       effective_announce_date=EXCLUDED.effective_announce_date, roe=EXCLUDED.roe,
       roa=EXCLUDED.roa, debt_to_assets=EXCLUDED.debt_to_assets,
-      revenue_yoy=EXCLUDED.revenue_yoy, netprofit_yoy=EXCLUDED.netprofit_yoy,
+      revenue_yoy=EXCLUDED.revenue_yoy, or_yoy=EXCLUDED.or_yoy,
+      tr_yoy=EXCLUDED.tr_yoy, q_sales_yoy=EXCLUDED.q_sales_yoy,
+      netprofit_yoy=EXCLUDED.netprofit_yoy, payload_hash=EXCLUDED.payload_hash,
       operating_cashflow=EXCLUDED.operating_cashflow, net_profit=EXCLUDED.net_profit,
       operating_cashflow_to_profit=EXCLUDED.operating_cashflow_to_profit,
       quality_status=EXCLUDED.quality_status, calculated_at=CURRENT_TIMESTAMP
@@ -277,6 +283,7 @@ def rebuild_shareholder_return() -> int:
     LEFT JOIN std.dividend_event e
       ON e.ts_code=d.stock_code AND e.ex_date > d.trade_date - INTERVAL '3 years'
      AND e.ex_date <= d.trade_date
+     AND e.implementation_status = '实施'
     GROUP BY d.stock_code, d.trade_date
     ON CONFLICT (ts_code, asof_date) DO UPDATE SET
       cash_div_12m=EXCLUDED.cash_div_12m,
@@ -293,7 +300,7 @@ def register_features() -> int:
     VALUES
       ('price_daily', 'v1', 'stock x trade_date', 'rows before current trade_date only', ARRAY['daily_kline','adj_factor_daily'], 'phase2'),
       ('valuation_daily', 'v1', 'stock x trade_date', 'rolling 3y/5y positive observations', ARRAY['valuation_daily'], 'phase2'),
-      ('company_financial', 'v1', 'stock x report_date/version', 'announce_date controls availability', ARRAY['stock_financial_indicator','financial_income_standard','financial_cash_flow_standard'], 'phase2'),
+      ('company_financial', 'v1', 'stock x report_date/version', 'effective_announce_date controls availability', ARRAY['fina_indicator_standard','financial_income_standard','financial_cash_flow_standard'], 'phase2'),
       ('shareholder_return', 'v1', 'stock x asof_date', 'ex_date <= asof_date', ARRAY['std.dividend_event'], 'phase2')
     ON CONFLICT (feature_name) DO UPDATE SET
       feature_version=EXCLUDED.feature_version, grain=EXCLUDED.grain,
