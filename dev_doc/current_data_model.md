@@ -1,6 +1,6 @@
 # 当前金融数据模型与来源说明
 
-更新时间：2026-08-02
+更新时间：2026-08-05
 
 本文只描述当前实际启用、已接入或作为分析主模型使用的数据。不列出尚未启用、依赖QMT/MiniQMT且当前为空的QMT专用表。
 
@@ -24,7 +24,7 @@ flowchart LR
 | 股票基础信息 | PostgreSQL | Tushare `stock_basic` | 股票代码、名称、市场、上市状态 |
 | 日线行情 | PostgreSQL | Tushare `daily` | K线、均线、趋势、成交量 |
 | 估值快照 | PostgreSQL | Tushare `daily_basic` | PE、PB、PS、市值、换手率 |
-| 复权因子 | 已建立 raw 表并正在初始化 | Tushare `adj_factor` | 前复权/后复权计算 |
+| 复权因子 | PostgreSQL Raw + Standard | Tushare `adj_factor` | 前复权/后复权计算 |
 | 财务指标 | PostgreSQL | Tushare `fina_indicator` | ROE、资产负债率、现金流质量 |
 | 三大财务报表 | PostgreSQL原始层 | Tushare `income`、`balancesheet`、`cashflow` | 财务核验、重算指标 |
 | 新闻、政策、监管 | OpenSearch | RSS、RSSHub、AkShare、网页/API | 信息发现和交叉验证 |
@@ -506,4 +506,35 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 
 `sql/024_create_research_snapshot.sql` 通过触发器禁止非法状态流转、删除 Manifest，
 以及 `FROZEN` 后修改/删除所有子表。生成器使用 `REPEATABLE READ`，输入内容发生变化
-时校验失败，必须重新构建。正式回测只接受 `FROZEN` 快照，当前只完成基础实现和回滚验证，尚未生成正式快照。
+时校验失败，必须重新构建。正式回测只接受 `FROZEN` 快照。
+
+当前正式状态：FROZEN 快照为
+`9afb9a08-da75-439b-8b4a-fcc688df3787`，研究截止日为 `2026-08-03`，基线为
+`baseline_20260803`，包含 5,535 条股票快照、8 张输入统计和 44,280 条血缘记录。
+该快照基于干净 Git commit `658a8c8` 生成并通过 build、validate、freeze。
+
+## 16. Research 观察池与证据引用模型（2026-08-05）
+
+Research 观察池建立在 FROZEN 快照之上，不读取实时 PIT/Feature，不修改 Raw/Standard/PIT/Feature，
+也不自动下单。相关迁移为 `sql/026_create_research_watchlist.sql` 和
+`sql/027_research_audit_immutability.sql`。
+
+| 对象 | 用途 | 关键约束 |
+|---|---|---|
+| `research.watchlist` | 观察池身份、快照绑定、规则版本和状态 | ACTIVE 只能归档；ACTIVE 必须绑定 FROZEN 快照 |
+| `research.watchlist_member` | 观察池股票、排名、分数、筛选轨道和结构化理由 | 股票必须存在于对应快照；ACTIVE 只能追加 |
+| `research.evidence_reference` | 外部新闻/公告/研报或 PostgreSQL 事实的引用元数据 | 只保存定位、哈希、时间和 claim_role，不复制正文 |
+
+观察池当前规则版本为 `watchlist-v1`，包含 `value_quality` 和 `growth_trend` 两条轨道，
+同一股票跨轨道去重。正式观察池
+`01b53411-155e-4672-9548-189396e7a3e0` 已激活，基于上述 FROZEN 快照，当前有 3 个
+`value_quality` 成员和 9 条 PostgreSQL 快照事实引用。
+
+审计规则：ACTIVE 观察池成员和证据只能追加；ARCHIVED 观察池、成员和证据全部不可变；
+需要修正时新建 `watchlist_id`。证据必须属于快照股票，绑定观察池时还必须属于该观察池成员。
+
+外部证据候选由 `data_collect/jobs/research_evidence_candidates.py` 只读检索 OpenSearch，
+返回 `document_index`、`document_id`、URL、发布时间和摘要片段，并标记
+`REVIEW_REQUIRED`，不会自动写入证据表。当前真实联调未命中 3 个成员的股票标签，
+名称文本搜索存在误匹配风险，不能直接作为 supporting 或 contrary 证据；必须人工核验后使用
+`add_evidence` 绑定真实文档。
