@@ -128,18 +128,18 @@
 
 - 时间：2026-08-05
 - 目标：建立 Research 快照 Manifest、输入切片哈希、逐行血缘、一致性生成和数据库冻结机制。
-- 状态：已完成基础实现与血缘补强，暂不生成正式快照
-- 当前结果：新增 `sql/024_create_research_snapshot.sql`、`sql/025_research_lineage_sources.sql`、`research_snapshot.py` 和专项测试；数据库迁移已应用。事务回滚验证真实执行 build→validate→freeze，5,535 行单日快照、8 张输入统计和 8 个血缘组均通过，回滚后无残留数据；派生来源已写入稳定哈希与 v1 版本，生命周期已补齐 Raw record_id/payload_hash 血缘。
+- 状态：已完成，正式 FROZEN 快照已生成
+- 当前结果：新增 `sql/024_create_research_snapshot.sql`、`sql/025_research_lineage_sources.sql`、`research_snapshot.py` 和专项测试；正式快照 `9afb9a08-da75-439b-8b4a-fcc688df3787` 已基于干净 commit `658a8c8` 完成 build→validate→freeze，5,535 行单日快照、8 张输入统计和 44,280 条血缘记录通过校验。
 - 测试口径：新增血缘回归测试后，`tests/test_research_snapshot.py` 单独 6 passed；与 `tests/test_phase2_business_rules.py` 合计 12 passed。
-- 约束：Research 生成器可读取通过质量门禁的 PIT/Feature；Research/Backtest 只允许读取 `FROZEN` 快照；正式快照待 Research 表和观察池完成后生成。
-- 下一步：开发 Research 观察池和证据引用，再生成第一份正式 FROZEN 快照。
+- 约束：Research 生成器可读取通过质量门禁的 PIT/Feature；Research/Backtest 只允许读取 `FROZEN` 快照；正式快照已冻结，后续不得更新或删除其子表。
+- 下一步：继续补充真实 OpenSearch/公告/研报证据引用，再进入 Research 人工复核；暂不进入正式 Backtest。
 
 ## T-015｜阶段三 Research 观察池与证据引用
 
 - 时间：2026-08-05
 - 目标：在快照之上建立可解释观察池和 OpenSearch/URL 证据引用，不接入自动交易。
-- 状态：已完成最小实现，暂不生成正式快照
+- 状态：已完成，正式观察池已创建并激活
 - 当前结果：新增 `sql/026_create_research_watchlist.sql`、`sql/027_research_audit_immutability.sql`、`research_watchlist.py` 和观察池专项测试；默认只消费 FROZEN，预览模式显式允许 VALIDATED；规则版本为 `watchlist-v1`，支持价值质量/成长趋势两条轨道、总人数上限、去重和结构化理由；证据表只保存来源定位、内容哈希和正反方角色，不复制正文。
 - 审计约束：ACTIVE 观察池只能归档，ACTIVE/ARCHIVED 成员和证据只能追加；应用层和数据库触发器均校验股票属于快照，绑定观察池时必须属于观察池成员。
-- 验证：事务内生成并激活 1 个 FROZEN 观察池、写入 1 条证据引用；成员/证据修改删除、观察池删除和快照外股票引用均被阻断，回滚后无残留。
-- 下一步：清理并提交全部代码后，重新确认 `baseline_20260803=validated`，生成第一份正式 FROZEN 快照，再创建正式观察池。
+- 验证：正式观察池 `01b53411-155e-4672-9548-189396e7a3e0` 已基于 FROZEN 快照激活，当前 3 个 `value_quality` 成员；已写入 9 条 PostgreSQL 快照事实引用，重复执行幂等；外部 OpenSearch/公告/研报证据待真实文档绑定。
+- 下一步：为 3 个成员补充真实外部证据和反方证据，完成 Research 人工复核后再设计 Backtest 输入。

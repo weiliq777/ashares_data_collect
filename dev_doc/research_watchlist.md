@@ -48,6 +48,9 @@
 
 .\.venv\Scripts\python.exe -m data_collect.jobs.research_watchlist activate `
   --watchlist-id <WATCHLIST_ID>
+
+.\.venv\Scripts\python.exe -m data_collect.jobs.research_watchlist lineage-evidence `
+  --watchlist-id <ACTIVE_WATCHLIST_ID>
 ```
 
 正式使用顺序仍是：

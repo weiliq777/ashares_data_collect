@@ -30,3 +30,10 @@ def test_audit_migration_makes_active_records_append_only():
     assert "ACTIVE/ARCHIVED watchlist members are append-only" in sql
     assert "ACTIVE/ARCHIVED evidence is append-only" in sql
     assert "evidence stock is not a member of watchlist" in sql
+
+
+def test_snapshot_lineage_evidence_is_explicitly_not_external_news():
+    from data_collect.jobs.research_watchlist import add_snapshot_lineage_evidence
+
+    assert "快照血缘" in add_snapshot_lineage_evidence.__doc__
+    assert "新闻" in add_snapshot_lineage_evidence.__doc__

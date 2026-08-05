@@ -208,6 +208,59 @@ def add_evidence(
     return evidence_id
 
 
+def add_snapshot_lineage_evidence(watchlist_id: str) -> int:
+    """把观察池使用的财务、价格和估值快照血缘登记为 PostgreSQL 事实引用。
+
+    这不是新闻/公告证据；外部证据仍需通过 ``add_evidence`` 绑定真实文档 ID。
+    """
+    psycopg2, _ = require_psycopg2()
+    Json = psycopg2.extras.Json
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT w.snapshot_id, w.status, m.status
+               FROM research.watchlist w
+               JOIN research.snapshot_manifest m ON m.snapshot_id=w.snapshot_id
+               WHERE w.watchlist_id=%s""",
+            (watchlist_id,),
+        )
+        parent = cur.fetchone()
+        if not parent or parent[1] != "ACTIVE" or parent[2] != "FROZEN":
+            raise RuntimeError("快照事实引用要求 ACTIVE 观察池和 FROZEN 快照")
+        snapshot_id = parent[0]
+        cur.execute(
+            """SELECT m.ts_code, l.field_group, l.source_table, l.source_record_key,
+                      l.source_record_version, l.source_payload_hash
+               FROM research.watchlist_member m
+               JOIN research.snapshot_lineage l
+                 ON l.snapshot_id=m.snapshot_id AND l.research_date=m.research_date
+                AND l.ts_code=m.ts_code
+               WHERE m.watchlist_id=%s
+                 AND l.field_group IN ('financial','price','valuation')
+                 AND l.source_record_key NOT LIKE '%%:missing'
+                 AND l.source_payload_hash IS NOT NULL""",
+            (watchlist_id,),
+        )
+        inserted = 0
+        for ts_code, group, source_table, key, version, payload_hash in cur.fetchall():
+            cur.execute(
+                """INSERT INTO research.evidence_reference
+                   (evidence_id,watchlist_id,snapshot_id,ts_code,source_system,source_type,
+                    source_locator,document_id,content_hash,claim_role,locator,note)
+                   VALUES (%s,%s,%s,%s,'postgres','snapshot_lineage',%s,%s,%s,'context',%s,%s)
+                   ON CONFLICT DO NOTHING""",
+                (
+                    str(uuid.uuid4()), watchlist_id, snapshot_id, ts_code,
+                    f"{source_table}:{key}", key, payload_hash,
+                    Json({"field_group": group, "source_table": source_table,
+                          "source_record_key": key, "source_record_version": version}),
+                    "Research 快照事实来源；不代表外部新闻或公告证据。",
+                ),
+            )
+            inserted += cur.rowcount
+        conn.commit()
+    return inserted
+
+
 def main():
     parser = argparse.ArgumentParser(description="Research 观察池与证据引用")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -219,12 +272,16 @@ def main():
     create.add_argument("--notes", default="")
     activate = sub.add_parser("activate")
     activate.add_argument("--watchlist-id", required=True)
+    lineage = sub.add_parser("lineage-evidence")
+    lineage.add_argument("--watchlist-id", required=True)
     args = parser.parse_args()
     if args.command == "create":
         print(create_watchlist(args.snapshot_id, args.name, args.max_members,
                                allow_preview=args.allow_preview, notes=args.notes))
-    else:
+    elif args.command == "activate":
         activate_watchlist(args.watchlist_id)
+    else:
+        print(add_snapshot_lineage_evidence(args.watchlist_id))
 
 
 if __name__ == "__main__":
