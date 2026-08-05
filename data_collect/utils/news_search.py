@@ -249,10 +249,10 @@ def _join_highlight(highlight) -> List[str] | None:
     return fragments or None
 
 
-def _format_hit(hit: dict, score) -> Dict[str, Any]:
+def _format_hit(hit: dict, score, *, include_identity: bool = False) -> Dict[str, Any]:
     """OpenSearch hit → 消费方 hit（溯源三件套 url/source/pub_time；url 可缺省 None）。"""
     src = hit.get("_source") or {}
-    return {
+    result = {
         "title": src.get("title"),
         "source": src.get("source"),
         "channel": src.get("channel"),
@@ -261,12 +261,17 @@ def _format_hit(hit: dict, score) -> Dict[str, Any]:
         "score": score,
         "highlight": _join_highlight(hit.get("highlight")),
     }
+    if include_identity:
+        result["document_index"] = hit.get("_index")
+        result["document_id"] = hit.get("_id")
+    return result
 
 
-def _format_response(resp) -> Dict[str, Any]:
+def _format_response(resp, *, include_identity: bool = False) -> Dict[str, Any]:
     """单路/hybrid 响应 → {"total", "hits"}（score 取 _score）。"""
     return {"total": osu.hits_total(resp),
-            "hits": [_format_hit(h, h.get("_score")) for h in _resp_hits(resp)]}
+            "hits": [_format_hit(h, h.get("_score"), include_identity=include_identity)
+                     for h in _resp_hits(resp)]}
 
 
 def _search(client, body: Dict[str, Any], params: Dict[str, Any] | None = None):
@@ -281,7 +286,8 @@ def _search(client, body: Dict[str, Any], params: Dict[str, Any] | None = None):
 # ---------- 消费入口 ----------
 
 def search_news(query, top_k: int = 10, channel=None, date_range=None, stocks=None,
-                mode: str = "hybrid", collapse: str | None = None) -> Dict[str, Any]:
+                mode: str = "hybrid", collapse: str | None = None,
+                include_identity: bool = False) -> Dict[str, Any]:
     """新闻混合检索（AI 智能体消费入口，架构 §5.3/§9）。
 
     Args:
@@ -331,7 +337,7 @@ def search_news(query, top_k: int = 10, channel=None, date_range=None, stocks=No
                 "size": top_k, "_source": _SOURCE_FIELDS, "highlight": _HIGHLIGHT}
         if collapse:
             body["collapse"] = {"field": collapse}
-        return _format_response(_search(client, body))
+        return _format_response(_search(client, body), include_identity=include_identity)
 
     if mode == "knn":
         vector = _encode_query(cleaned)
@@ -339,7 +345,7 @@ def search_news(query, top_k: int = 10, channel=None, date_range=None, stocks=No
                 "size": top_k, "_source": _SOURCE_FIELDS}
         if collapse:
             body["collapse"] = {"field": collapse}
-        return _format_response(_search(client, body))
+        return _format_response(_search(client, body), include_identity=include_identity)
 
     if mode == "hybrid":
         vector = _encode_query(cleaned)
@@ -376,9 +382,9 @@ def search_news(query, top_k: int = 10, channel=None, date_range=None, stocks=No
                 # 与 pipeline 无关的 404（别名/索引确未建，冷启动）：仍按空结果，
                 # 与 bm25/knn/rrf 经 _search 的容错语义一致
                 logger.warning(f"news 检索 404（别名/索引未建，按空结果处理）: {exc!r}")
-                return _format_response(None)
+                return _format_response(None, include_identity=include_identity)
             raise
-        return _format_response(resp)
+        return _format_response(resp, include_identity=include_identity)
 
     # mode == "rrf"：两路各取 window 条，客户端融合（质量基线 & pipeline 替代路径）
     window = max(top_k, _KNN_K_FLOOR)
@@ -398,5 +404,6 @@ def search_news(query, top_k: int = 10, channel=None, date_range=None, stocks=No
         # 两路 total 较大者：bm25 total 是全量匹配数，knn total 受 k 窗口截断，
         # 取 max 作"至少有这么多相关文档"的召回充分性信号
         "total": max(osu.hits_total(bm25_resp), osu.hits_total(knn_resp)),
-        "hits": [_format_hit(h, h["_rrf_score"]) for h in fused],
+        "hits": [_format_hit(h, h["_rrf_score"], include_identity=include_identity)
+                 for h in fused],
     }

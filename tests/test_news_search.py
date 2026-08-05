@@ -369,6 +369,15 @@ def test_search_404_returns_empty(env):
     assert ns.search_news("茅台", mode="bm25") == {"total": 0, "hits": []}
 
 
+# ---------- optional OpenSearch identity ----------
+
+def test_search_can_include_opensearch_identity_without_changing_default(env):
+    env.responses = [_resp([_hit("doc-1")])]
+    out = ns.search_news("茅台", mode="bm25", include_identity=True)
+    assert out["hits"][0]["document_id"] == "doc-1"
+    assert out["hits"][0]["document_index"] is None
+
+
 # ---------- ensure_hybrid_pipeline ----------
 
 class _FakeTransport:

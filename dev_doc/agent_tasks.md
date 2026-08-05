@@ -1,5 +1,12 @@
 # Agent 任务清单
 
+## T-016：Research 外部证据候选检索最小闭环
+- 时间：2026-08-05
+- 目标：按 ACTIVE 观察池成员与快照截止日，只读检索 OpenSearch 新闻/公告候选。
+- 状态：已完成
+- 当前结果：新增 `data_collect/jobs/research_evidence_candidates.py`，返回 `document_index/document_id/url` 等元数据并标记 `REVIEW_REQUIRED`，不自动写入证据表。真实联调未命中三只成员的股票标签，名称搜索结果不能直接当作证据。
+- 下一步：人工核验后用 `add_evidence` 绑定 supporting/contrary/context；正式回测仍暂缓。
+
 更新时间：2026-08-05
 
 ## T-011｜历史行情缺口补采与派生层重建
@@ -140,6 +147,6 @@
 - 目标：在快照之上建立可解释观察池和 OpenSearch/URL 证据引用，不接入自动交易。
 - 状态：已完成，正式观察池已创建并激活
 - 当前结果：新增 `sql/026_create_research_watchlist.sql`、`sql/027_research_audit_immutability.sql`、`research_watchlist.py` 和观察池专项测试；默认只消费 FROZEN，预览模式显式允许 VALIDATED；规则版本为 `watchlist-v1`，支持价值质量/成长趋势两条轨道、总人数上限、去重和结构化理由；证据表只保存来源定位、内容哈希和正反方角色，不复制正文。
-- 审计约束：ACTIVE 观察池只能归档，ACTIVE/ARCHIVED 成员和证据只能追加；应用层和数据库触发器均校验股票属于快照，绑定观察池时必须属于观察池成员。
+- 审计约束：ACTIVE 观察池只能归档；ACTIVE 成员和证据只能追加；ARCHIVED 观察池、成员和证据全部不可变；应用层和数据库触发器均校验股票属于快照，绑定观察池时必须属于观察池成员。
 - 验证：正式观察池 `01b53411-155e-4672-9548-189396e7a3e0` 已基于 FROZEN 快照激活，当前 3 个 `value_quality` 成员；已写入 9 条 PostgreSQL 快照事实引用，重复执行幂等；外部 OpenSearch/公告/研报证据待真实文档绑定。
 - 下一步：为 3 个成员补充真实外部证据和反方证据，完成 Research 人工复核后再设计 Backtest 输入。

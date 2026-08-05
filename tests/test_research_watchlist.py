@@ -27,8 +27,10 @@ def test_watchlist_query_deduplicates_a_stock_across_tracks():
 def test_audit_migration_makes_active_records_append_only():
     sql = Path("sql/027_research_audit_immutability.sql").read_text(encoding="utf-8")
     assert "ACTIVE/ARCHIVED watchlist cannot be deleted" in sql
-    assert "ACTIVE/ARCHIVED watchlist members are append-only" in sql
-    assert "ACTIVE/ARCHIVED evidence is append-only" in sql
+    assert "ACTIVE watchlist members are append-only" in sql
+    assert "ARCHIVED watchlist members are immutable" in sql
+    assert "ACTIVE evidence is append-only" in sql
+    assert "ARCHIVED evidence is immutable" in sql
     assert "evidence stock is not a member of watchlist" in sql
 
 

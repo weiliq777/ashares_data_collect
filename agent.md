@@ -131,4 +131,4 @@ Windows 后台启动 Tushare 任务时，必须显式保证子进程继承 `TUSH
 
 阶段三快照规则：`research_snapshot` 生成器可读取已通过质量门禁的 PIT/Feature；Research 和 Backtest 只能读取 `FROZEN` 快照。一个 `snapshot_id` 只对应一个截止日；生成使用 REPEATABLE READ 和输入切片哈希；FROZEN 后由数据库触发器禁止更新/删除。非缺失血缘必须有来源版本和 SHA-256，`:missing` 只表示上游确实没有记录。正式快照前不得进入正式回测或自动交易。
 
-Research 审计规则：`ACTIVE` 观察池只能归档；ACTIVE/ARCHIVED 成员和证据只能追加；证据必须属于快照股票，绑定观察池时必须属于该观察池成员；修正必须新建 `watchlist_id`。
+Research 审计规则：`ACTIVE` 观察池只能归档；ACTIVE 成员和证据只能追加；ARCHIVED 观察池、成员和证据全部不可变；证据必须属于快照股票，绑定观察池时必须属于该观察池成员；修正必须新建 `watchlist_id`。

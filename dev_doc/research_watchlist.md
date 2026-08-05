@@ -1,5 +1,16 @@
 # Research 观察池与证据引用 v1
 
+## 外部证据候选检索
+
+只读检索当前 ACTIVE 观察池的 OpenSearch 新闻/公告候选，不写入证据表：
+
+```powershell
+.\.venv\Scripts\python.exe -m data_collect.jobs.research_evidence_candidates `
+  --watchlist-id <ACTIVE_WATCHLIST_ID> --top-k 5 --mode bm25
+```
+
+候选结果只提供文档身份、来源、时间、URL 和摘要片段，并标记 `REVIEW_REQUIRED`。必须人工核验后，再使用 `add_evidence` 写入真实引用；候选不等同于 supporting 或 contrary 证据。
+
 更新时间：2026-08-05
 
 ## 定位
@@ -34,7 +45,8 @@
 ## 审计不可变规则
 
 - `ACTIVE` 观察池只能转为 `ARCHIVED`，不能回改名称、规则、快照绑定或删除；
-- `ACTIVE`/`ARCHIVED` 观察池成员和证据只能追加，不能更新或删除；
+- `ACTIVE` 观察池成员和证据只能追加，不能更新或删除；
+- `ARCHIVED` 观察池及其成员、证据均不可变，不能追加、更新或删除；需要修正时新建 `watchlist_id`；
 - 新证据必须对应快照中的股票；绑定 `watchlist_id` 时，该股票必须已经是该观察池成员；
 - 需要修正规则、成员或证据时，创建新的 `watchlist_id`，不覆盖旧研究结果。
 

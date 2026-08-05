@@ -55,8 +55,11 @@ BEGIN
     IF target_snapshot IS NULL THEN
         RAISE EXCEPTION 'watchlist member references missing watchlist: %', target_watchlist;
     END IF;
-    IF TG_OP IN ('UPDATE', 'DELETE') AND watchlist_status IN ('ACTIVE', 'ARCHIVED') THEN
-        RAISE EXCEPTION 'ACTIVE/ARCHIVED watchlist members are append-only: %', target_watchlist;
+    IF watchlist_status = 'ARCHIVED' THEN
+        RAISE EXCEPTION 'ARCHIVED watchlist members are immutable: %', target_watchlist;
+    END IF;
+    IF TG_OP IN ('UPDATE', 'DELETE') AND watchlist_status = 'ACTIVE' THEN
+        RAISE EXCEPTION 'ACTIVE watchlist members are append-only: %', target_watchlist;
     END IF;
     IF TG_OP = 'DELETE' THEN
         RETURN OLD;
@@ -106,8 +109,11 @@ BEGIN
         IF TG_OP <> 'DELETE' AND target_snapshot <> NEW.snapshot_id THEN
             RAISE EXCEPTION 'evidence watchlist snapshot mismatch: % <> %', NEW.snapshot_id, target_snapshot;
         END IF;
-        IF TG_OP IN ('UPDATE', 'DELETE') AND watchlist_status IN ('ACTIVE', 'ARCHIVED') THEN
-            RAISE EXCEPTION 'ACTIVE/ARCHIVED evidence is append-only: %', target_watchlist;
+        IF watchlist_status = 'ARCHIVED' THEN
+            RAISE EXCEPTION 'ARCHIVED evidence is immutable: %', target_watchlist;
+        END IF;
+        IF TG_OP IN ('UPDATE', 'DELETE') AND watchlist_status = 'ACTIVE' THEN
+            RAISE EXCEPTION 'ACTIVE evidence is append-only: %', target_watchlist;
         END IF;
     END IF;
     IF TG_OP = 'DELETE' THEN
