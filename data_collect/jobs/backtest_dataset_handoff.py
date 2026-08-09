@@ -5,7 +5,6 @@ import argparse
 from datetime import date
 
 from data_collect.jobs.backtest_dataset import (
-    build_dataset,
     create_dataset,
     freeze_dataset,
     _checkpoint,
@@ -14,6 +13,7 @@ from data_collect.jobs.backtest_dataset import (
     _set_checkpoint,
     validate_dataset,
 )
+from data_collect.jobs.backtest_dataset_batched import build_dataset_batched
 from data_collect.utils.db import get_connection
 
 
@@ -37,6 +37,12 @@ def main() -> None:
         "--force-rebuild",
         action="store_true",
         help="忽略已完成的 BUILD checkpoint，强制重新物化 Dataset",
+    )
+    parser.add_argument(
+        "--batch-days",
+        type=int,
+        default=5,
+        help="每个 Dataset Build 事务包含的交易日数量，默认 5；用于限制数据库/WAL/内存峰值",
     )
     parser.add_argument("--dataset-id", help="续跑已有的 DRAFT/FAILED Dataset")
     args = parser.parse_args()
@@ -140,9 +146,18 @@ def main() -> None:
                 )
                 conn.commit()
     else:
-        _set_checkpoint(dataset_id, "BUILD", "RUNNING", details={"mode": "atomic_streaming_batch"})
+        _set_checkpoint(
+            dataset_id,
+            "BUILD",
+            "RUNNING",
+            details={"mode": "date_batched_resumable", "batch_days": args.batch_days},
+        )
         try:
-            build_result = build_dataset(dataset_id)
+            build_result = build_dataset_batched(
+                dataset_id,
+                batch_days=args.batch_days,
+                force_rebuild=args.force_rebuild,
+            )
             _set_checkpoint(
                 dataset_id,
                 "BUILD",

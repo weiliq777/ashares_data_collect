@@ -49,6 +49,29 @@ uv run python -m data_collect.jobs.backtest_dataset_handoff `
   --dataset-id <DATASET_ID>
 ```
 
+## 2026-08-09 批次构建优化
+
+旧版 `BUILD` 虽然使用了 `execute_values`，但仍把整个执行行情物化放在一个长事务中；这会在五年数据量下制造较大的 WAL、死元组、索引维护和临时排序压力。现已新增 `sql/043_backtest_dataset_batch_checkpoint.sql`，并由 `backtest_dataset_handoff.py` 默认使用 `build_dataset_batched()`。
+
+新流程保持原有 Raw 高水位、单一 Raw payload 选择、单位换算、质量标记、血缘字段和最终哈希口径不变，只改变事务边界：
+
+```text
+Dataset BUILDING
+→ 读取 5 个交易日（可用 --batch-days 调整，范围 1~60）
+→ 删除当前 Dataset 这一个日期区间的旧执行行
+→ 查询并批量写入这一个区间
+→ 同事务更新成员统计和批次 COMPLETED
+→ 提交
+→ 下一批
+→ 小型日历/分红/规则/基准表单独重建
+→ 流式重算全局哈希
+→ 原有 Validate → Freeze 门禁
+```
+
+`backtest.dataset_build_batch_checkpoint` 的主键是 `(dataset_id, stage, batch_start)`，记录日期范围、行数、批次哈希、代码版本、状态和心跳。进程在批次中途退出时，数据库事务回滚；重启会重新执行该批次。只有状态为 `COMPLETED`、日期范围、批次哈希和代码版本均匹配时才跳过已完成批次。`--force-rebuild` 只清理当前 Dataset 的批次 checkpoint，随后仍按日期区间逐批删除和重建，不对共享表执行全局 `TRUNCATE` 或全表删除。
+
+该优化不修改任何 Raw/Standard/PIT/Feature，也不改变 Dataset 的最终输入哈希和 Validate 规则。建议五年任务先使用 `--batch-days 5`；如数据库资源稳定，可逐步试到 10 或 20。Docker/数据库不可用时不要启动构建，恢复后可直接复用同一个 `--dataset-id` 续跑。
+
 强制重新 Build：
 
 ```text

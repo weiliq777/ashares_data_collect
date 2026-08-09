@@ -458,4 +458,14 @@
   `--dataset-id` 断点续建，避免重复创建和内存暴涨。
 - 下一步：等待当前事务提交，执行 Dataset `validate → freeze`；通过后创建五年 Baseline
   Run，并对订单、成交、现金、持仓、公司行为、输入哈希进行全量对账。冻结前三日 smoke
-  Run 仍是唯一可引用的完成回测结果，Raw 不允许被 Dataset 流程修改。
+Run 仍是唯一可引用的完成回测结果，Raw 不允许被 Dataset 流程修改。
+
+## T-037｜Dataset 分交易日批次构建与资源保护
+
+- 时间：2026-08-09
+- 状态：代码完成；小范围真实烟测通过；五年任务待重新启动
+- 目标：解决旧版 Dataset Build 单个长事务导致 WAL、死元组、索引维护和 Docker/WSL 内存峰值过高的问题，同时保留原始计算口径和最终审计哈希。
+- 实现：新增 `sql/043_backtest_dataset_batch_checkpoint.sql` 和 `data_collect/jobs/backtest_dataset_batched.py`；`backtest_dataset_handoff.py` 默认按交易日批次构建，`--batch-days` 默认 5（允许 1~60）。每个批次只删除当前 Dataset 的日期区间，批量读取和写入后提交；批次 checkpoint 与该批次写入同事务收口，失败后重做，已完成批次仅在代码版本和批次哈希一致时跳过。
+- 边界：不对共享 Dataset 子表执行全局 `TRUNCATE` 或全表删除；不修改任何 Raw/Standard/PIT/Feature；小型日历、分红、规则、基准表在执行行情完成后单独重建；最终仍执行原有完整 Validate → Freeze 门禁。
+- 验证：新迁移已在 Docker PostgreSQL 幂等应用；2026-07-30~2026-08-03 三日真实 Dataset `afe4a191-be9d-4af6-b623-b46e7994ea18` 分两批完成，16,606 条执行行情、3 个成员、无缺失行情，`validate` 返回 `issues=[]`；相关专项测试 59 项通过。
+- 下一步：恢复 Docker 后使用同一个五年 Dataset ID `eaa310e5-e3b3-45b6-aba0-f973c3ea3f4f`，以 `--batch-days 5` 重新执行；完成后再 Validate/Freeze。旧 Dataset `7b138308-f397-4886-a255-5b5b5cdf42cb` 的已提交物化结果不删除，继续作为历史对照。

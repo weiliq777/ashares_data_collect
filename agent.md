@@ -172,3 +172,16 @@ Research 审计规则：`ACTIVE` 观察池只能归档；ACTIVE 成员和证据�
 
 阶段三 Backtest 规则：正式回测必须基于多日期 `FROZEN` Research Snapshot 和不可变 Dataset/Run Manifest；不能直接读取实时 PIT/Feature，也不能在生产模式自动回退合成数据。一个 snapshot 只对应一个截止日；`research_snapshot_series.py` 只负责按显式日期或标准交易日历编排多个单日快照，且截止日必须为开市日。执行行情使用原始 OHLC/成交量/涨跌停价，复权价格只用于指标；Dataset 构建时按 `tushare_market_raw_version.fetched_at DESC, record_id DESC` 选择每个日线业务键的最新 Raw 版本，并把 source version/hash 物化冻结；必须区分 warm-up 与 evaluation 区间、信号/订单/成交时间，并版本化交易日历、市场规则、费用、滑点、策略参数、适配器和代码。第一版默认 T 日收盘出信号、T+1 日开盘尝试成交、只做多、不模拟部分成交、暂不模拟配股；使用信号时确定的固定止损，不宣称已实现 ATR/Trailing Stop；缺规则必须 fail-closed。Dataset 成员必须同时保存执行行情和公司行为切片哈希，`validate` 必须重新对账最终物化子表的全局及按日哈希，并独立检查 warm-up 到 evaluation_end 的每个开市日覆盖；市场规则必须按 `market_rule_version`、`fee_rule_version` 和有效日期筛选，公司行为按业务键选择有效版本；送转只分配给除权日前持仓并落为 `CORPORATE_ACTION` 批次，卖出结算日超出 Dataset 时拒绝成交，不提前释放未结算资金。结果按 signal→order→fill/reject/expire→cash/position→daily performance 事件链保存。Portfolio 当前仅允许人工批准的 `PAPER_MANUAL` 模拟成交，组合 Manifest 必须保存 T+1、现金结算、费用和最小价位规则，不连接券商；数据库还要独立拒绝不符合成交股数、现金、价位、止损、已有持仓、SSE 开市日和快照截止日的成交，现金账本和持仓日期也必须命中冻结交易日历。Portfolio 每日估值必须绑定同一 FROZEN Snapshot 和 `valuation_input_hash`；相同输入只能幂等重放，不同输入、更新和删除均拒绝，且不得在更晚成交后回补过去估值。开发任务和详细契约见 `dev_doc/agent_tasks.md` 的 T-018/T-019/T-020/T-021/T-022/T-023/T-024/T-025/T-026/T-027 与 `dev_doc/backtest_design.md`、`dev_doc/portfolio_design.md`。
 当前阶段状态（2026-08-07）：阶段三核心代码开发已完成，正式历史回测可以进入生产准备；当前数据库尚无正式 Dataset/Run/Portfolio/规则记录，后续执行生产门禁即可。生产顺序为规则审批入库、clean Git commit、多日期 FROZEN Snapshot、Dataset build/validate/freeze、正式 Run 和结果审计。自动实盘交易仍禁止，Backtest→Portfolio 必须人工审批并使用 PAPER_MANUAL。
+
+## 数据库批量写入资源规则（2026-08-09）
+
+曾因 Dataset 执行行情一次性放入数百万行长事务，造成 WAL、死元组、索引维护和 Docker/WSL 内存压力，且阶段级 checkpoint 无法在 Build 中途续传。以后所有大批量数据库任务必须遵守：
+
+- 按日期/业务分区拆成有限批次，单批独立事务并及时提交；
+- 批次写入必须有 checkpoint、心跳、幂等键和失败重试；已完成批次只在代码版本和批次哈希一致时跳过；
+- 不能使用全局 `TRUNCATE` 或一次性删除/重建共享表；清理必须限定明确的业务范围；
+- 不以多线程直接向 PostgreSQL 共享表堆写来解决性能问题，先采用批量写入、合理索引、服务端游标和受控事务；
+- 数据库任务异常后，必须同时检查进程、数据库 checkpoint 和错误日志，不能只看本地进度日志；
+- Raw 表始终只读，不因性能优化而修改、覆盖或删除原始数据。
+
+本次对应实现：`sql/043_backtest_dataset_batch_checkpoint.sql`、`data_collect/jobs/backtest_dataset_batched.py` 和 `backtest_dataset_handoff.py` 的 `--batch-days`。
