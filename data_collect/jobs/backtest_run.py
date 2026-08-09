@@ -18,6 +18,8 @@ from data_collect.backtest import (
     BacktestConfig, BacktestEngine, BaseStrategy,
     FundamentalValueGrowthTrendStrategy, ValueTrendStrategy,
 )
+from data_collect.backtest.strategy.value_trend import ValueTrendStrategy as PureValueTrendStrategy
+from data_collect.backtest.adapter import ValueTrendCandidateAdapter
 from data_collect.jobs.backtest_dataset import _git_metadata, _json_param, load_frozen_dataset
 from data_collect.jobs.research_snapshot import _sha256_file
 from data_collect.utils.db import get_connection, require_psycopg2
@@ -399,9 +401,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="运行 FROZEN Backtest Dataset")
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument(
-        "--strategy", choices=["fundamental-v2", "legacy-value-trend-v1"],
+        "--strategy", choices=["fundamental-v2", "legacy-value-trend-v1", "pure-value-trend-v1"],
         default="fundamental-v2",
-        help="正式默认 fundamental-v2；legacy 仅用于复现旧 Run",
+        help="正式默认 fundamental-v2；legacy 仅用于复现旧 Run；pure 用于验证解耦后的策略适配器架构",
     )
     parser.add_argument("--run-version", default="1")
     parser.add_argument("--initial-cash", type=float, default=10000.0)
@@ -421,10 +423,15 @@ def main(argv=None):
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--code-archive-path")
     args = parser.parse_args(argv)
-    strategy = (
-        FundamentalValueGrowthTrendStrategy()
-        if args.strategy == "fundamental-v2" else ValueTrendStrategy()
-    )
+    if args.strategy == "fundamental-v2":
+        strategy = FundamentalValueGrowthTrendStrategy()
+    elif args.strategy == "legacy-value-trend-v1":
+        strategy = ValueTrendStrategy()
+    elif args.strategy == "pure-value-trend-v1":
+        strategy = ValueTrendCandidateAdapter(PureValueTrendStrategy())
+    else:
+        raise ValueError(f"Unknown strategy: {args.strategy}")
+
     run_id, result = run_frozen_backtest(
         args.dataset_id,
         BacktestConfig(
