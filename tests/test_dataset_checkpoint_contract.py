@@ -16,6 +16,8 @@ def test_handoff_supports_stage_resume_without_changing_build_engine():
     assert "--force-rebuild" in source
     assert '"BUILD"' in source and '"VALIDATE"' in source and '"FREEZE"' in source
     assert "BUILD=SKIPPED" in source
+    assert "status='BUILDING', failure_reason=NULL, failed_at=NULL" in source
+    assert "manifest[\"status\"] == \"VALIDATED\"" in source
 
 
 def test_checkpoint_does_not_touch_raw_or_standard_layers():

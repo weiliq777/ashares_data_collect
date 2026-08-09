@@ -102,8 +102,35 @@ def main() -> None:
         and build_checkpoint["status"] == "COMPLETED"
     )
 
+    if manifest["status"] == "VALIDATED":
+        print("BUILD=SKIPPED; VALIDATE=SKIPPED (manifest already validated)", flush=True)
+        _set_checkpoint(
+            dataset_id,
+            "VALIDATE",
+            "COMPLETED",
+            details={"mode": "manifest_already_validated"},
+        )
+        _set_checkpoint(dataset_id, "FREEZE", "RUNNING")
+        try:
+            freeze_dataset(dataset_id, code_archive_path=args.code_archive_path)
+            _set_checkpoint(dataset_id, "FREEZE", "COMPLETED")
+            print(f"FROZEN_DATASET_ID={dataset_id}", flush=True)
+        except Exception as exc:
+            _set_checkpoint(dataset_id, "FREEZE", "FAILED", error_message=str(exc)[:4000])
+            raise
+        return
+
     if can_resume_validate:
         print("BUILD=SKIPPED (checkpoint completed; resume validation)", flush=True)
+        if manifest["status"] == "FAILED":
+            with get_connection() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE backtest.dataset_manifest
+                          SET status='BUILDING', failure_reason=NULL, failed_at=NULL
+                        WHERE dataset_id=%s AND status='FAILED'""",
+                    (dataset_id,),
+                )
+                conn.commit()
     else:
         _set_checkpoint(dataset_id, "BUILD", "RUNNING", details={"mode": "atomic_streaming_batch"})
         try:
