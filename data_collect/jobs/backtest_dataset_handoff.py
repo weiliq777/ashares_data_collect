@@ -89,7 +89,7 @@ def main() -> None:
         manifest = _manifest(conn, dataset_id)
     if manifest["status"] == "FROZEN":
         freeze_checkpoint = _checkpoint(dataset_id, "FREEZE")
-        if freeze_checkpoint and freeze_checkpoint["status"] == "RUNNING":
+        if freeze_checkpoint and freeze_checkpoint["status"] in {"RUNNING", "FAILED"}:
             _set_checkpoint(
                 dataset_id,
                 "FREEZE",

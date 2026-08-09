@@ -25,3 +25,10 @@ def test_checkpoint_does_not_touch_raw_or_standard_layers():
     assert "tushare_" not in source
     assert "DELETE FROM standard" not in source
     assert "DELETE FROM pit" not in source
+
+
+def test_freeze_checkpoint_recovery_allows_only_failed_or_running_to_completed():
+    source = (ROOT / "sql" / "044_backtest_freeze_checkpoint_recovery.sql").read_text(encoding="utf-8")
+    assert "OLD.status IN ('RUNNING','FAILED')" in source
+    assert "NEW.status = 'COMPLETED'" in source
+    assert "tushare_" not in source
