@@ -171,11 +171,35 @@ def _canonical(value: Any):
 
 
 def hash_rows(rows: Iterable[Iterable[Any]]) -> str:
-    digest = hashlib.sha256()
+    hasher = _IncrementalRowHasher()
     for row in rows:
-        digest.update((json.dumps([_canonical(item) for item in row], ensure_ascii=False,
-                                  separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8"))
-    return digest.hexdigest()
+        hasher.update(row)
+    return hasher.hexdigest()
+
+
+class _IncrementalRowHasher:
+    """Hash rows with the same canonical representation as ``hash_rows``."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self.count = 0
+
+    def update(self, row: Iterable[Any]) -> None:
+        self._digest.update(
+            (
+                json.dumps(
+                    [_canonical(item) for item in row],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        self.count += 1
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
 
 
 def _git_metadata() -> dict[str, Any]:
@@ -601,7 +625,9 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                 cur.execute("DELETE FROM backtest.dataset_rule_snapshot WHERE dataset_id=%s", (dataset_id,))
                 cur.execute("DELETE FROM backtest.dataset_benchmark_bar WHERE dataset_id=%s", (dataset_id,))
 
-                cur.execute(
+                stream_cur = conn.cursor(name=f"dataset_execution_{dataset_id.replace('-', '')}")
+                stream_cur.itersize = 5000
+                stream_cur.execute(
                     """SELECT m.research_date, s.ts_code, s.market,
                               NULLIF(COALESCE(v.payload, r.payload)->>'open', '')::double precision,
                               NULLIF(COALESCE(v.payload, r.payload)->>'high', '')::double precision,
@@ -671,11 +697,13 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                         limit_max_record_id, suspend_max_record_id, dataset_id,
                     ),
                 )
-                bar_rows = cur.fetchall()
+                bar_rows = stream_cur
                 if not bar_rows:
                     raise RuntimeError("Dataset 没有可物化的 Research 股票快照")
                 execution_insert = []
-                per_date_rows: dict[date, list[tuple]] = {}
+                execution_hasher = _IncrementalRowHasher()
+                per_date_stats: dict[date, dict[str, Any]] = {}
+                execution_seen = False
                 for row in bar_rows:
                     (
                         day, code, market, opn, high, low, close, volume, amount, up, down,
@@ -735,8 +763,40 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                         computed_hash, limit_version, limit_hash, suspend_version, suspend_hash,
                         quality,
                     )
+                    execution_seen = True
                     execution_insert.append(values)
-                    per_date_rows.setdefault(day, []).append(values[1:])
+                    execution_hasher.update(values[1:])
+                    stats = per_date_stats.setdefault(
+                        day,
+                        {
+                            "hasher": _IncrementalRowHasher(),
+                            "count": 0,
+                            "missing": 0,
+                            "invalid": 0,
+                            "warning": 0,
+                        },
+                    )
+                    stats["hasher"].update(values[1:])
+                    stats["count"] += 1
+                    if quality == "MISSING_SOURCE":
+                        stats["missing"] += 1
+                    elif quality == "INVALID":
+                        stats["invalid"] += 1
+                    elif quality == "WARNING":
+                        stats["warning"] += 1
+                    if len(execution_insert) >= 5000:
+                        _insert_values(
+                            cur,
+                            """INSERT INTO backtest.dataset_execution_bar
+                              (dataset_id,trade_date,ts_code,market,raw_open,raw_high,raw_low,raw_close,
+                               volume,amount,up_limit,down_limit,is_suspended,can_buy,can_sell,
+                               limit_status,source_record_key,source_record_version,source_payload_hash,
+                               limit_source_record_id,limit_source_payload_hash,
+                               suspend_source_record_id,suspend_source_payload_hash,
+                               quality_status) VALUES %s""",
+                            execution_insert,
+                        )
+                        execution_insert.clear()
                 _insert_values(
                     cur,
                     """INSERT INTO backtest.dataset_execution_bar
@@ -748,24 +808,9 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                        quality_status) VALUES %s""",
                     execution_insert,
                 )
-
-                cur.execute(
-                    """SELECT trade_date, ts_code, market, raw_open, raw_high, raw_low,
-                              raw_close, volume, amount, up_limit, down_limit,
-                              is_suspended, can_buy, can_sell, limit_status,
-                              source_record_key, source_record_version, source_payload_hash,
-                              limit_source_record_id, limit_source_payload_hash,
-                              suspend_source_record_id, suspend_source_payload_hash,
-                              quality_status
-                         FROM backtest.dataset_execution_bar
-                        WHERE dataset_id=%s
-                        ORDER BY trade_date, ts_code""",
-                    (dataset_id,),
-                )
-                actual_execution_rows = cur.fetchall()
-                actual_per_date_rows: dict[date, list[tuple]] = {}
-                for actual_row in actual_execution_rows:
-                    actual_per_date_rows.setdefault(actual_row[0], []).append(actual_row)
+                stream_cur.close()
+                if not execution_seen:
+                    raise RuntimeError("Dataset 没有可物化的 Research 股票快照")
                 cur.execute(
                     """SELECT research_date
                          FROM backtest.dataset_member
@@ -774,7 +819,7 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                     (dataset_id,),
                 )
                 member_dates = [row[0] for row in cur.fetchall()]
-                execution_dates = sorted(actual_per_date_rows)
+                execution_dates = sorted(per_date_stats)
                 if member_dates != execution_dates:
                     raise RuntimeError(
                         "Dataset 成员日期与执行行情日期不一致: "
@@ -1051,15 +1096,15 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                 actual_rule_rows = cur.fetchall()
 
                 member_stats = []
-                for day in sorted(actual_per_date_rows):
-                    rows_for_day = actual_per_date_rows[day]
-                    execution_hash_for_day = hash_rows(rows_for_day)
+                for day in sorted(per_date_stats):
+                    execution_stats = per_date_stats[day]
+                    execution_hash_for_day = execution_stats["hasher"].hexdigest()
                     corporate_action_hash_for_day = hash_rows(
                         corporate_action_rows_by_day.get(day, [])
                     )
-                    missing_for_day = sum(1 for row in rows_for_day if row[-1] == "MISSING_SOURCE")
-                    invalid_for_day = sum(1 for row in rows_for_day if row[-1] == "INVALID")
-                    warning_for_day = sum(1 for row in rows_for_day if row[-1] == "WARNING")
+                    missing_for_day = execution_stats["missing"]
+                    invalid_for_day = execution_stats["invalid"]
+                    warning_for_day = execution_stats["warning"]
                     member_quality = (
                         "INVALID" if invalid_for_day else
                         "MISSING_SOURCE" if missing_for_day else
@@ -1088,17 +1133,17 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                                   execution_hash=%s, corporate_action_hash=%s,
                                   quality_status=%s
                             WHERE dataset_id=%s AND research_date=%s""",
-                        (obs_count, len(rows_for_day), execution_hash_for_day,
+                        (obs_count, execution_stats["count"], execution_hash_for_day,
                          corporate_action_hash_for_day, member_quality, dataset_id, day),
                     )
                     member_stats.append((
                         day, member[0], execution_hash_for_day, corporate_action_hash_for_day,
-                        len(rows_for_day),
+                        execution_stats["count"],
                     ))
 
                 calendar_hash = hash_rows(actual_calendar_rows)
                 rules_hash = hash_rows(actual_rule_rows)
-                execution_hash = hash_rows(actual_execution_rows)
+                execution_hash = execution_hasher.hexdigest()
                 corporate_action_hash = hash_rows(actual_dividend_rows)
                 benchmark_hash = hash_rows(actual_benchmark_rows)
                 input_manifest_hash = hash_rows([
@@ -1115,13 +1160,15 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                     ("out_of_sample_start", manifest["out_of_sample_start"]),
                 ])
                 quality = {
-                    "execution_rows": len(actual_execution_rows),
+                    "execution_rows": execution_hasher.count,
                     "calendar_rows": len(actual_calendar_rows),
                     "corporate_action_rows": len(actual_dividend_rows),
                     "rule_rows": len(actual_rule_rows),
                     "benchmark_rows": len(actual_benchmark_rows),
                     "member_count": len(member_stats),
-                    "missing_execution_rows": sum(1 for row in actual_execution_rows if row[-1] == "MISSING_SOURCE"),
+                    "missing_execution_rows": sum(
+                        stats["missing"] for stats in per_date_stats.values()
+                    ),
                     "baseline_quality_report_hash": manifest["baseline_quality_report_hash"],
                     "baseline_source_manifest_hash": manifest["baseline_source_manifest_hash"],
                     "benchmark_code": manifest["benchmark_code"],
@@ -1166,7 +1213,11 @@ def _materialized_hashes(cur, dataset_id: str) -> dict[str, Any]:
     校验必须对账 Dataset 自己的物料，而不是再次对 mutable 上游表计算哈希。
     这样才能发现物化过程中的列顺序、类型转换、默认值或写入截断问题。
     """
-    cur.execute(
+    execution_cur = cur.connection.cursor(
+        name=f"dataset_materialized_{dataset_id.replace('-', '')}"
+    )
+    execution_cur.itersize = 5000
+    execution_cur.execute(
         """SELECT trade_date, ts_code, market, raw_open, raw_high, raw_low,
                           raw_close, volume, amount, up_limit, down_limit,
                           is_suspended, can_buy, can_sell, limit_status,
@@ -1179,10 +1230,20 @@ def _materialized_hashes(cur, dataset_id: str) -> dict[str, Any]:
                   ORDER BY trade_date, ts_code""",
         (dataset_id,),
     )
-    execution_rows = cur.fetchall()
-    execution_by_day: dict[date, list[tuple]] = {}
-    for row in execution_rows:
-        execution_by_day.setdefault(row[0], []).append(row)
+    execution_hasher = _IncrementalRowHasher()
+    execution_by_day: dict[date, dict[str, Any]] = {}
+    while True:
+        rows = execution_cur.fetchmany(5000)
+        if not rows:
+            break
+        for row in rows:
+            execution_hasher.update(row)
+            stats = execution_by_day.setdefault(
+                row[0], {"hasher": _IncrementalRowHasher(), "count": 0}
+            )
+            stats["hasher"].update(row)
+            stats["count"] += 1
+    execution_cur.close()
 
     cur.execute(
         """SELECT trade_date, exchange, is_open, pretrade_date,
@@ -1234,14 +1295,13 @@ def _materialized_hashes(cur, dataset_id: str) -> dict[str, Any]:
     benchmark_rows = cur.fetchall()
 
     return {
-        "execution_rows": execution_rows,
         "execution_by_day": execution_by_day,
         "calendar_rows": calendar_rows,
         "dividend_rows": dividend_rows,
         "dividend_by_day": dividend_by_day,
         "rule_rows": rule_rows,
         "benchmark_rows": benchmark_rows,
-        "execution_hash": hash_rows(execution_rows),
+        "execution_hash": execution_hasher.hexdigest(),
         "calendar_hash": hash_rows(calendar_rows),
         "corporate_action_hash": hash_rows(dividend_rows),
         "rules_hash": hash_rows(rule_rows),
@@ -1378,14 +1438,16 @@ def validate_dataset(dataset_id: str) -> dict[str, Any]:
                 issues.append(f"{day}: corporate_action_hash 为空")
             if quality in {"INVALID", "MISSING_SOURCE"}:
                 issues.append(f"{day}: Dataset 成员行情质量为 {quality}")
-            actual_execution_for_day = materialized["execution_by_day"].get(day, [])
+            actual_execution_stats = materialized["execution_by_day"].get(
+                day, {"hasher": _IncrementalRowHasher(), "count": 0}
+            )
             actual_corporate_for_day = materialized["dividend_by_day"].get(day, [])
-            actual_execution_hash = hash_rows(actual_execution_for_day)
+            actual_execution_hash = actual_execution_stats["hasher"].hexdigest()
             actual_corporate_hash = hash_rows(actual_corporate_for_day)
-            if exec_count != len(actual_execution_for_day):
+            if exec_count != actual_execution_stats["count"]:
                 issues.append(
                     f"{day}: execution_row_count 与物化行情不一致 "
-                    f"{exec_count}/{len(actual_execution_for_day)}"
+                    f"{exec_count}/{actual_execution_stats['count']}"
                 )
             if exec_hash != actual_execution_hash:
                 issues.append(f"{day}: execution_hash 与物化行情不一致")
@@ -1393,7 +1455,7 @@ def validate_dataset(dataset_id: str) -> dict[str, Any]:
                 issues.append(f"{day}: corporate_action_hash 与物化公司行为不一致")
             member_stats.append((
                 day, snapshot_hash, actual_execution_hash, actual_corporate_hash,
-                len(actual_execution_for_day),
+                actual_execution_stats["count"],
             ))
 
         calculated_input_hash = hash_rows(
