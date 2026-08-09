@@ -82,6 +82,14 @@ def main() -> None:
     with get_connection() as conn, conn.cursor() as cur:
         manifest = _manifest(conn, dataset_id)
     if manifest["status"] == "FROZEN":
+        freeze_checkpoint = _checkpoint(dataset_id, "FREEZE")
+        if freeze_checkpoint and freeze_checkpoint["status"] == "RUNNING":
+            _set_checkpoint(
+                dataset_id,
+                "FREEZE",
+                "COMPLETED",
+                details={"mode": "manifest_already_frozen"},
+            )
         print(f"FROZEN_DATASET_ID={dataset_id} (already frozen)", flush=True)
         return
 

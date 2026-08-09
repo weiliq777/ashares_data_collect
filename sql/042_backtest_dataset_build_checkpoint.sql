@@ -33,7 +33,13 @@ BEGIN
     SELECT status INTO current_status
       FROM backtest.dataset_manifest
      WHERE dataset_id = COALESCE(NEW.dataset_id, OLD.dataset_id);
-    IF current_status = 'FROZEN' THEN
+    IF current_status = 'FROZEN'
+       AND NOT (
+           TG_OP = 'UPDATE'
+           AND OLD.stage = 'FREEZE'
+           AND OLD.status = 'RUNNING'
+           AND NEW.status = 'COMPLETED'
+       ) THEN
         RAISE EXCEPTION 'FROZEN Dataset 的构建 checkpoint 不可修改';
     END IF;
     IF TG_OP = 'DELETE' THEN
