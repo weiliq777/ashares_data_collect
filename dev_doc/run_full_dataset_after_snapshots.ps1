@@ -160,7 +160,20 @@ print(f"FROZEN_DATASET_ID={dataset_id}", flush=True)
 '@
 
 try {
-    & $python -u -c $pythonCode *>> $LogPath
+    & $python -u -m data_collect.jobs.backtest_dataset_handoff `
+        --baseline-tag $BaselineTag `
+        --schema-version $SchemaVersion `
+        --expected-snapshots $ExpectedSnapshots `
+        --warmup-start $WarmupStart `
+        --evaluation-start $EvaluationStart `
+        --evaluation-end $EvaluationEnd `
+        --dataset-name $DatasetName `
+        --dataset-version $DatasetVersion `
+        --calendar-rule-version $CalendarRuleVersion `
+        --market-rule-version $MarketRuleVersion `
+        --fee-rule-version $FeeRuleVersion `
+        --benchmark-code $BenchmarkCode `
+        --code-archive-path $ArchivePath *>> $LogPath
     if ($LASTEXITCODE -ne 0) {
         throw "Dataset handoff failed with exit code $LASTEXITCODE"
     }
