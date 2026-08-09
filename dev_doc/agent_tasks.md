@@ -442,3 +442,20 @@
 - Skill 不启动定时任务、不连接券商、不自动批准、不自动成交。
 - 034 迁移在实际 PostgreSQL 上重复执行成功；正式候选、Portfolio 和每日
   绑定数据仍为 0 行。
+
+## T-036: research-v1.3 historical Dataset materialization
+
+- 时间：2026-08-09
+- 状态：Snapshot 系列完成；Dataset build 已完成物化阶段，当前等待 validate/freeze。
+- 已完成：`baseline_20260806` 下 1,215 个 `research-v1.3` Snapshot 全部 `FROZEN`，覆盖
+  `2021-08-02 ~ 2026-08-06`；工作区干净，快照哈希完整。
+- 当前 Dataset：`7b138308-f397-4886-a255-5b5b5cdf42cb`，名称
+  `history-baseline-v13`，版本 `dataset-v1.3`，状态 `BUILDING`。
+- 构建统计：执行行情 6,309,894 条、交易日历 1,831 条、公司行为 17,890 条、基准行情
+  1,215 条、Dataset 成员 1,215 个；另有 93,384 条缺失执行行情待验证分类，不得静默忽略。
+- 工程约束：`backtest_dataset.py` 使用服务端游标 `itersize=5000`、每 5,000 行批量写入和
+  增量哈希，禁止对完整执行区间 `fetchall()`；`backtest_dataset_handoff.py` 支持通过
+  `--dataset-id` 断点续建，避免重复创建和内存暴涨。
+- 下一步：等待当前事务提交，执行 Dataset `validate → freeze`；通过后创建五年 Baseline
+  Run，并对订单、成交、现金、持仓、公司行为、输入哈希进行全量对账。冻结前三日 smoke
+  Run 仍是唯一可引用的完成回测结果，Raw 不允许被 Dataset 流程修改。

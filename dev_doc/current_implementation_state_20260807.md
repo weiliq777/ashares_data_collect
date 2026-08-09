@@ -268,3 +268,27 @@ Portfolio 命令只用于把已成交回测订单导入人工审批意图，不�
 .\.venv\Scripts\python.exe -m data_collect.jobs.portfolio_simulation `
   --portfolio-id <portfolio-id> --import-backtest-order-id <filled-order-id> --actor <operator>
 ```
+
+## 7. Latest production state (2026-08-09)
+
+This section supersedes earlier statements that the full historical Snapshot series was still
+missing. The current production state is:
+
+- `research-v1.3` has 1,215 `FROZEN` Snapshots for every required SSE open date from
+  `2021-08-02` through `2026-08-06`.
+- The series is bound to validated baseline `baseline_20260806`; `git_dirty=0` and required
+  Snapshot hashes are complete.
+- Dataset `7b138308-f397-4886-a255-5b5b5cdf42cb` (`history-baseline-v13`, `dataset-v1.3`) is
+  currently `BUILDING`. Its build phase reported 6,309,894 execution bars, 1,831 calendar rows,
+  17,890 corporate-action rows, 1,215 benchmark rows and 1,215 members.
+- The build reported 93,384 missing execution rows. These are a validation input and must be
+  classified as legitimate non-trading/suspended/listing-boundary rows or a blocking data issue;
+  they are not automatically accepted.
+- No build error has been recorded. The process uses bounded streaming/batched inserts and does
+  not load the full execution range into Python memory. The Dataset remains non-frozen until
+  `build → validate → freeze` completes.
+
+Historical Dataset construction is resumable through
+`data_collect.jobs.backtest_dataset_handoff --dataset-id ...`. Do not launch duplicate builds;
+the build transaction may hide child-table rows until it commits. Research and Backtest continue
+to read only frozen inputs, and Raw remains unchanged.

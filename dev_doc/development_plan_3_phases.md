@@ -18,6 +18,34 @@ Stage 3 code is functionally closed for historical Backtest production gates. Re
 
 完整执行顺序、命令模板、验收门禁和恢复边界见 `dev_doc/project_completion_runbook.md`。
 
+## 2026-08-09 历史 Dataset 生产进度
+
+阶段三的完整历史输入已经从“生成快照”进入“Dataset 物化与验收”：
+
+```text
+research-v1.3 FROZEN Snapshot series
+→ history-baseline-v13 Dataset build
+→ validate
+→ freeze
+→ Baseline Run
+```
+
+当前已完成：
+
+- `baseline_20260806` 下的 1,215 个 `research-v1.3` Snapshot 已全部 `FROZEN`；
+- 覆盖 `2021-08-02 ~ 2026-08-06`，代码工作区干净，快照血缘哈希完整；
+- Dataset 构建已完成执行输入物化：6,309,894 条执行行情、1,831 条交易日历、17,890 条公司行为、1,215 条基准行情和 1,215 个 Dataset 成员；
+- Dataset 构建采用服务端游标、5,000 行分批写入和增量哈希，禁止全量 `fetchall()`，以避免 Docker/PostgreSQL 内存飙升；
+- `backtest_dataset_handoff` 支持使用既有 `--dataset-id` 断点续建，不重复创建 Dataset。
+
+当前未完成：
+
+- Dataset `7b138308-f397-4886-a255-5b5b5cdf42cb` 仍处于 `BUILDING`，尚未通过 `validate` 和 `freeze`；
+- 构建报告 93,384 条缺失执行行情，必须在验证阶段区分停牌、未上市/退市边界与真实数据缺口；
+- Dataset 冻结后才能创建五年 Baseline Run，并完成订单、成交、现金、持仓、公司行为和哈希对账。
+
+在 Dataset 冻结前，三日 smoke Run 仍是唯一可引用的已完成回测结果；不得把当前构建中的 Dataset 当作正式回测输入。
+
 版本：v1.0  
 时间：2026-08-02
 

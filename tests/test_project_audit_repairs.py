@@ -9,6 +9,7 @@ from data_collect.jobs.backtest_dataset import (
     ADAPTER_VERSION,
     SCHEMA_VERSION as BACKTEST_DATASET_SCHEMA_VERSION,
     _check_baseline,
+    _quality_report_hash,
     create_dataset,
 )
 from data_collect.backtest.engine import BacktestConfig
@@ -65,6 +66,20 @@ def test_dataset_materializes_mutable_execution_inputs_from_bounded_raw():
     )[1]
     assert "std.security_status_daily" not in execution_section
     assert "pit.security_tradeability_daily" not in execution_section
+
+
+def test_quality_report_hash_canonicalizes_database_dates():
+    quality = {"out_of_sample_start": date(2025, 8, 6), "status": "VALID"}
+    first = _quality_report_hash(quality)
+    second = _quality_report_hash({"status": "VALID", "out_of_sample_start": "2025-08-06"})
+    assert first == second
+
+
+def test_dataset_validation_has_failure_state_recovery_boundary():
+    source = Path("data_collect/jobs/backtest_dataset.py").read_text(encoding="utf-8")
+    assert "def _mark_dataset_validation_failed" in source
+    assert "WHERE dataset_id=%s AND status='BUILDING'" in source
+    assert "_mark_dataset_validation_failed(dataset_id, exc)" in source
 
 
 def test_release_switch_is_atomic_and_respects_single_validated_index():

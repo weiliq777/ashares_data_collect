@@ -53,11 +53,16 @@ def test_backtest_dataset_job_rejects_non_frozen_snapshot_in_source():
     assert "COALESCE(v.payload, r.payload)->>'open'" in source
     assert "COALESCE(v.payload, r.payload)->>'vol'" in source
     assert "LEFT JOIN daily_kline" not in source
-    assert "s.quality_status IN ('VALID', 'WARNING')" in source
+    # Research snapshot quality is an aggregate over financial/feature inputs;
+    # execution-source availability must be decided from the selected OHLC Raw
+    # payload and the limit Raw record, not from that aggregate status.
+    assert "s.quality_status IN ('VALID', 'WARNING')" not in source
     assert "lim.record_id IS NOT NULL" in source
     assert "limit_source_payload_hash" in source
     assert "suspend_source_payload_hash" in source
     assert "status_source_present" in source
+    assert "rule_audit_rows" in source
+    assert "approval_status, approved_by, approved_at" in source
     assert "assert_market_coverage_range_publishable" in source
     assert 'manifest["warmup_start"]' in source
     assert 'manifest["evaluation_end"]' in source

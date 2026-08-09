@@ -470,3 +470,61 @@ Snapshots, run the idempotent migrations `042_create_point_in_time_price_feature
 `043_research_v13_point_in_time_price.sql`, then rebuild `price_v2`. The v2 indicator coordinate
 uses only implemented corporate actions with `ex_date <= trade_date`; raw OHLC remains the
 execution coordinate. Existing v1.1/v1.2 Snapshots and v1 Dataset/Run records stay immutable.
+
+## 13. 2026-08-09 historical Dataset production status
+
+The five-year `research-v1.3` Snapshot series has now been generated, validated, and batch-frozen:
+
+```text
+baseline:       baseline_20260806
+schema:         research-v1.3
+snapshots:      1,215 FROZEN
+date range:     2021-08-02 ~ 2026-08-06
+git_dirty:      0
+missing hashes: 0
+```
+
+The historical Dataset is:
+
+```text
+dataset_id:     7b138308-f397-4886-a255-5b5b5cdf42cb
+name:           history-baseline-v13
+version:        dataset-v1.3
+status:         BUILDING (validation/freeze pending)
+```
+
+The materialization build has completed its execution-input phase with the following audit
+counts; the build transaction must still commit and pass `validate` before the Dataset can be
+called `VALIDATED` or `FROZEN`:
+
+```text
+execution bars:  6,309,894
+calendar rows:   1,831
+corporate acts:  17,890
+benchmark rows:  1,215
+dataset members: 1,215
+missing rows:    93,384 (must be classified by validation; not silently ignored)
+```
+
+Because the build is one resumable transaction, the database may continue to show `BUILDING`
+and child-table counts may remain invisible until commit. A live process and an empty stderr log
+are the expected signs of a running build; do not start a second build for the same Dataset.
+
+The historical build is deliberately memory-bounded. `backtest_dataset.py` uses a named
+server-side cursor (`itersize=5000`), inserts execution bars in batches of 5,000, and calculates
+global/per-date hashes incrementally. It must not use `fetchall()` for the full execution range.
+The standalone handoff entry point supports resuming an existing DRAFT/FAILED Dataset with
+`data_collect.jobs.backtest_dataset_handoff --dataset-id ...`.
+
+The remaining production sequence is:
+
+```text
+Dataset build commit
+→ validate (including the 93,384 missing-row classification)
+→ freeze
+→ create Baseline Run with explicit rules/risks/slippage
+→ reconcile orders, fills, cash, positions, corporate actions and hashes
+```
+
+Until this sequence succeeds, the three-day smoke Run remains the only completed Backtest
+result. Raw tables remain append-only and are not modified by Snapshot/Dataset construction.

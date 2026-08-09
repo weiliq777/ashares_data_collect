@@ -541,7 +541,22 @@ def _insert_values(cur, sql: str, rows: list[tuple]):
 def _json_param(value: Any):
     """以 psycopg2 JSONB 适配器传参，避免把 JSON 当普通文本写入。"""
     psycopg2, _ = require_psycopg2()
-    return psycopg2.extras.Json(value, dumps=lambda item: json.dumps(item, ensure_ascii=False))
+    return psycopg2.extras.Json(
+        value,
+        dumps=lambda item: json.dumps(
+            _canonical(item), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        ),
+    )
+
+
+def _quality_report_hash(value: Any) -> str:
+    """对质量报告做确定性哈希，并统一处理 date/Decimal 等数据库类型。"""
+    encoded = json.dumps(
+        _canonical(value), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_dataset(dataset_id: str) -> dict[str, Any]:
@@ -643,8 +658,7 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                               (COALESCE(s.can_sell, FALSE)
                                AND NOT (COALESCE(s.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL)),
                               (COALESCE(v.payload, r.payload) IS NOT NULL
-                               AND lim.record_id IS NOT NULL
-                               AND s.quality_status IN ('VALID', 'WARNING')),
+                               AND lim.record_id IS NOT NULL),
                               s.limit_status, COALESCE(v.payload, r.payload),
                               v.record_id, v.payload_hash,
                               lim.record_id, lim.payload_hash,
@@ -1187,7 +1201,7 @@ def build_dataset(dataset_id: str) -> dict[str, Any]:
                         WHERE dataset_id=%s""",
                     (calendar_hash, rules_hash, execution_hash, corporate_action_hash,
                      benchmark_hash, input_manifest_hash,
-                     _json_param(quality), hashlib.sha256(json.dumps(quality, sort_keys=True).encode()).hexdigest(),
+                     _json_param(quality), _quality_report_hash(quality),
                      metadata["code_version"], metadata["commit"], metadata["dirty"], metadata["diff_hash"], dataset_id),
                 )
                 conn.commit()
@@ -1271,6 +1285,22 @@ def _materialized_hashes(cur, dataset_id: str) -> dict[str, Any]:
     for row in dividend_rows:
         dividend_by_day.setdefault(row[10], []).append(row)
 
+    # rules_hash 必须与 build 阶段使用完全相同的审计字段集合；
+    # load_frozen_dataset 另外使用不含审批元数据的 rule_rows。
+    cur.execute(
+        """SELECT rule_version, market_rule_version, fee_rule_version,
+                          effective_from, effective_to, market,
+                          min_buy_lot, allow_sell_odd_lot, t_plus_one, price_tick,
+                          cash_settlement_days, limit_pct, commission_rate, min_commission,
+                          stamp_duty_sell_rate, transfer_fee_rate, slippage_bps,
+                          parameters, approval_status, approved_by, approved_at,
+                          approval_hash, rule_hash
+                   FROM backtest.dataset_rule_snapshot
+                  WHERE dataset_id=%s
+                  ORDER BY effective_from, market, rule_version""",
+        (dataset_id,),
+    )
+    rule_audit_rows = cur.fetchall()
     cur.execute(
         """SELECT rule_version, market_rule_version, fee_rule_version,
                           effective_from, effective_to, market,
@@ -1304,12 +1334,12 @@ def _materialized_hashes(cur, dataset_id: str) -> dict[str, Any]:
         "execution_hash": execution_hasher.hexdigest(),
         "calendar_hash": hash_rows(calendar_rows),
         "corporate_action_hash": hash_rows(dividend_rows),
-        "rules_hash": hash_rows(rule_rows),
+        "rules_hash": hash_rows(rule_audit_rows),
         "benchmark_hash": hash_rows(benchmark_rows),
     }
 
 
-def validate_dataset(dataset_id: str) -> dict[str, Any]:
+def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
     """校验成员覆盖、FROZEN 来源、执行输入完整性和哈希字段。"""
     with get_connection() as conn, conn.cursor() as cur:
         manifest = _manifest(conn, dataset_id, for_update=True)
@@ -1696,13 +1726,13 @@ def validate_dataset(dataset_id: str) -> dict[str, Any]:
                           failure_reason=%s, quality_report=%s, quality_report_hash=%s
                     WHERE dataset_id=%s""",
                 (failure_reason, _json_param(quality),
-                 hashlib.sha256(json.dumps(quality, ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+                _quality_report_hash(quality),
                  dataset_id),
             )
             conn.commit()
             raise RuntimeError(f"Backtest Dataset 校验失败: {issues}")
         quality["status"] = "VALID"
-        report_hash = hashlib.sha256(json.dumps(quality, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        report_hash = _quality_report_hash(quality)
         cur.execute(
             """UPDATE backtest.dataset_manifest
                   SET status='VALIDATED', quality_report=%s, quality_report_hash=%s
@@ -1711,6 +1741,32 @@ def validate_dataset(dataset_id: str) -> dict[str, Any]:
         )
         conn.commit()
         return quality
+
+
+def _mark_dataset_validation_failed(dataset_id: str, exc: Exception) -> None:
+    """在验证事务回滚或未进入质量报告分支时，保留可恢复的 FAILED 状态。"""
+    try:
+        with get_connection() as failed_conn, failed_conn.cursor() as failed_cur:
+            failed_cur.execute(
+                """UPDATE backtest.dataset_manifest
+                      SET status='FAILED', failed_at=CURRENT_TIMESTAMP,
+                          failure_reason=%s
+                    WHERE dataset_id=%s AND status='BUILDING'""",
+                (str(exc)[:4000], dataset_id),
+            )
+            failed_conn.commit()
+    except Exception:
+        # 不覆盖原始验证异常；数据库连接问题会由调用方的原始异常暴露。
+        pass
+
+
+def validate_dataset(dataset_id: str) -> dict[str, Any]:
+    """执行 Dataset 验证，并确保任何未处理异常都留下 FAILED 审计状态。"""
+    try:
+        return _validate_dataset_impl(dataset_id)
+    except Exception as exc:
+        _mark_dataset_validation_failed(dataset_id, exc)
+        raise
 
 
 def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
