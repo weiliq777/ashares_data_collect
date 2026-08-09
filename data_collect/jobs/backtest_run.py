@@ -29,7 +29,11 @@ def _parameters_hash(parameters: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def register_strategy(strategy: BaseStrategy, code_version: str | None = None) -> str:
+def register_strategy(
+    strategy: BaseStrategy,
+    code_version: str | None = None,
+    allow_existing_code_version: bool = False,
+) -> str:
     parameters = dict(getattr(strategy, "parameters", {}))
     strategy_id = strategy.strategy_id
     metadata = _git_metadata()
@@ -45,7 +49,9 @@ def register_strategy(strategy: BaseStrategy, code_version: str | None = None) -
         existing = cur.fetchone()
         if existing:
             expected = (strategy_id, strategy.strategy_version, parameters_hash, definition_code_version)
-            if existing != expected:
+            if existing[:3] != expected[:3] or (
+                existing[3] != expected[3] and not allow_existing_code_version
+            ):
                 raise RuntimeError(
                     "策略定义已存在且不可覆盖；请递增 strategy_version/strategy_id，"
                     "不得用新代码改写旧策略定义"
@@ -369,6 +375,7 @@ def run_frozen_backtest(
     run_version: str = "1",
     code_archive_path: str | None = None,
     strategy: BaseStrategy | None = None,
+    reuse_existing_strategy_definition: bool = False,
 ):
     config = config or BacktestConfig()
     strategy = strategy or FundamentalValueGrowthTrendStrategy()
@@ -383,7 +390,10 @@ def run_frozen_backtest(
     metadata = _git_metadata()
     if metadata["dirty"] and not code_archive_path:
         raise RuntimeError("正式回测要求 Git 工作区干净；脏工作区必须提供代码归档")
-    strategy_id = register_strategy(strategy)
+    strategy_id = register_strategy(
+        strategy,
+        allow_existing_code_version=reuse_existing_strategy_definition,
+    )
     run_id = create_run(dataset_id, strategy_id, config, run_version, code_archive_path)
     try:
         required_columns = getattr(strategy, "required_observation_columns", None)
@@ -433,6 +443,11 @@ def main(argv=None):
     )
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--code-archive-path")
+    parser.add_argument(
+        "--reuse-existing-strategy-definition",
+        action="store_true",
+        help="仅在策略规则未改变、仅运行器/加载器变更时复用既有策略定义；Run 仍记录当前代码版本",
+    )
     args = parser.parse_args(argv)
     if args.strategy == "fundamental-v2":
         strategy = FundamentalValueGrowthTrendStrategy()
@@ -461,6 +476,7 @@ def main(argv=None):
         args.run_version,
         args.code_archive_path,
         strategy,
+        args.reuse_existing_strategy_definition,
     )
     print(json.dumps({"run_id": run_id, "metrics": result.metrics, "warnings": result.warnings}, ensure_ascii=True, default=str))
 
