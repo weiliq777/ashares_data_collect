@@ -243,7 +243,7 @@ def _manifest(conn, dataset_id: str, *, for_update: bool = False) -> dict[str, A
                        schema_version, adapter_version, feature_version, warmup_start,
                         evaluation_start, evaluation_end, out_of_sample_start,
                         market_rule_version, fee_rule_version,
-                        status, input_manifest_hash,
+                        status, built_at, validated_at, frozen_at, input_manifest_hash,
                         selection_predicate, selected_columns, hash_algorithm, availability_rules,
                         calendar_hash, rules_hash, execution_hash, corporate_action_hash,
                         benchmark_code, benchmark_hash,
@@ -261,7 +261,7 @@ def _manifest(conn, dataset_id: str, *, for_update: bool = False) -> dict[str, A
              "schema_version", "adapter_version",
              "feature_version", "warmup_start", "evaluation_start",
               "evaluation_end", "out_of_sample_start", "market_rule_version", "fee_rule_version",
-              "status", "input_manifest_hash", "selection_predicate",
+              "status", "built_at", "validated_at", "frozen_at", "input_manifest_hash", "selection_predicate",
               "selected_columns", "hash_algorithm", "availability_rules", "calendar_hash",
               "rules_hash", "execution_hash", "corporate_action_hash",
               "benchmark_code", "benchmark_hash", "quality_report_hash",
@@ -557,6 +557,73 @@ def _quality_report_hash(value: Any) -> str:
         separators=(",", ":"), allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _checkpoint(dataset_id: str, stage: str) -> dict[str, Any] | None:
+    """读取 Dataset 阶段检查点；检查点只用于恢复流程，不参与业务数据计算。"""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT status, progress_done, progress_total, last_trade_date,
+                              stage_hash, details, error_message,
+                              started_at, heartbeat_at, completed_at
+                         FROM backtest.dataset_build_checkpoint
+                        WHERE dataset_id=%s AND stage=%s""",
+            (dataset_id, stage),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "status": row[0],
+        "progress_done": row[1],
+        "progress_total": row[2],
+        "last_trade_date": row[3],
+        "stage_hash": row[4],
+        "details": row[5] or {},
+        "error_message": row[6],
+        "started_at": row[7],
+        "heartbeat_at": row[8],
+        "completed_at": row[9],
+    }
+
+
+def _set_checkpoint(
+    dataset_id: str,
+    stage: str,
+    status: str,
+    *,
+    progress_done: int = 0,
+    progress_total: int | None = None,
+    last_trade_date: date | None = None,
+    stage_hash: str | None = None,
+    details: dict[str, Any] | None = None,
+    error_message: str | None = None,
+) -> None:
+    """在独立连接中写入 checkpoint，避免被大事务阻塞。"""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO backtest.dataset_build_checkpoint
+                      (dataset_id,stage,status,progress_done,progress_total,
+                       last_trade_date,stage_hash,details,error_message,
+                       started_at,heartbeat_at,completed_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,
+                           CASE WHEN %s='COMPLETED' THEN CURRENT_TIMESTAMP ELSE NULL END)
+              ON CONFLICT (dataset_id,stage) DO UPDATE SET
+                       status=EXCLUDED.status,
+                       progress_done=EXCLUDED.progress_done,
+                       progress_total=EXCLUDED.progress_total,
+                       last_trade_date=EXCLUDED.last_trade_date,
+                       stage_hash=EXCLUDED.stage_hash,
+                       details=EXCLUDED.details,
+                       error_message=EXCLUDED.error_message,
+                       heartbeat_at=CURRENT_TIMESTAMP,
+                       completed_at=EXCLUDED.completed_at""",
+            (dataset_id, stage, status, progress_done, progress_total,
+             last_trade_date, stage_hash, _json_param(details or {}),
+             error_message, status),
+        )
+        conn.commit()
 
 
 def build_dataset(dataset_id: str) -> dict[str, Any]:

@@ -8,6 +8,10 @@ from data_collect.jobs.backtest_dataset import (
     build_dataset,
     create_dataset,
     freeze_dataset,
+    _checkpoint,
+    _git_metadata,
+    _manifest,
+    _set_checkpoint,
     validate_dataset,
 )
 from data_collect.utils.db import get_connection
@@ -29,6 +33,11 @@ def main() -> None:
     parser.add_argument("--fee-rule-version", default="research-fee-assumption-v3")
     parser.add_argument("--benchmark-code", default="000300.SH")
     parser.add_argument("--code-archive-path")
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="忽略已完成的 BUILD checkpoint，强制重新物化 Dataset",
+    )
     parser.add_argument("--dataset-id", help="续跑已有的 DRAFT/FAILED Dataset")
     args = parser.parse_args()
 
@@ -69,10 +78,75 @@ def main() -> None:
             benchmark_code=args.benchmark_code,
         )
     print(f"DATASET_ID={dataset_id}", flush=True)
-    print(f"BUILD={build_dataset(dataset_id)}", flush=True)
-    print(f"VALIDATE={validate_dataset(dataset_id)}", flush=True)
-    freeze_dataset(dataset_id, code_archive_path=args.code_archive_path)
-    print(f"FROZEN_DATASET_ID={dataset_id}", flush=True)
+
+    with get_connection() as conn, conn.cursor() as cur:
+        manifest = _manifest(conn, dataset_id)
+    if manifest["status"] == "FROZEN":
+        print(f"FROZEN_DATASET_ID={dataset_id} (already frozen)", flush=True)
+        return
+
+    build_checkpoint = _checkpoint(dataset_id, "BUILD")
+    current_code = _git_metadata()
+    same_clean_code = (
+        not current_code.get("dirty")
+        and not manifest.get("git_dirty")
+        and manifest.get("git_commit") == current_code.get("commit")
+    )
+    can_resume_validate = (
+        not args.force_rebuild
+        and same_clean_code
+        and manifest.get("built_at") is not None
+        and bool(manifest.get("execution_hash"))
+        and bool(manifest.get("input_manifest_hash"))
+        and build_checkpoint is not None
+        and build_checkpoint["status"] == "COMPLETED"
+    )
+
+    if can_resume_validate:
+        print("BUILD=SKIPPED (checkpoint completed; resume validation)", flush=True)
+    else:
+        _set_checkpoint(dataset_id, "BUILD", "RUNNING", details={"mode": "atomic_streaming_batch"})
+        try:
+            build_result = build_dataset(dataset_id)
+            _set_checkpoint(
+                dataset_id,
+                "BUILD",
+                "COMPLETED",
+                progress_done=int(build_result.get("execution_rows", 0)),
+                progress_total=int(build_result.get("execution_rows", 0)),
+                stage_hash=build_result.get("input_hash"),
+                details=build_result,
+            )
+            print(f"BUILD={build_result}", flush=True)
+        except Exception as exc:
+            _set_checkpoint(dataset_id, "BUILD", "FAILED", error_message=str(exc)[:4000])
+            raise
+
+    _set_checkpoint(dataset_id, "VALIDATE", "RUNNING", details={"mode": "full_materialized_gate"})
+    try:
+        validate_result = validate_dataset(dataset_id)
+        _set_checkpoint(
+            dataset_id,
+            "VALIDATE",
+            "COMPLETED",
+            progress_done=int(validate_result.get("execution_rows", 0)),
+            progress_total=int(validate_result.get("execution_rows", 0)),
+            stage_hash=validate_result.get("input_hash"),
+            details=validate_result,
+        )
+        print(f"VALIDATE={validate_result}", flush=True)
+    except Exception as exc:
+        _set_checkpoint(dataset_id, "VALIDATE", "FAILED", error_message=str(exc)[:4000])
+        raise
+
+    _set_checkpoint(dataset_id, "FREEZE", "RUNNING")
+    try:
+        freeze_dataset(dataset_id, code_archive_path=args.code_archive_path)
+        _set_checkpoint(dataset_id, "FREEZE", "COMPLETED")
+        print(f"FROZEN_DATASET_ID={dataset_id}", flush=True)
+    except Exception as exc:
+        _set_checkpoint(dataset_id, "FREEZE", "FAILED", error_message=str(exc)[:4000])
+        raise
 
 
 if __name__ == "__main__":
