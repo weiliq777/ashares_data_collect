@@ -11,7 +11,7 @@ class ValueTrendStrategy(BaseStrategy):
     从 engine.py 中剥离出来的纯粹的研究层策略。
     它不依赖任何仓位信息，只对整个市场切片(Universe)进行评估并输出候选。
     """
-    strategy_id = "value_trend_v1"
+    strategy_id = "pure_value_trend_v1"
     strategy_version = "1.0.0"
     
     def __init__(
