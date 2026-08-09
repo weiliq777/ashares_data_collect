@@ -16,7 +16,7 @@ import subprocess
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from data_collect.backtest.models import (
     BacktestDataset,
@@ -1876,7 +1876,10 @@ def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
         conn.commit()
 
 
-def load_frozen_dataset(dataset_id: str) -> BacktestDataset:
+def load_frozen_dataset(
+    dataset_id: str,
+    observation_columns: Sequence[str] | None = None,
+) -> BacktestDataset:
     """从已冻结 Dataset 加载纯内存输入；不允许读取实时上游表。"""
     with get_connection() as conn, conn.cursor() as cur:
         manifest = _manifest(conn, dataset_id)
@@ -1888,19 +1891,29 @@ def load_frozen_dataset(dataset_id: str) -> BacktestDataset:
                 ORDER BY trade_date""", (dataset_id,)
         )
         calendar = tuple(row[0] for row in cur.fetchall())
-        cur.execute(
+        # Use a server-side cursor. fetchall() temporarily retained all 6.3m
+        # source tuples in addition to the materialized bars.
+        bars: dict[date, dict[str, MarketBar]] = {}
+        bar_cur = conn.cursor(name=f"backtest_bars_{dataset_id.replace('-', '')}")
+        bar_cur.itersize = 10000
+        bar_cur.execute(
             """SELECT trade_date, ts_code, raw_open, raw_high, raw_low, raw_close,
                       volume, amount, up_limit, down_limit, is_suspended, can_buy,
                       can_sell, limit_status, market
                  FROM backtest.dataset_execution_bar
                 WHERE dataset_id=%s ORDER BY trade_date, ts_code""", (dataset_id,)
         )
-        bars: dict[tuple[date, str], MarketBar] = {}
-        for row in cur.fetchall():
+        bar_count = 0
+        for row in bar_cur:
             bar = MarketBar(*row)
-            bars[(bar.trade_date, bar.ts_code)] = bar
+            bars.setdefault(bar.trade_date, {})[bar.ts_code] = bar
+            bar_count += 1
+            if bar_count % 500000 == 0:
+                print(f"backtest dataset loading bars={bar_count}", flush=True)
+        bar_cur.close()
+        print(f"backtest dataset bars loaded={bar_count}", flush=True)
 
-        observation_columns = (
+        all_observation_columns = (
             "research_date", "ts_code", "list_date", "delist_date", "raw_close", "adj_close_base", "ma20", "ma60",
             "volume_ratio_20d", "pe_ttm", "pe_pct_5y", "pb_pct_5y", "is_pe_meaningful",
             "is_listed_asof", "is_st_asof", "is_tradeable", "can_buy", "can_sell",
@@ -1915,21 +1928,32 @@ def load_frozen_dataset(dataset_id: str) -> BacktestDataset:
             "q_sales_yoy_above_30_quarters_4q", "q_sales_yoy_4q_all_above_30",
             "debt_to_assets",
         )
-        cur.execute(
-            f"""SELECT {', '.join(observation_columns)}
+        selected_columns = list(observation_columns or all_observation_columns[2:])
+        invalid_columns = set(selected_columns) - set(all_observation_columns[2:])
+        if invalid_columns:
+            raise ValueError(f"unknown frozen observation columns: {sorted(invalid_columns)}")
+        selected_columns = ["research_date", "ts_code", *selected_columns]
+        obs_cur = conn.cursor(name=f"backtest_obs_{dataset_id.replace('-', '')}")
+        obs_cur.itersize = 10000
+        obs_cur.execute(
+            f"""SELECT {', '.join(selected_columns)}
                    FROM research.stock_snapshot_daily s
                   WHERE s.snapshot_id IN (SELECT research_snapshot_id FROM backtest.dataset_member WHERE dataset_id=%s)
                   ORDER BY research_date, ts_code""", (dataset_id,)
         )
         observations: dict[date, list[Observation]] = {}
         delist_dates: dict[str, date | None] = {}
-        for row in cur.fetchall():
-            values = dict(zip(observation_columns, row))
+        observation_count = 0
+        for row in obs_cur:
+            values = dict(zip(selected_columns, row))
             day = values.pop("research_date")
             code = values.pop("ts_code")
             if values.get("delist_date") is not None:
                 delist_dates[code] = values["delist_date"]
             observations.setdefault(day, []).append(Observation(day, code, values))
+            observation_count += 1
+        obs_cur.close()
+        print(f"backtest dataset observations loaded={observation_count} columns={len(selected_columns)-2}", flush=True)
 
         cur.execute(
             """SELECT ts_code, ex_date, cash_div, stock_div, stock_bonus_rate,

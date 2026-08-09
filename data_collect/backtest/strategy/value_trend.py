@@ -13,6 +13,13 @@ class ValueTrendStrategy(BaseStrategy):
     """
     strategy_id = "pure_value_trend_v1"
     strategy_version = "1.0.0"
+    # The execution engine still owns all OHLC/order decisions. This profile
+    # only reduces the frozen research payload loaded for this strategy.
+    required_observation_columns = (
+        "list_date", "delist_date", "raw_close", "adj_close_base", "ma20", "ma60",
+        "volume_ratio_20d", "pe_pct_5y", "is_pe_meaningful", "is_listed_asof",
+        "is_st_asof", "eligible_by_market", "effective_announce_date",
+    )
     
     def __init__(
         self,

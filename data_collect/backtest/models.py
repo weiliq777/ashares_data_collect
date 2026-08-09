@@ -19,7 +19,7 @@ def _as_date(value: date | datetime | str) -> date:
     return date.fromisoformat(str(value))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MarketBar:
     trade_date: date
     ts_code: str
@@ -47,7 +47,7 @@ class MarketBar:
         ))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Observation:
     """某个 FROZEN Research Snapshot 中的一只股票研究输入。"""
 
@@ -62,7 +62,7 @@ class Observation:
         return self.values.get(key, default)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DividendEvent:
     ts_code: str
     ex_date: date
@@ -194,7 +194,9 @@ class BacktestDataset:
     evaluation_end: date
     warmup_start: date
     observations: Mapping[date, tuple[Observation, ...]]
-    bars: Mapping[tuple[date, str], MarketBar]
+    # Production loader uses date -> code -> bar to avoid millions of tuple
+    # keys. Fixtures may continue to use the historical (date, code) mapping.
+    bars: Mapping[Any, Any]
     dividends: Mapping[date, tuple[DividendEvent, ...]] = field(default_factory=dict)
     member_roles: Mapping[date, str] = field(default_factory=dict)
     snapshot_ids: Mapping[date, str] = field(default_factory=dict)
@@ -250,7 +252,11 @@ class BacktestDataset:
         return None
 
     def bar(self, day: date, ts_code: str) -> MarketBar | None:
-        return self.bars.get((_as_date(day), ts_code))
+        day = _as_date(day)
+        by_day = self.bars.get(day)
+        if isinstance(by_day, Mapping):
+            return by_day.get(ts_code)
+        return self.bars.get((day, ts_code))
 
     def observations_for(self, day: date) -> tuple[Observation, ...]:
         return tuple(self.observations.get(_as_date(day), ()))

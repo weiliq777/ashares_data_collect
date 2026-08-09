@@ -17,6 +17,10 @@ class ValueTrendCandidateAdapter:
         self.strategy_id = research_strategy.metadata["name"]
         self.strategy_version = research_strategy.metadata["version"]
         self.parameters = research_strategy.metadata["parameters"]
+
+    @property
+    def required_observation_columns(self):
+        return getattr(self.research_strategy, "required_observation_columns", None)
         
     def generate_signals(
         self,

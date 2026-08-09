@@ -386,7 +386,18 @@ def run_frozen_backtest(
     strategy_id = register_strategy(strategy)
     run_id = create_run(dataset_id, strategy_id, config, run_version, code_archive_path)
     try:
-        dataset = load_frozen_dataset(dataset_id)
+        required_columns = getattr(strategy, "required_observation_columns", None)
+        print(
+            f"backtest loading frozen dataset dataset_id={dataset_id} "
+            f"strategy={strategy_id} compact_columns={bool(required_columns)}",
+            flush=True,
+        )
+        dataset = load_frozen_dataset(dataset_id, observation_columns=required_columns)
+        print(
+            f"backtest dataset loaded calendar={len(dataset.calendar)} "
+            f"evaluation={dataset.evaluation_start}..{dataset.evaluation_end}",
+            flush=True,
+        )
         result = BacktestEngine(config).run(dataset, strategy, run_id=run_id)
         persist_result(run_id, result)
         return run_id, result
