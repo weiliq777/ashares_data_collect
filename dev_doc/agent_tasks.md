@@ -1,5 +1,147 @@
 # Agent 任务清单
 
+## T-041｜Research v1.3 历史快照批量物化（2026-08-08）
+
+- 状态：进行中，后台断点执行。
+- 范围：`2021-08-02` 至 `2026-08-06` 共 1,215 个 SSE 开市日；已完成 2 个烟测快照，正式范围当前已创建 1,213 个 Manifest。
+- 实现：`research_snapshot_series.py` 使用每批 10 日的集合 SQL，批量写入 `stock_snapshot_daily`、`snapshot_lineage` 和 `snapshot_input`；baseline/质量报告在批次内复用；Raw 不写入。
+- 当前进度：约 60 个快照处于 `BUILDING`，其余待处理日期为 `DRAFT/FAILED`；本轮先完成 `build → validate`，不绕过 dirty Git 冻结门禁。
+- 续跑：重复执行同一命令会跳过 `VALIDATED/FROZEN`，按日期继续；异常中断的 `BUILDING` 记录需先确认无运行进程后转为 `FAILED` 再续跑。
+- 下一步：完成全部日期校验，提交干净 Git 后统一执行 `research-v1.3` FROZEN 门禁。
+
+## T-040｜基线门禁与财务派生重建收口（2026-08-08）
+
+- 状态：已完成。
+- 修复：重建财务 Raw→版本→Standard→PIT→Feature 链路；Standard 沿用 Raw `business_key` 作为血缘键；门禁按唯一 `payload_hash` 检查重复源键；发布报告支持 PostgreSQL `Decimal` 序列化。
+- 结果：`fina_indicator`、income、balancesheet、cashflow 的版本元数据缺失为 0；PIT 财务 6,211,407 条；公司财务 Feature 116,492 条；估值 Feature 6,291,067 条。
+- 基线：`baseline_20260806` 已通过门禁并为 `validated`，含 `source_manifest_hash`；`baseline_20260803` 自动变为 `superseded`。Raw 未修改。
+- 验证：全量 `pytest` 为 `699 passed, 1 skipped, 5 deselected`；`compileall`、`git diff --check` 通过。
+- 下一步：基于该 validated baseline 生成完整 `research-v1.3` FROZEN Snapshot 系列；完成前不进入正式五年回测。
+
+## T-039｜时点复权价格 Feature v2（2026-08-08）
+
+- 状态：代码、迁移和生产派生重建已完成。
+- 设计：不修改既有 `adj_factor_daily`/`price_daily_v1`；仅使用 `std.dividend_event` 中“实施”且 `ex_date <= trade_date` 的现金分红与送转事件，构造 `feature.price_adjustment_factor_asof` 和时点总回报坐标。
+- 接入：Research 默认版本升级为 `research-v1.3`，Snapshot/Backtest/候选历史读取 `price_daily_v2`；`price_daily_v1` 只读保留兼容。
+- 迁移：`sql/042_create_point_in_time_price_feature.sql`、`sql/043_research_v13_point_in_time_price.sql`；Raw、旧 Standard/PIT/Feature 不被删除或覆盖。
+- 约束：原始 OHLC 仍是成交/止损坐标，v2 仅用于指标；配股仍不模拟，未来公司行为不得进入历史指标。
+- 后续：重建完成后抽样核对除权日前后连续性、公司行为事件映射、行数和质量状态，再发布带完整 Source Manifest 的新 baseline 并生成 `research-v1.3` 快照系列。
+- 实测：`price_adjustment_factor_asof=6,308,213`、`price_daily_v2=6,308,213`，覆盖 `2021-08-02` 至 `2026-08-06`；截止 `2026-08-03` 与 `daily_kline` 均为 `6,291,619` 行，`MISSING_SOURCE=0`。`WARNING` 仅为上市初期不足 60 个观察日的预热行。
+- 验证：全量测试 `699 passed, 1 skipped, 5 deselected`，compileall 和 `git diff --check` 通过；PostgreSQL 正常且未 OOM。下一步为只读抽样、发布新 baseline 和生成 v1.3 Snapshot。
+
+## T-038｜历史初始化与 Research 时点安全修复（2026-08-08）
+
+- 状态：历史时点门禁修复已由 T-039 的 `price_daily_v2` 方案替代；等待 v2 派生重建后生成正式 `research-v1.3` 快照。
+- 历史初始化：`daily`/`daily_basic` 单交易日响应达到 Tushare 上限时，自动按股票代码分片重试；新 checkpoint 保存 Raw 版本行数，空响应不标记完成，避免静默截断。
+- 历史股票状态：Research Snapshot 使用 `pit.universe_daily` 和 `std.security_lifecycle` 的有效区间，不再把当前 `stock_basic` 名称/市场/上市状态倒灌到历史日期；Raw stock_basic 仅作基准内身份与日期字段来源。
+- 复权时点门禁：Snapshot 的 create/build/validate/freeze 均检查截止日前 365 个日历日技术窗口内，`adj_factor_daily` 存在且 `fetched_at <= research_cutoff_date`。缺失或未来获取的因子直接 fail-closed，不修改既有 FROZEN 快照。
+- 验证：`compileall` 通过；Research Snapshot 与系列专项测试 `11 passed`；数据库只读核验显示 `2026-08-03` 当前因子仍有晚于截止日获取的历史行，故正式历史快照会正确阻断，`2021-08-02` 同样阻断。
+- 后续：完成 v2 派生表验收，发布带完整 Source Manifest 的新 validated baseline，再生成 `research-v1.3` 快照系列。
+
+## T-037 follow-up — 2026-08-08 audit closure
+
+### Production data audit — 2026-08-08
+
+- Code audit result: no new P0/P1 execution defect found after the reserve-cash, settled-cash, Snapshot input-lock, and `041` open-time contract repairs; `693 passed, 1 skipped, 5 deselected`.
+- Production data result: current code requires `research-v1.2` Snapshots and v2 Dataset/adapter/engine contracts, but the database has no `research-v1.2` FROZEN Snapshot. The existing `research-v1.1` series is incomplete: 690 FROZEN dates, one DRAFT date, and 522 missing SSE open dates in `2021-08-02`–`2026-08-03`; its frozen rows are legacy dirty records without baseline quality hashes and must not be silently reused.
+- Existing `dataset-v1`/`dataset-v1.1` and legacy v1 Runs remain immutable smoke/history records. A new clean-code `research-v1.2` Snapshot series and a new v2 Dataset/Run are required before formal five-year results.
+- Background Raw initialization remains active and must not be interrupted; this audit did not write or delete Raw data.
+- Additional gate: `baseline_20260803` is `validated` but has an empty persisted `source_manifest_hash/source_manifest`; the current Snapshot code correctly fails closed before creating v1.2. Publish a new complete baseline after Raw/derived work finishes before starting the new Snapshot series.
+
+- Status: code fixes completed; 59 focused tests and 693 full tests pass (`1 skipped`, `5 deselected`).
+- Fixed: reserve cash is an absolute equity floor in Backtest, candidate generation, DB Portfolio fills, and manual Portfolio simulation.
+- Fixed: candidate sizing now uses settled `available_date` cash while preserving total cash for equity/risk.
+- Fixed: Research Snapshot build locks the quality/materialization input boundary before quality reads.
+- Fixed: Dataset/Run schema uses `backtest-dataset-v2`, `research-to-backtest-v2`, and `daily-next-open-v2`; migration `sql/041_backtest_open_time_contract.sql` is applied.
+- Boundary: Portfolio remains manual `PENDING_APPROVAL -> PAPER_MANUAL`; corporate actions are handled by Backtest, while Portfolio valuation consumes explicitly bound frozen daily snapshots and does not create broker orders.
+- Background: the long historical Raw initializer remains running with checkpointed `adj_factor` progress; do not interrupt it.
+
+## T-037｜正式回测逻辑审计修复
+
+- 时间：2026-08-08
+- 目标：修复样本成熟度、撮合时序、涨跌停时点、每日候选冻结、基本面策略、Raw-first 调度、财务版本和代码归档门禁。
+- 状态：进行中
+- 当前结果：已完成代码、数据库和测试审计；旧 `research-v1.1` 快照只读保留，不作为修复后的正式五年基线。
+- 下一步：完成 `research-v1.2` 与各项门禁代码，专项验证后后台回补 warm-up 数据并重建新快照。
+
+## T-036｜阶段三开发完成与正式历史回测生产准备（2026-08-07）
+
+- 状态：阶段三代码开发完成；正式历史回测生产门禁待执行。
+- 已确认：Backtest Dataset/Run、撮合、风险、公司行为、PIT/快照边界、Portfolio 人工 Air-Gap、数据库审计约束和 `actual_shares`/订单哈希收口均已实现。
+- 验证：当前环境全量 `pytest` 为 `652 passed, 1 skipped, 5 deselected`；`compileall`、`git diff --check` 通过；033 迁移可幂等重放；生产库 Dataset/Run/Portfolio/规则均为 0 行；Raw 未修改。
+- 当前边界：可以进入正式历史回测生产环节，但尚未生成生产数据。自动实盘交易仍不支持，Backtest 只能进入 `BACKTEST/PENDING_APPROVAL`，成交只能是人工批准的 `PAPER_MANUAL`。
+- 生产顺序：规则审批并入库 → 干净 Git commit → 多日期 `research-v1.1` FROZEN Snapshot → Dataset `build→validate→freeze` → 创建正式 Run → 结果、现金、持仓和审计哈希对账。
+- 完工流程文档：`dev_doc/project_completion_runbook.md`，以后按该手册执行生产操作和验收。
+- 不再继续扩展阶段三核心代码；后续发现问题按小版本修复，并在生产门禁中记录证据。
+
+## T-035 阶段三生产增强版（2026-08-06）
+
+- 状态：代码与迁移完成，专项测试通过；正式多日期回测门禁待按生产流程执行。
+- 完成：风险压力仓位字段、成交量/成交额标准单位和整笔流动性拒单、Monte Carlo bootstrap/排列法及哈希、Backtest→Portfolio `BACKTEST/PENDING_APPROVAL` 人工隔离。
+- 补强：Dataset 对非停牌异常成交量/成交额和无效行情失败；规则参数进入冻结 MarketRule；期末假设清仓使用独立 `END_OF_DATA_LIQUIDATION` 审计 Metric，不伪造 Fill。
+- 迁移：`sql/032_backtest_portfolio_airgap.sql`；Raw 表只读，已核对 Raw 行数未改变。
+- 入口：`data_collect/jobs/portfolio_simulation.py::import_backtest_order`。该入口只创建待审批意图，不批准、不成交、不访问券商。
+- 验收：新增风险、流动性、Monte Carlo、人工隔离专项测试通过；正式回测前仍需 clean Git、Snapshot series、Dataset freeze 和正式 Run 验收。
+- 测试文件：`tests/test_risk_gap_model.py`、`tests/test_liquidity_rules.py`、`tests/test_monte_carlo.py`、`tests/test_portfolio_airgap.py`；规则候选文件已加入参与率和整笔拒单策略，但仍保持 `REVIEW_REQUIRED`，未写入生产规则表。
+- 最终验收：全量 `pytest` 为 `650 passed, 1 skipped, 5 deselected`；`compileall` 与 `git diff --check` 通过；032 迁移重复执行和事务回滚演练通过，Raw 核心表行数未改变。
+
+## T-034｜阶段三正式版回测审计修复
+
+- 时间：2026-08-06
+- 目标：按正式回测审计结论封口送转股、除权止损、退市、组合排序、数据版本、覆盖门禁、压力测试和 Run/Dataset 血缘。
+- 状态：代码修复与专项验证完成；正式规则、快照系列和生产回测仍待业务门禁。
+- 当前结果：`DividendEvent` 以 `stk_div` 合计为唯一送转率并校验分项；除权日调整原始止损坐标、送转成本和待成交订单；退市持仓无真实退出时 fail-closed；同日 BUY 按 `signal_score DESC, ts_code ASC` 分配，T+1 开盘按实际价格重算股数且 `actual_shares != planned_shares` 才标记 resize；Dataset 只选择一个完整 Raw payload，不跨版本按字段拼接；保存并绑定 validated baseline 的 `baseline_quality_report_hash`，该哈希进入 Dataset `input_manifest_hash`，基线变化会阻断后续 build/validate/freeze；无逐日覆盖门禁时使用该基线报告作为等价覆盖；Monte Carlo 保存方法、参数和交易序列哈希；Run 数据库触发器强制输入哈希及市场/费用版本与 Dataset 一致。送转零碎股 v1 按整数股向下取整，不产生现金补偿，真实券商政策需新规则版本。
+- 文件：`data_collect/backtest/models.py`、`engine.py`、`risk.py`、`data_collect/jobs/backtest_dataset.py`、`backtest_run.py`、`sql/028_create_backtest_model.sql`、`sql/031_phase3_final_audit_contract.sql`、`dev_doc/backtest_design.md`、`dev_doc/current_data_model.md`、`dev_doc/development_plan_3_phases.md`。
+- 验证：阶段三最终专项 `47 passed`；全量 `640 passed, 1 skipped, 5 deselected`，仍有 2 个既有通知前缀测试失败；`compileall`、`git diff --check`、028/029/030/031 迁移重放和 Run/Dataset 哈希触发器烟测通过；生产 Dataset/Run/Portfolio/门禁仍为 0 行，Raw 行数未变。
+- 约束：当前工作区仍需后续提交为 clean commit；规则 YAML 仍为 `REVIEW_REQUIRED`，正式回测必须先导入已批准的有效日期规则、生成多日期 `research-v1.1` FROZEN 快照并完成 Dataset `build→validate→freeze`。
+- 文档同步：已将 Dataset 基线质量哈希绑定、T+1 实际股数 resize 审计标记和送转零碎股 v1 向下取整规则同步到数据模型、回测设计和三阶段开发计划。
+
+## T-032｜阶段三 Gemini 设计吸收与正式回测开发基线
+
+- 时间：2026-08-06
+- 目标：将 Gemini 阶段三建议收敛为本项目可复现的 Dataset、撮合、账本、组合和运行门禁契约。
+- 状态：代码与契约已完成，正式生产门禁待业务确认
+- 当前结果：已落地 Dataset/Run/Portfolio 模型、执行行情与公司行为物化、warm-up/evaluation 区间、数据可见性与版本血缘、T 收盘→T+1 开盘撮合、有效日期市场/费用规则、不可变事件账本、人工确认的 `PAPER_MANUAL` 组合及阶段三专项测试；Dataset 的 `VALIDATED→FROZEN` 只允许代码血缘字段变化，规则导入同时拒绝数据库既有重叠区间；并修复 `028/029/030` 迁移中注释与 SQL 粘连导致的可重放语法问题。Portfolio 现金账本新增组合行锁和唯一 `INIT` 索引，避免并发初始化/现金检查穿透；生产库尚未写入正式规则、Dataset、Run 或 Portfolio。
+- 验证：阶段三定向测试在 warm-up 全区间校验、运行前代码预检、执行来源缺失门禁、账本约束和失败后 BLOCKED 门禁补强后为 59 项通过；`028`/`029`/`030` 迁移重放和 PostgreSQL 回滚烟测通过；候选规则默认只校验，`--confirm` 在 `REVIEW_REQUIRED` 状态下被拒绝；生产 Dataset/Run/Portfolio/规则/门禁均为 0 行，Raw 行数未变化。
+- 当前门禁：候选规则文件 `dev_doc/backtest_rules_candidate.yaml` 仍为 `REVIEW_REQUIRED`，不得使用 `--confirm`；正式回测还需要多个 `research-v1.1` FROZEN 快照和干净 Git 版本。第一版不模拟配股、部分成交、ATR/Trailing Stop，也不接入自动下单。
+- 下一步：确认规则费率/滑点和正式回测日期范围；审核通过后导入规则，生成完整快照系列，执行 Dataset `build→validate→freeze`，再联调 Run 与 Portfolio。执行行情的 vintage 口径固定为构建事务内按 `fetched_at DESC, record_id DESC` 选择的 Raw 版本，并在 Dataset 中保存版本/哈希。
+
+### T-033｜阶段三数据来源与状态约束收口
+
+- 时间：2026-08-06
+- 目标：封口执行行情来源缺失、历史 Raw 版本兼容、Dataset 基线复核和 Run/Portfolio 数据库状态约束。
+- 状态：已完成
+- 当前结果：Dataset 物化对 `daily_kline`、`std.security_status_daily` 和 `pit.security_tradeability_daily` 任一缺失均标记 `MISSING_SOURCE`，禁止静默生成可交易行；历史没有 `tushare_market_raw_version` 的日线允许版本号为空，但必须由选中 Raw payload 生成确定性哈希。build/validate/freeze 均重新确认基线仍为 `validated`；验证失败持久化为 FAILED；Run 子表仅在 RUNNING 可写；Portfolio 数据库增加决定日/快照截止日精确匹配、审批人、费用、现金余额和持仓批次约束；公司行为现金腿与送转腿可分开结算。
+- 验证：阶段三定向测试 59 项通过；`compileall`、`git diff --check`、028/029/030 迁移重放及 PostgreSQL 回滚烟测通过；规则区间排他约束回滚烟测通过；生产 Dataset/Run/Portfolio/规则/门禁仍为 0 行，Raw 未修改。
+- 补充：Portfolio 数据库同时要求决定日、计划执行日、成交日、现金账本日期和持仓批次日期均为 `trading_calendar` 中的 SSE 开市日；无交易日历记录时拒绝写入。
+- 补充：Research `freeze` 也会在同一数据库会话中重新确认 validated 基线，并复核质量报告哈希；validate 后基线或质量门禁变化时不得冻结。
+- 补充：Dataset 执行 OHLC/成交量/成交额现在直接解析构建事务选定的 `tushare_market_raw_version.payload`，历史无版本时才回退 `tushare_daily_raw.payload`；不再从可变 `daily_kline` 取执行价格。
+- 补充：Portfolio 现金账本插入会锁定账户 Manifest，缺少账户时拒绝写入；唯一部分索引保证每个组合只有一条 `INIT` 记录，成交现金检查也锁定账户行。
+- 补充：行情覆盖率 PASS 只表示接口响应达到历史基准；单日 Raw/Standard/checkpoint 或全局派生重建失败时追加最新 `BLOCKED` 门禁，禁止旧 PASS 让 Research freeze 放行。
+- 补充：Research Snapshot 与 Backtest Dataset 的 freeze 会先 `FOR UPDATE` 锁定 Manifest，并要求 `UPDATE ... WHERE status='VALIDATED'` 命中一行，避免并发冻结竞态。
+- 补充：Backtest Dataset build/validate 会检查 warm-up 到 evaluation_end 区间内已有的最新覆盖门禁；历史无门禁记录不强行补造，但任何已记录的非 PASS 都会阻断物化和验收。
+- 下一步：等待规则费率/滑点与正式回测日期范围确认；随后生成多日期 `research-v1.1` FROZEN 快照并执行 Dataset `build→validate→freeze`。在此之前不导入候选规则、不创建正式 Dataset/Run/Portfolio。
+
+## T-018：阶段三 Backtest Dataset/Run 与日线引擎实现
+- 时间：2026-08-05
+- 目标：把已冻结的阶段三契约落实为可复现的 Dataset、Run、规则快照、事件账本和纯 Python 日线回测基础。
+- 状态：基础实现完成，正式 Dataset/Run 待门禁
+- 当前结果：已新增并幂等应用 `sql/028_create_backtest_model.sql`；实现 `backtest_dataset.py`、`backtest_run.py` 和 `data_collect/backtest/`。已覆盖 FROZEN Snapshot 输入、执行 OHLC/涨跌停/可交易性、日历/公司行为/规则冻结、T 收盘→T+1 开盘、T+1 可卖、费用、风险预算、资金结算、确定性事件 ID、不可变状态和结果持久化；专项回归已通过。
+- 当前门禁：交易日历已覆盖到 2026-08-03；`backtest.market_rule_effective` 仍未配置，且只有一个日 FROZEN Research Snapshot，不能支撑完整历史回测。代码按 fail-closed 处理，不补造日期、不回退当前/合成规则、不修改 Raw。
+- 下一步：确认显式市场/费用规则并准备多日期 FROZEN 快照后，创建小范围 DRAFT Dataset，执行 build→validate→freeze，再联调首个 Backtest Run。
+
+## T-017｜阶段三 Backtest 输入、撮合与账本契约
+
+- 时间：2026-08-05
+- 目标：吸收 `dev_doc/gemini-doc/` 的有效设计，建立基于多日期 FROZEN 快照的可复现 Backtest Dataset、Run Manifest、日线撮合和不可变账本契约。
+- 状态：已由 T-018 接续完成（历史记录）
+- 当前结果：已确认 Research 快照研究链路基本完成，但正式回测仍缺少执行行情物料、公司行为冻结、warm-up/evaluation 区间、数据 vintage、市场规则/费用版本、撮合状态机和 Run Manifest。设计已保存至 `dev_doc/backtest_design.md`；Gemini 示例代码暂不直接接入生产。
+- 关键边界：Backtest 不读取实时 PIT/Feature，不使用当前 3 只观察股替代历史股票池，不在生产模式回退合成数据；复权价格只用于指标，原始价格用于成交。
+- 默认方案：T 收盘出信号、T+1 开盘尝试成交、只做多、不模拟部分成交、第一版暂不模拟配股；若无异议按此实现。
+- 下一步：先完成 Dataset/Run Manifest 及执行输入物料的 DDL 和测试契约，再实现 Frozen Dataset Materializer、Input Adapter 和纯 Python 撮合引擎。
+
+更新时间：2026-08-05
+
 ## T-016：Research 外部证据候选检索最小闭环
 - 时间：2026-08-05
 - 目标：按 ACTIVE 观察池成员与快照截止日，只读检索 OpenSearch 新闻/公告候选。
@@ -137,7 +279,7 @@
 - 目标：建立 Research 快照 Manifest、输入切片哈希、逐行血缘、一致性生成和数据库冻结机制。
 - 状态：已完成，正式 FROZEN 快照已生成
 - 当前结果：新增 `sql/024_create_research_snapshot.sql`、`sql/025_research_lineage_sources.sql`、`research_snapshot.py` 和专项测试；正式快照 `9afb9a08-da75-439b-8b4a-fcc688df3787` 已基于干净 commit `658a8c8` 完成 build→validate→freeze，5,535 行单日快照、8 张输入统计和 44,280 条血缘记录通过校验。
-- 测试口径：新增血缘回归测试后，`tests/test_research_snapshot.py` 单独 6 passed；与 `tests/test_phase2_business_rules.py` 合计 12 passed。
+- 测试口径：新增血缘及冻结前质量/基线复核测试后，`tests/test_research_snapshot.py` 单独 7 passed；与 `tests/test_phase2_business_rules.py` 合计 13 passed。
 - 约束：Research 生成器可读取通过质量门禁的 PIT/Feature；Research/Backtest 只允许读取 `FROZEN` 快照；正式快照已冻结，后续不得更新或删除其子表。
 - 下一步：继续补充真实 OpenSearch/公告/研报证据引用，再进入 Research 人工复核；暂不进入正式 Backtest。
 
@@ -150,3 +292,153 @@
 - 审计约束：ACTIVE 观察池只能归档；ACTIVE 成员和证据只能追加；ARCHIVED 观察池、成员和证据全部不可变；应用层和数据库触发器均校验股票属于快照，绑定观察池时必须属于观察池成员。
 - 验证：正式观察池 `01b53411-155e-4672-9548-189396e7a3e0` 已基于 FROZEN 快照激活，当前 3 个 `value_quality` 成员；已写入 9 条 PostgreSQL 快照事实引用，重复执行幂等；外部 OpenSearch/公告/研报证据待真实文档绑定。
 - 下一步：为 3 个成员补充真实外部证据和反方证据，完成 Research 人工复核后再设计 Backtest 输入。
+# 当前任务状态覆盖（2026-08-05）
+
+- T-017 的“下一步先完成 DDL/引擎”属于历史描述；现已由 T-018 完成。
+- 当前阶段三状态以 T-018 和 `dev_doc/backtest_design.md` 为准：基础代码、迁移和专项测试已完成；正式 Dataset/Run 仍等待交易日历完整覆盖及显式市场/费用规则配置。
+
+## T-019：阶段三 Portfolio 人工模拟组合
+- 时间：2026-08-06
+- 目标：建立不连接券商的人工批准模拟组合，保留成交、T+1 持仓、现金、估值和审计事件。
+- 状态：代码与契约已完成；生产实例待 T-027
+- 当前结果：已新增 `sql/029_create_portfolio_model.sql`、`data_collect/portfolio/`、`data_collect/jobs/portfolio_simulation.py` 和 `dev_doc/portfolio_design.md`；已覆盖 FROZEN Snapshot/ACTIVE Watchlist 门禁、PAPER_MANUAL、整手、预留现金、现金结算天数、禁止已有持仓加仓、T+1 和追加式账本。
+- 当前门禁：数据库中尚未创建正式 Portfolio；正式使用前仍需干净代码版本，并且所有成交必须人工批准。
+- 下一步：生产使用仍等待多日期 `research-v1.1` FROZEN 快照、干净代码版本和正式规则；隔离数据库的组合成交/估值联调已完成。
+
+## T-020：阶段三时间截面与样本外门禁
+- 时间：2026-08-06
+- 目标：阻断 Research/PIT 财务可见日期穿越，并提供回测 Dataset 的 cutoff 隐藏未来数据验证。
+- 状态：代码与契约已完成；多日期数据待 T-027
+- 当前结果：Dataset validate 已检查 Snapshot 截止日与研究日一致、`effective_announce_date <= research_date`；新增 `data_collect/backtest/validation.py` 和专项测试。
+- 当前门禁：历史回测仍需要多个日期的 FROZEN Research Snapshot；当前单一 2026-08-03 快照不能支撑完整历史回测。
+
+## T-021：阶段三回测契约加固与组合联调（2026-08-06）
+
+- 状态：代码与契约已完成；生产门禁待 T-027
+- 已完成：Dataset Manifest 增加切片谓词、字段集合、哈希算法、可见性规则；Run Manifest 增加参数哈希；止损优先于同日策略卖出；Frozen Dataset 缺规则时 fail-closed；公司行为增加公告/送转到账日期与可见性校验；Portfolio Python/数据库两层补齐 T+1 日期约束；Portfolio 账户 Manifest 持久化 `cash_settlement_days`，延迟结算时拒绝缺失或同日可用日期；Portfolio 意图校验快照/观察池股票归属，估值校验 FROZEN 原始收盘价。
+- 验证：Backtest/Portfolio 专项测试已通过；`028`、`029` 迁移可重复执行；Portfolio 正向/负向数据库烟测均回滚，相关表保持 0 行；Raw 未修改；新增账户现金结算字段后的迁移和烟测已重跑通过。
+- 当前门禁：`trading_calendar` 已覆盖到 2026-08-03，但 `backtest.market_rule_effective` 仍无显式规则，正式 Dataset/Run 仍未创建；只有一个日 FROZEN Research Snapshot，尚不能做完整历史回测。
+- 规则边界：第一版使用固定信号止损，不宣称已实现 ATR/Trailing Stop；配股暂不模拟；不自动下单。
+- 下一步：确认并录入按生效日期的市场/费用规则，准备多日期 FROZEN Snapshot 生成与 Dataset build→validate→freeze；最小 fixture 的 Run 和 Portfolio 账本联调已完成。
+
+## T-023：阶段三可复现与估值不可变门禁
+
+- 时间：2026-08-06
+- 目标：收口快照重跑、组合估值覆盖以及未来成交回补历史估值的可复现风险。
+- 状态：已完成
+- 当前结果：快照逻辑键 `(research_cutoff_date, data_baseline_tag, schema_version)` 唯一；系列任务可复用 DRAFT/FAILED，保留 VALIDATED/FROZEN；正式冻结只接受干净 Git 或存在的代码归档。Portfolio 估值保存 FROZEN Snapshot 和现金/持仓/价格输入哈希，同输入重跑幂等，冲突输入及数据库更新/删除均拒绝，且禁止在更晚成交后回补过去估值。
+- 验证（中间结果）：迁移幂等、PostgreSQL 估值不可变烟测和隔离 Dataset→Run 联调通过；阶段三专项测试最终由 T-026 更新为 39 项。
+- 下一步：待录入有效日期市场/费用规则并生成多日期 `research-v1.1` FROZEN 快照后，执行正式 Dataset→Run 联调；隔离联调已先行通过。
+
+## T-022：阶段三多日期快照与 Dataset 血缘补强
+
+- 时间：2026-08-06
+- 目标：把多日期 FROZEN Research Snapshot 编排和 Dataset 成员级公司行为血缘做成可复现、可验收的代码契约。
+- 状态：代码与契约已完成；正式快照待 T-027
+- 当前结果：新增 `data_collect/jobs/research_snapshot_series.py`，只接受明确日期或标准化交易日历范围，按单日 Snapshot 的 create→build→validate→freeze 顺序执行，默认最多 50 个并要求显式取消上限；Research 升级为 `research-v1.1` 并接通 `eligible_by_market`；`dataset_member` 已写入按 `ex_date` 的 `corporate_action_hash`，并纳入 Dataset 输入 Manifest 哈希；Portfolio 意图和估值门禁已补齐。纯 Python/静态专项测试通过，数据库迁移和 Portfolio 现金结算/观察池成员烟测通过且全部回滚。
+- 当前门禁：尚未生成新的 `research-v1.1` 正式历史 FROZEN 快照；旧 `9afb...` 快照不作为正式 Dataset 输入；`backtest.market_rule_effective` 仍为空，不能创建正式 Dataset/Run；当前工作区仍需干净 commit 才能正式冻结。
+- 下一步：先确定并录入真实有效日期的市场/费用规则，再选择历史快照日期执行小范围 DRAFT→VALIDATED 验证；通过后再在干净代码版本上冻结 Dataset 并联调 Run/Portfolio 账本。
+
+## T-024｜阶段三物化哈希与估值不可变门禁收口
+
+- 时间：2026-08-06
+- 目标：确保 Dataset 校验对账最终物化子表，并让 Portfolio 估值输入可幂等、可追溯且不可覆盖。
+- 状态：已完成
+- 当前结果：`backtest_dataset.py` 现在重算物化日历、规则、执行行情和公司行为的全局/按日哈希，并与 Manifest、`dataset_member` 对账；修正 Portfolio 估值日期门禁位置，估值保存 Snapshot/现金/持仓/价格哈希，同输入幂等，冲突、更新、删除和更晚成交后的历史回补均拒绝。
+- 验证（中间结果）：`compileall`、024/028/029 迁移可重复执行、PostgreSQL 回滚烟测和临时隔离数据库全链路联调通过；阶段三定向测试最终由 T-026 更新为 39 项，生产正式 Dataset、Portfolio 和 Raw 均无新增或修改。
+- 下一步：录入经确认的有效日期市场/费用规则，生成多个 `research-v1.1` FROZEN 快照后，执行正式数据集联调；全量测试仍有 2 个既有通知前缀失败，非阶段三逻辑。
+
+## T-025｜阶段三结算边界与迁移契约收口
+
+- 时间：2026-08-06
+- 状态：已完成
+- 当前结果：回测卖出发生在 Dataset 最后一天且现金结算需要未来交易日时改为 fail-closed，不再错误地把未结算资金当日释放；补充回归测试。分红 Standard 基础 DDL 已声明 `business_key` 和 `payload_hash`，与版本转换及 Dataset 公司行为血缘查询保持一致。
+- 验证（中间结果）：阶段三定向测试当时为 37 项；最终由 T-026 更新为 39 项。生产库只读计数确认阶段三正式 Dataset/Run/Portfolio 仍为 0，Raw 行数未变化。
+
+## T-026｜阶段三物化门禁、规则版本与 Portfolio 数据库约束收口
+
+- 时间：2026-08-06
+- 目标：把 Gemini 阶段三设计中的时间截面、输入物化、市场/费用版本、公司行为去重和人工组合约束落实到代码与数据库。
+- 状态：已完成
+- 当前结果：快照系列只接受开市日；Dataset 校验基线、截止日和开市日，按 `market_rule_version` 与 `fee_rule_version` 选择有效规则；公司行为按业务键取有效版本并检查重复；缺失成交量动量按 fail-closed 处理；Portfolio 数据库触发器补齐成交股数、T+1、现金、价位、止损、快照截止日和已有持仓等门禁。修复 `028`/`029` 重复 SQL，使迁移可安全重放。
+- 验证：阶段三定向测试 39 项通过；`compileall`、`git diff --check` 和 `028`/`029` 幂等迁移通过；生产只读核对 `tushare_daily_raw=6,291,619`、`tushare_daily_basic_raw=6,274,473`、`tushare_adj_factor_raw=6,360,864`，Dataset/Run/Portfolio 均为 0，Raw 未执行写入。
+- 下一步：确认并录入按生效日期的市场/费用规则，生成多个 `research-v1.1` FROZEN 快照后，再创建正式 Dataset 并运行第一份回测；不伪造规则、不自动下单。
+
+## T-027｜阶段三正式回测生产门禁
+
+- 时间：2026-08-06
+- 目标：完成多日期 FROZEN 快照、规则数据集和正式 Dataset→Run→Portfolio 验收。
+- 状态：待开始
+- 当前结果：代码和隔离数据库全链路已具备，但生产库尚无正式 Dataset/Run/Portfolio；现有唯一正式快照为旧 `research-v1`，不能静默升级为 `research-v1.1`。
+- 下一步：先确定市场板块/ST/新股及费用规则的有效日期和版本，再小范围生成并验证快照系列，随后在干净 Git commit 上执行 Dataset `build→validate→freeze`。
+
+## T-028｜阶段三运行门禁、PIT 校验与撮合边界补强
+
+- 时间：2026-08-06
+- 目标：吸收 Gemini MVP 中可落地的覆盖率熔断、PIT 物理截面检查和风险适配要求，封住回测引擎的重复买单与数据边界漏洞。
+- 状态：代码完成；正式生产门禁仍待 T-027
+- 已完成：新增 `sql/030_create_phase3_ops_gate.sql` 和 `ops.market_data_quality_gate` 追加式门禁；按日全市场增量在 Raw 写入前检查历史覆盖率，低于 1% 阈值、无基线或抽样结果均不可作为正式发布；Research 快照冻结检查最新门禁结果。新增 `data_collect/jobs/phase3_validation.py` 的 PIT 只读校验，检查财务公告日、Feature/Tradeability `source_asof_date` 和 Research 快照截止日；新增 `data_collect/jobs/backtest_rules.py`，规则 YAML/JSON 先校验有效区间、有限数值和 `parameters.provenance`，再显式 `--confirm` 只追加入库，数据库禁止修改/删除规则。新增市场温度风险倍率纯适配器，但未隐式接入第一版回测。撮合层新增执行时重复 BUY/最大持仓二次检查、正式 Dataset T+1 边界拒绝、分红支付/上市日期顺序校验；物化遇到涨跌停空值、非有限值、非正值或 100000 哨兵时保留价格但标记 WARNING 并关闭买卖，退市/不可交易行不伪造限制价。
+- 验证：阶段三定向测试 52 项通过；全量实测为 `628 passed, 1 skipped, 5 deselected`，另有 2 个既有通知前缀测试失败；PIT 只读校验（`2026-08-03`）5 项均为 0；`compileall`、`git diff --check` 和 `030` 迁移执行通过。生产 Raw 行数仍为 `daily=6,291,619`、`daily_basic=6,274,473`、`adj_factor=6,360,864`，门禁表当前 0 行，未写入模拟门禁记录。
+- 剩余门禁：仍需用户/业务确认并录入按有效日期的市场板块、ST/新股、费用、滑点和资金结算规则；生成多个 `research-v1.1` FROZEN 快照；在干净 Git commit 上构建正式 Dataset/Run。第一版仍不接自动下单，不宣称 ATR/Trailing Stop 或配股已实现。
+
+## T-029｜Dataset 全区间 Snapshot 覆盖与候选发布不可变性
+
+- 时间：2026-08-06
+- 目标：避免回测 Dataset 存在中间交易日缺少 Research 输入，或验收后被修改再冻结。
+- 状态：已完成
+- 当前结果：`create_dataset()` 现在要求 `warmup_start` 至 `evaluation_end` 每个 SSE 开市日均绑定一个 FROZEN `research-v1.1` Snapshot；`VALIDATED` Dataset 及其成员、执行行情、日历、公司行为和规则子表均禁止修改，只有 `VALIDATED → FROZEN` 发布状态及代码元数据更新允许发生。新增 `missing_snapshot_dates()` 和状态锁定回归测试。
+- 验证：阶段三定向测试 51 项通过；全量实测 `627 passed, 1 skipped, 5 deselected`，2 个既有通知前缀测试失败；`028/030` 迁移重放成功，VALIDATED 锁定烟测通过，生产 Dataset/Run/Portfolio 和规则表保持 0 行，Raw 行数未变化。
+- 下一步：补录经确认的有效日期市场/费用规则，按完整开市日生成多个 `research-v1.1` FROZEN Snapshot，再创建正式 Dataset；未完成前不进入正式回测。
+
+## T-030｜规则冲突与 Dataset 代码血缘收口
+
+- 时间：2026-08-06
+- 目标：防止规则导入静默吞掉同主键修订，以及 Dataset 在 build 后使用另一版本代码冻结。
+- 状态：已完成
+- 当前结果：规则导入对同主键执行内容指纹核对；相同内容幂等，不同内容要求新增 `rule_version`。Dataset Manifest 保存 build 时的 `code_version/git_commit/git_dirty/diff_hash`，freeze 前必须与当前工作区一致，否则必须重新 build。
+- 验证：阶段三定向测试 52 项通过；全量实测 `628 passed, 1 skipped, 5 deselected`，2 个既有通知前缀测试失败；Raw、正式规则和 Dataset/Run/Portfolio 均未写入或修改。
+- 下一步：继续等待有效日期规则和完整 Snapshot 日期范围确认，再执行正式生产数据集流程。
+
+## T-031｜正式规则候选文件与审核入口
+
+- 时间：2026-08-06
+- 目标：提供可审计、可校验但不会自动入库的第一版市场/费用规则候选。
+- 状态：候选已完成，等待审核
+- 当前结果：新增 `dev_doc/backtest_rules_candidate.yaml`，按印花税生效日期拆分两段规则；交易单位、T+1、价位和费用均显式记录，涨跌停不由静态百分比伪造，而使用每日冻结 `std.security_status_daily` 限价。佣金、最低佣金和零滑点明确标记为研究假设，文件包含官方规则引用。
+- 验证：`uv run python -m data_collect.jobs.backtest_rules dev_doc/backtest_rules_candidate.yaml` 返回 `validated=2`，未写入数据库；必须人工确认后才允许 `--confirm`。
+- 下一步：确认候选费率/滑点及正式回测日期范围；确认后再入库并生成完整 `research-v1.1` Snapshot 系列。
+
+## T-032｜阶段三成交语义与 Air-Gap 数据库哈希收口
+
+- 时间：2026-08-06
+- 目标：确保 `actual_shares` 只代表真实成交，并让 Backtest→Portfolio 的来源哈希不能被直接 SQL 绕过。
+- 状态：已完成
+- 当前结果：回测引擎在计划和拒单阶段保持 `actual_shares=0`，创建 Fill 后才写入 Fill 股数；数据库新增 `backtest.order.order_audit_hash` 及生成触发器，Portfolio 触发器强制 `source_order_hash` 等于该真实订单哈希；Portfolio 导入逻辑改为读取数据库权威哈希。
+- 验证：回测/Air-Gap 专项测试 19 项通过；`compileall` 通过；`sql/033_backtest_order_audit_hash.sql` 已在 Docker PostgreSQL 应用并完成事务回滚烟测，直接插入订单自动生成 64 位哈希；Raw 表未修改。
+- 后续门禁：全量测试、干净 Git commit、多日期 FROZEN Snapshot、正式 Dataset/Run 仍按 T-027/T-031 执行；本次修复不改变第一版“不自动下单”的边界。
+## T-033: Approved Baseline smoke execution and audit closure
+
+- Date: 2026-08-07
+- Status: completed (three-day smoke; full historical run pending)
+- Scope: approved fee rules -> FROZEN Dataset -> explicit Baseline Run -> ledger/order/hash audit.
+- Result: Dataset `4013823d-2cf9-48f8-aff5-b642f0989329` FROZEN; Run `9f278214-606d-40b1-9ce4-b8ee6ce2c1ad` SUCCEEDED; 91 orders, 6 fills, 85 rejects; actual shares and fills reconcile 900/900; rejected actual shares 0; Dataset/Run input hashes match.
+- Fixes: corrected Dataset Manifest rule-version loading, frozen rule parameter/hash loading, no-price WARNING classification for suspended/non-trading securities, and Run Manifest recording of effective frozen rules. Raw tables were not modified by Dataset/Run.
+- Boundary: this is not a five-year performance conclusion and does not create Portfolio/broker orders. Portfolio remains manual `PENDING_APPROVAL` -> `PAPER_MANUAL`.
+## T-034: Documentation synchronization to verified implementation
+
+- Date: 2026-08-07
+- Status: completed
+- Updated: `current_implementation_state_20260807.md`, `development_plan_3_phases.md`, `current_data_model.md`, `backtest_design.md`, and `project_completion_runbook.md`.
+- Synchronized: Raw append/checkpoint rules, Standard/PIT/Feature mapping, FROZEN Snapshot contract, Dataset materialization, effective market/fee rules, T+1 execution, actual share semantics, corporate actions, Run audit hashes, Baseline smoke result, and Portfolio manual Air-Gap.
+- Current boundary: three-day Baseline smoke passed; full historical Snapshot series and five-year Dataset/Run remain pending. No automatic trading.
+
+## T-035: 手动每日候选 / AI 审计 Skill
+
+- 状态：代码开发完成；生产使用仍保持手动。
+- 新增 `sql/034_daily_candidate_ai_audit.sql`，覆盖候选运行、候选哈希、
+  AI 审计 JSON、人工作决定、每日 Snapshot 绑定和 DAILY_SIGNAL Air-Gap。
+- 新增 `data_collect/decision/` 服务，以及 `skills/ashares-decision-audit/`
+  的候选生成、候选包、历史数据、AI 审计落库、人工作决定和待审批意图入口。
+- Skill 不启动定时任务、不连接券商、不自动批准、不自动成交。
+- 034 迁移在实际 PostgreSQL 上重复执行成功；正式候选、Portfolio 和每日
+  绑定数据仍为 0 行。

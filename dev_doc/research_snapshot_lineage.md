@@ -15,4 +15,4 @@
 
 `research_snapshot.validate` 除了检查 8 个字段组，还检查所有非 `:missing` 的血缘记录必须同时具有 `source_record_version` 和 `source_payload_hash`。快照构建仍使用 `REPEATABLE READ`，验证失败必须重新构建。
 
-测试口径：当前新增血缘回归测试后，`tests/test_research_snapshot.py` 单独 6 个测试；与 `tests/test_phase2_business_rules.py` 合并运行共 12 个测试。正式 FROZEN 快照应使用干净 Git commit，dirty 工作区只保留为补救审计信息。
+测试口径：当前新增血缘及冻结前质量/基线复核测试后，`tests/test_research_snapshot.py` 单独 7 个测试；与 `tests/test_phase2_business_rules.py` 合并运行共 13 个测试。正式 FROZEN 快照应使用干净 Git commit，dirty 工作区只保留为补救审计信息。

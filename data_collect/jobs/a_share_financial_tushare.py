@@ -8,12 +8,6 @@ from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.utils.db import get_connection, save_to_postgres
 
 
-INDICATOR_FIELDS = (
-    "ts_code,ann_date,end_date,roe,roa,debt_to_assets,grossprofit_margin,"
-    "netprofit_margin,ocf_to_or,eps,bps,or_yoy,tr_yoy,q_sales_yoy,netprofit_yoy"
-)
-
-
 def _date(v):
     return pd.to_datetime(v, format="%Y%m%d", errors="coerce").date() if v else None
 
@@ -52,7 +46,9 @@ def run(run_date: str, **kwargs) -> str:
         codes = [x.strip() for x in codes.split(",") if x.strip()]
     total = 0
     for code in codes[: int(kwargs.get("limit_stocks") or len(codes))]:
-        indicator = call_api(pro.fina_indicator, ts_code=code, fields=INDICATOR_FIELDS)
+        # Raw-first contract: preserve the complete interface payload.  Field
+        # projection belongs in Raw -> Standard, never in the paid API request.
+        indicator = call_api(pro.fina_indicator, ts_code=code)
         if indicator is None or indicator.empty:
             continue
         rows = indicator.to_dict("records")

@@ -1,0 +1,75 @@
+# Approved research/backtest-only assumptions with persisted approval evidence.
+metadata:
+  status: APPROVED
+  approved_by: user
+  approved_at: "2026-08-07T02:25:00+08:00"
+  scope: research_backtest_only
+  note: "Same user-approved baseline economics as v2; v3 adds database-bound approval evidence."
+  references:
+    stamp_duty: "https://m.mof.gov.cn/czxw/202308/t20230827_3904226.htm"
+    transfer_fee: "https://finance.sina.com.cn/money/bond/2022-04-28/doc-imcwipii6993883.shtml"
+
+rules:
+  - rule_version: cn-a-share-20210802-fee-v3
+    market_rule_version: cn-a-share-v2
+    fee_rule_version: research-fee-assumption-v3
+    effective_from: 2021-08-02
+    effective_to: 2022-04-28
+    market: ALL
+    min_buy_lot: 100
+    allow_sell_odd_lot: true
+    t_plus_one: true
+    price_tick: 0.01
+    cash_settlement_days: 0
+    limit_pct: null
+    commission_rate: 0.0003
+    min_commission: 5.0
+    stamp_duty_sell_rate: 0.001
+    transfer_fee_rate: 0.00002
+    slippage_bps: 10.0
+    parameters: &execution_parameters
+      provenance: "User-approved research assumption; historical policy boundaries recorded above."
+      limit_source: "Tushare stk_limit Raw numeric up_limit/down_limit bounded by the release source high-water mark and frozen into the Dataset"
+      commission_source: "research assumption; replace with broker schedule for live use"
+      slippage_source: "explicit 10 bps per side baseline"
+      gap_stress_pct: 0.05
+      max_volume_participation_pct: 0.05
+      liquidity_policy: reject_full_order
+
+  - rule_version: cn-a-share-20220429-fee-v3
+    market_rule_version: cn-a-share-v2
+    fee_rule_version: research-fee-assumption-v3
+    effective_from: 2022-04-29
+    effective_to: 2023-08-27
+    market: ALL
+    min_buy_lot: 100
+    allow_sell_odd_lot: true
+    t_plus_one: true
+    price_tick: 0.01
+    cash_settlement_days: 0
+    limit_pct: null
+    commission_rate: 0.0003
+    min_commission: 5.0
+    stamp_duty_sell_rate: 0.001
+    transfer_fee_rate: 0.00001
+    slippage_bps: 10.0
+    parameters: *execution_parameters
+
+  - rule_version: cn-a-share-20230828-fee-v3
+    market_rule_version: cn-a-share-v2
+    fee_rule_version: research-fee-assumption-v3
+    effective_from: 2023-08-28
+    effective_to: null
+    market: ALL
+    min_buy_lot: 100
+    allow_sell_odd_lot: true
+    t_plus_one: true
+    price_tick: 0.01
+    cash_settlement_days: 0
+    limit_pct: null
+    commission_rate: 0.0003
+    min_commission: 5.0
+    stamp_duty_sell_rate: 0.0005
+    transfer_fee_rate: 0.00001
+    slippage_bps: 10.0
+    parameters: *execution_parameters

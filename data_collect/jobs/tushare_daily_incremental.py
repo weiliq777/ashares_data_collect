@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import date, timedelta
@@ -33,6 +34,12 @@ if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 
 
+# Limit the Python/SQL/WAL peak when a Tushare response contains thousands of
+# rows.  The value is intentionally conservative; it can be lowered through
+# the environment when running on a memory-constrained Docker Desktop host.
+RAW_WRITE_PAGE_SIZE = max(50, int(os.getenv("TUSHARE_RAW_WRITE_PAGE_SIZE", "500")))
+
+
 def _clean(row):
     return {key: (None if pd.isna(value) else value) for key, value in row.items()}
 
@@ -41,39 +48,72 @@ def _json(row):
     return json.dumps(_clean(row), ensure_ascii=False, default=str, allow_nan=False)
 
 
-def _version_and_snapshot(dataset, frame, batch_id):
+def _version_and_snapshot(dataset, frame, batch_id, page_size=RAW_WRITE_PAGE_SIZE):
     """写入不可变版本，并将首次出现的业务键追加到现有 Raw 快照。"""
     if frame is None or frame.empty:
         return 0, 0
-    version_rows = []
-    snapshot_rows = []
-    for row in frame.to_dict("records"):
-        clean = _clean(row)
-        payload = _json(clean)
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        if dataset == "trade_cal":
-            business_key = f"{clean.get('exchange')}:{clean.get('cal_date')}"
-            ts_code = trade_date = None
-            exchange, cal_date = clean.get("exchange"), _date(clean.get("cal_date"))
-        else:
-            business_key = f"{clean.get('ts_code')}:{clean.get('trade_date')}"
-            ts_code, trade_date = clean.get("ts_code"), _date(clean.get("trade_date"))
-            exchange = cal_date = None
-        version_rows.append((dataset, business_key, ts_code, trade_date, exchange, cal_date, payload, "tushare", batch_id, digest))
-        snapshot_rows.append((clean, payload))
+    page_size = max(50, int(page_size))
+    columns = list(frame.columns)
+    table = {
+        "daily": "tushare_daily_raw",
+        "daily_basic": "tushare_daily_basic_raw",
+        "adj_factor": "tushare_adj_factor_raw",
+        "trade_cal": "tushare_trade_cal_raw",
+    }[dataset]
+    keys = ("exchange", "cal_date") if dataset == "trade_cal" else ("ts_code", "trade_date")
+    version_sql = """INSERT INTO tushare_market_raw_version
+        (dataset,business_key,ts_code,trade_date,exchange,cal_date,payload,source,batch_id,payload_hash)
+        VALUES %s
+        ON CONFLICT (dataset,business_key,payload_hash) DO NOTHING"""
+    snapshot_sql = (
+        f'INSERT INTO "{table}" ({", ".join(keys)},payload,source) VALUES %s '
+        "ON CONFLICT DO NOTHING"
+    )
+
+    attempted = 0
+    from data_collect.utils.db import require_psycopg2
+    execute_values = require_psycopg2()[1]
+
     with get_connection() as conn, conn.cursor() as cur:
-        for values in version_rows:
-            cur.execute("""INSERT INTO tushare_market_raw_version
-                (dataset,business_key,ts_code,trade_date,exchange,cal_date,payload,source,batch_id,payload_hash)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (dataset,business_key,payload_hash) DO NOTHING""", values)
-        table = {"daily": "tushare_daily_raw", "daily_basic": "tushare_daily_basic_raw", "adj_factor": "tushare_adj_factor_raw", "trade_cal": "tushare_trade_cal_raw"}[dataset]
-        keys = ("exchange", "cal_date") if dataset == "trade_cal" else ("ts_code", "trade_date")
-        for clean, payload in snapshot_rows:
-            values = tuple(_date(clean.get(key)) if key in ("trade_date", "cal_date") else clean.get(key) for key in keys)
-            cur.execute(f'INSERT INTO "{table}" ({", ".join(keys)},payload,source) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING', values + (payload, "tushare"))
-        conn.commit()
-    return len(version_rows), len(snapshot_rows)
+        version_rows = []
+        snapshot_rows = []
+
+        def flush():
+            nonlocal version_rows, snapshot_rows
+            if not version_rows:
+                return
+            execute_values(cur, version_sql, version_rows, page_size=len(version_rows))
+            execute_values(cur, snapshot_sql, snapshot_rows, page_size=len(snapshot_rows))
+            conn.commit()
+            logger.debug("raw batch committed dataset=%s rows=%s", dataset, len(version_rows))
+            version_rows = []
+            snapshot_rows = []
+
+        for raw_values in frame.itertuples(index=False, name=None):
+            clean = _clean(dict(zip(columns, raw_values)))
+            payload = _json(clean)
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if dataset == "trade_cal":
+                business_key = f"{clean.get('exchange')}:{clean.get('cal_date')}"
+                ts_code = trade_date = None
+                exchange, cal_date = clean.get("exchange"), _date(clean.get("cal_date"))
+            else:
+                business_key = f"{clean.get('ts_code')}:{clean.get('trade_date')}"
+                ts_code, trade_date = clean.get("ts_code"), _date(clean.get("trade_date"))
+                exchange = cal_date = None
+            version_rows.append((dataset, business_key, ts_code, trade_date, exchange, cal_date, payload, "tushare", batch_id, digest))
+            snapshot_values = tuple(
+                _date(clean.get(key)) if key in ("trade_date", "cal_date") else clean.get(key)
+                for key in keys
+            )
+            snapshot_rows.append(snapshot_values + (payload, "tushare"))
+            attempted += 1
+            if len(version_rows) >= page_size:
+                flush()
+        flush()
+
+    logger.info("raw write complete dataset=%s rows=%s page_size=%s", dataset, attempted, page_size)
+    return attempted, attempted
 
 
 def _date(value):

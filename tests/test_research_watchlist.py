@@ -4,7 +4,7 @@ from data_collect.jobs.research_watchlist import RULE_VERSION, _candidate_sql
 
 
 def test_watchlist_rule_version_is_explicit():
-    assert RULE_VERSION == "watchlist-v1"
+    assert RULE_VERSION == "watchlist-v2"
 
 
 def test_watchlist_query_is_snapshot_scoped_and_explainable():
@@ -12,7 +12,11 @@ def test_watchlist_query_is_snapshot_scoped_and_explainable():
     assert "s.snapshot_id=%s" in sql
     assert "s.can_buy IS TRUE" in sql
     assert "value_quality" in sql
-    assert "growth_trend" in sql
+    assert "growth_quality" in sql
+    assert "roe_5y_all_above_15 IS TRUE" in sql
+    assert "ocf_3y_all_positive IS TRUE" in sql
+    assert "q_sales_yoy_4q_all_above_30 IS TRUE" in sql
+    assert "s.list_date <= s.research_date - INTERVAL '2 years'" in sql
     assert "jsonb_build_object" in sql
     assert "ROW_NUMBER()" in sql
 

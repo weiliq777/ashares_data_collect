@@ -52,7 +52,7 @@ def _version_values(record: dict, batch_id: str, fetched_at=None):
     f_ann_date = _date(record.get("f_ann_date"))
     business_key = ":".join(
         str(record.get(key) or "")
-        for key in ("ts_code", "ann_date", "end_date", "report_type", "comp_type", "update_flag")
+        for key in ("ts_code", "end_date", "report_type", "comp_type", "end_type")
     )
     return (
         business_key, ts_code, ann_date, f_ann_date, end_date,
@@ -142,12 +142,41 @@ def rebuild_standard() -> int:
         cur.execute(f"""
             INSERT INTO fina_indicator_standard
             (ts_code, report_date, ann_date, f_ann_date, effective_announce_date,
-             report_type, comp_type, end_type, update_flag, roe, roa, debt_to_assets,
+              version_available_date,
+              vintage_quality, source_observed_at,
+              report_type, comp_type, end_type, update_flag, roe, roa, debt_to_assets,
              grossprofit_margin, netprofit_margin, ocf_to_or, eps, bps, or_yoy,
              tr_yoy, q_sales_yoy, netprofit_yoy, source, source_record_key,
              record_version, payload_hash, quality_status, fetched_at)
+            WITH base AS (
+                SELECT r.*,
+                       concat_ws(':', ts_code, end_date::text,
+                                 COALESCE(report_type,''), COALESCE(comp_type,''),
+                                 COALESCE(end_type,'')) AS logical_business_key,
+                       COALESCE(f_ann_date, ann_date) AS effective_date
+                  FROM fina_indicator_raw_version r
+            ), deduplicated AS (
+                SELECT DISTINCT ON (logical_business_key, payload_hash) *
+                  FROM base
+                 ORDER BY logical_business_key, payload_hash, fetched_at, record_id
+            ), versioned AS (
+                SELECT d.*,
+                       COUNT(*) OVER (
+                           PARTITION BY logical_business_key, effective_date
+                       ) > 1 AS ambiguous_same_day_revision
+                  FROM deduplicated d
+            )
             SELECT ts_code, end_date, ann_date, f_ann_date,
-                   COALESCE(f_ann_date, ann_date), report_type, comp_type, end_type,
+                   COALESCE(f_ann_date, ann_date),
+                   CASE WHEN ambiguous_same_day_revision
+                        THEN GREATEST(COALESCE(f_ann_date, ann_date), fetched_at::date) + 1
+                        ELSE COALESCE(f_ann_date, ann_date, fetched_at::date) + 1
+                   END,
+                   CASE WHEN ambiguous_same_day_revision
+                        THEN 'WAREHOUSE_OBSERVED_ONLY'
+                        ELSE 'SOURCE_ANNOUNCEMENT_ASSUMED' END,
+                   fetched_at,
+                   report_type, comp_type, end_type,
                    update_flag, {numeric['roe']}, {numeric['roa']}, {numeric['debt_to_assets']},
                    {numeric['grossprofit_margin']}, {numeric['netprofit_margin']},
                    {numeric['ocf_to_or']}, {numeric['eps']}, {numeric['bps']},
@@ -155,9 +184,9 @@ def rebuild_standard() -> int:
                    {numeric['netprofit_yoy']}, source, business_key, record_id,
                    payload_hash,
                    CASE WHEN end_date IS NULL OR COALESCE(f_ann_date, ann_date) IS NULL
-                        THEN 'MISSING_SOURCE' ELSE 'VALID' END,
+                         THEN 'MISSING_SOURCE' ELSE 'VALID' END,
                    fetched_at
-            FROM fina_indicator_raw_version
+            FROM versioned
         """)
         inserted = cur.rowcount
         conn.commit()

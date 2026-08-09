@@ -13,28 +13,30 @@ description: |
 
 | 项 | 值 |
 |---|---|
-| 端点 | `https://192.168.9.12:9200`（自签证书，客户端需关闭证书校验） |
-| 只读账号 | `news_reader` / 密码见部署方（建置见 `docs/deploy/news-reader-account.md`） |
+| 端点 | `http://127.0.0.1:9200`（当前项目由 Docker Compose 暴露） |
+| 认证 | 当前本地 Compose 未启用认证；连接参数以项目根目录 `config.yaml` 的 `opensearch` 段为准 |
 | 读入口 | 统一用别名 **`news`**（物理索引按年 `news-2026`、`news-2027`…，别名聚合全部） |
-| 查询向量服务 | Ollama `http://192.168.9.12:11434`（内网免鉴权），模型 `bge-m3`，1024 维 |
+| 查询向量服务 | 当前 `config.yaml` 默认关闭向量检索；若启用 `ollama`，地址必须读取 `news.embedding.ollama_url`，不要硬编码 |
 
 Python 连接示例：
 
 ```python
 from opensearchpy import OpenSearch
 client = OpenSearch(
-    hosts=[{"host": "192.168.9.12", "port": 9200}],
-    http_auth=("news_reader", ",
-    use_ssl=True, verify_certs=False, ssl_show_warn=False,
+    hosts=[{"host": "127.0.0.1", "port": 9200}],
+    use_ssl=False, verify_certs=False, ssl_show_warn=False,
 )
 ```
 
-若在 data_collect 仓库环境内，直接用现成封装（读 config.yaml 凭据）：
+在 data_collect 仓库环境内，优先使用现成封装（自动读取 `config.yaml`）：
 ```python
 from data_collect.utils.news_search import search_news
-search_news("锂电池 产能扩张", top_k=10, channel="stock", mode="hybrid")
+search_news("锂电池 产能扩张", top_k=10, channel="stock", mode="bm25")
 # → {"total": N, "hits": [{title, source, channel, pub_time, url, score, highlight}, ...]}
 ```
+
+当前项目的 Docker Compose 只提供 OpenSearch，不提供 Ollama；`embedding.enabled=false` 时，
+`hybrid`/`knn` 会由封装自动降级为 BM25。只有在配置并验证向量服务后，才使用向量检索。
 
 ## 2. 数据模型（一篇新闻 = 一个文档）
 
@@ -78,7 +80,12 @@ POST news/_search
 先把查询文本编成向量（Ollama），再 kNN：
 ```python
 import requests
-vec = requests.post("http://192.168.9.12:11434/api/embed",
+from data_collect.config import get_news_config
+embedding_cfg = get_news_config().get("embedding") or {}
+ollama_url = embedding_cfg.get("ollama_url")
+if not ollama_url:
+    raise RuntimeError("未配置 news.embedding.ollama_url")
+vec = requests.post(f"{ollama_url.rstrip('/')}/api/embed",
                     json={"model": "bge-m3", "input": ["白酒企业业绩与消费回暖"]},
                     timeout=120).json()["embeddings"][0]
 

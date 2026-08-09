@@ -24,10 +24,6 @@ if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 
 REPORT_APIS = ("income", "balancesheet", "cashflow")
-INDICATOR_FIELDS = (
-    "ts_code,ann_date,end_date,roe,roa,debt_to_assets,grossprofit_margin,"
-    "netprofit_margin,ocf_to_or,eps,bps,or_yoy,tr_yoy,q_sales_yoy,netprofit_yoy"
-)
 
 
 def _checkpoint(dataset: str, key: str, status: str, rows: int = 0, error: str | None = None):
@@ -91,10 +87,12 @@ def _rebuild_financial_derived():
 def run(end_date: str | None = None, lookback_days: int = 30,
         report_lookback_years: int = 3, limit_stocks: int | None = None,
         batch_pause: float = 1.0, dataset: str = "all", rebuild_derived: bool = True,
-        dry_run: bool = False) -> str:
+        dry_run: bool = False, run_date: str | None = None) -> str:
     if dataset not in {"all", *REPORT_APIS, "fina_indicator"}:
         raise ValueError(f"不支持的数据集: {dataset}")
-    end = end_date or date.today().strftime("%Y%m%d")
+    if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
+        raise ValueError("end_date 与 run_date 不一致")
+    end = (end_date or run_date or date.today().strftime("%Y%m%d")).replace("-", "")
     end_dt = pd.to_datetime(end, format="%Y%m%d").date()
     announcement_start = (end_dt - timedelta(days=max(lookback_days - 1, 0))).strftime("%Y%m%d")
     report_start = date(end_dt.year - max(report_lookback_years - 1, 0), 1, 1).strftime("%Y%m%d")
@@ -115,8 +113,6 @@ def run(end_date: str | None = None, lookback_days: int = 30,
                     continue
                 try:
                     kwargs = {"ts_code": code, "start_date": window_start, "end_date": window_end}
-                    if api_name == "fina_indicator":
-                        kwargs["fields"] = INDICATOR_FIELDS
                     frame = call_api(api, **kwargs)
                     rows = 0 if frame is None else len(frame)
                     if rows >= 100 and api_name == "fina_indicator":
@@ -124,7 +120,10 @@ def run(end_date: str | None = None, lookback_days: int = 30,
                     if dry_run:
                         logger.info("dry-run api=%s code=%s window=%s:%s rows=%s", api_name, code, window_start, window_end, rows)
                     elif rows == 0:
-                        _checkpoint(checkpoint_dataset, key, "empty", 0, "接口返回空数据")
+                        # An empty successful response is a completed fact for
+                        # this exact stock/window.  Marking it non-terminal would
+                        # spend Tushare quota again after every interruption.
+                        _checkpoint(checkpoint_dataset, key, "done", 0, "接口成功返回空数据")
                     else:
                         table = "tushare_fina_indicator_raw" if api_name == "fina_indicator" else f"tushare_{api_name}_raw"
                         inserted = _save_raw(table, frame, batch_id=batch_id)

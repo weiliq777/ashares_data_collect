@@ -1,5 +1,23 @@
 # Finance_cn Agent Notes
 
+## 2026-08-08 production data audit follow-up
+
+The code audit is green (`693 passed, 1 skipped, 5 deselected`; `compileall` and `git diff --check` pass). The active code contract is `research-v1.2` → `backtest-dataset-v2` → `research-to-backtest-v2` → `daily-next-open-v2`.
+
+The production database still contains legacy smoke/partial data, not a current five-year production baseline: `research-v1.2` has no frozen snapshot; `research-v1.1` has 690 FROZEN snapshots plus one DRAFT, with 522 SSE open dates missing in `2021-08-02`–`2026-08-03`; 689 of those FROZEN rows are dirty and all 690 lack `baseline_quality_report_hash`. Existing `dataset-v1`/`dataset-v1.1` and `daily-next-open-v1` runs remain immutable historical records and are not valid inputs for the current v2 path. The approved v3 market/fee rules are present.
+
+The long Raw initializer for `2016-08-01`–`2021-08-01` is still running in the background; its last observed checkpoint is `adj_factor=930 done, 0 failed` at `2026-08-08 03:15:16`. Do not interrupt it without an explicit decision. Raw data was not modified by this audit.
+
+The current `baseline_20260803` release is `validated` but its persisted `source_manifest_hash/source_manifest` is empty. The current Snapshot code intentionally rejects this baseline before creating a v1.2 snapshot; do not start a Snapshot series against it. After the active Raw/derived data work is complete, publish a new validated baseline with a complete source manifest, then resume the v1.2 series.
+
+## 2026-08-08 current audit status
+
+Stage 3 code audit repairs are complete. Formal Backtest uses frozen Dataset inputs; reserve cash is an equity floor, settled cash is required for new candidates, Snapshot build locks its quality/input boundary, and migration `sql/041_backtest_open_time_contract.sql` is applied. Full test result: `693 passed, 1 skipped, 5 deselected`. The long checkpointed historical Raw initializer is still running; do not stop it. Full five-year Snapshot series/Dataset/Run production generation remains a separate pending operation. Portfolio stays manual `PENDING_APPROVAL -> PAPER_MANUAL`; no broker or automatic order path.
+
+## 阶段三生产增强版（2026-08-06）
+
+风险压力模型、Tushare 执行单位归一化、成交量参与率整笔拒单、Monte Carlo 双方法及 Backtest→Portfolio 人工隔离已完成。对应迁移为 `sql/032_backtest_portfolio_airgap.sql`，Raw 表继续只读；`import_backtest_order()` 只能写入 `BACKTEST/PENDING_APPROVAL`，不得自动批准、成交或访问券商。正式回测仍需 clean Git、Snapshot series、Dataset freeze 和正式 Run 门禁。
+
 ## 阶段二质量审计修复（2026-08-04）
 
 最终审计发现 216 只股票的历史日线有数据但复权因子不完整；已用真实接口确认可补回，新增 `tushare_adj_factor_gap_repair.py` 按股票 checkpoint 追加 Raw。缺口已全部修复，`adj_factor_daily` 和价格 Feature 已重建，最终质量报告通过，`baseline_20260731` 已标记为 `validated`。
@@ -39,6 +57,8 @@ Tushare 原始接口 -> raw 原始表 -> 标准化表 -> 策略/分析层
 - `data_collect/jobs/tushare_financial_incremental.py`：财务日常增量；报表按公告窗口，`fina_indicator` 按股票和季度报告期窗口
 - `data_collect/jobs/tushare_derived_rebuild.py`：行情/阶段二/财务增量后的派生依赖重建编排
 - `data_collect/jobs/research_snapshot.py`：Research 快照 Manifest、输入切片哈希、血缘、校验和冻结
+- `data_collect/jobs/phase3_validation.py`：阶段三 PIT 截面只读校验入口
+- `data_collect/ops/market_coverage.py`：按日市场覆盖率门禁与熔断记录（只读 Raw 计数、追加 ops 事实）
 - `data_collect/jobs/tushare_release.py`：历史基线发布点的创建、验收和查询
 - `data_collect/jobs/tushare_adj_factor_gap_repair.py`：历史复权因子缺口的按股票断点修复
 - `data_collect/jobs/tushare_raw_to_standard.py`：Raw 离线重建 Standard
@@ -53,6 +73,17 @@ Tushare 原始接口 -> raw 原始表 -> 标准化表 -> 策略/分析层
 - `sql/026_create_research_watchlist.sql`：Research 观察池、观察池成员和证据引用表
 - `data_collect/jobs/research_watchlist.py`：只读快照生成观察池和写入证据引用元数据
 - `data_collect/jobs/research_evidence_candidates.py`：只读检索 OpenSearch 外部证据候选，不自动入库
+- `sql/028_create_backtest_model.sql`：Backtest Dataset/Run、执行输入、规则快照和事件账本模型
+- `data_collect/backtest/`：不访问数据库的纯 Python 日线撮合、风险、费用和输入模型
+- `data_collect/jobs/backtest_dataset.py`：Dataset 创建、Frozen Materializer、质量校验、冻结和加载
+- `data_collect/jobs/backtest_rules.py`：市场/费用规则 JSON 校验与只追加导入
+- `data_collect/jobs/backtest_run.py`：FROZEN Dataset 回测运行、事件账本和绩效结果持久化
+- `dev_doc/backtest_design.md`：阶段三回测契约、默认边界和当前验收门禁
+- `sql/029_create_portfolio_model.sql`：人工确认模拟组合、成交、持仓、现金和估值模型
+- `sql/030_create_phase3_ops_gate.sql`：阶段三按日市场覆盖率门禁和追加式数据库约束
+- `data_collect/portfolio/`：不访问数据库/券商的 Portfolio 纯 Python 模型
+- `data_collect/jobs/portfolio_simulation.py`：Portfolio 创建、人工意图、模拟成交和估值入库
+- `dev_doc/portfolio_design.md`：Portfolio 边界、审批、资金和审计契约
 - `sql/027_research_audit_immutability.sql`：ACTIVE 追加式、ARCHIVED 全不可变的观察池审计约束
 - `data_collect/normalize/`：接口数据到标准模型的转换
 - `data_collect/utils/db.py`：PostgreSQL 写入、幂等和表结构对齐
@@ -130,6 +161,14 @@ Windows 后台启动 Tushare 任务时，必须显式保证子进程继承 `TUSH
 
 历史基线规则：历史 Raw/Standard 验收后在 `tushare_data_release` 建立发布标签；只有 `status='validated'` 的基线可被增量任务默认读取。阶段二日常任务使用 `tushare_phase2_incremental`，不再启动历史 `tushare_phase2_raw_init` 编排；`dividend` 使用公告日期/实施公告日期窗口，`namechange` 使用低频日期窗口。
 
-阶段三快照规则：`research_snapshot` 生成器可读取已通过质量门禁的 PIT/Feature；Research 和 Backtest 只能读取 `FROZEN` 快照。一个 `snapshot_id` 只对应一个截止日；生成使用 REPEATABLE READ 和输入切片哈希；FROZEN 后由数据库触发器禁止更新/删除。非缺失血缘必须有来源版本和 SHA-256，`:missing` 只表示上游确实没有记录。正式快照前不得进入正式回测或自动交易。
+阶段三快照规则：`research_snapshot` 生成器可读取已通过质量门禁的 PIT/Feature；Research 和 Backtest 只能读取 `FROZEN` 快照。一个 `snapshot_id` 只对应一个截止日；生成使用 REPEATABLE READ 和输入切片哈希；FROZEN 后由数据库触发器禁止更新/删除。`research-v1.1` 额外保存并哈希 PIT 的 `eligible_by_market`；旧版本 FROZEN 快照只读保留，正式 Backtest Dataset 不得静默升级或使用。新增版本血缘必须有来源版本和 SHA-256；历史 `tushare_daily_raw` 行可能尚无 `tushare_market_raw_version`，此时允许 `source_record_version=NULL`，但必须以选中 Raw payload 计算确定性 SHA-256，并在 Dataset 中标明这是 legacy 限制，不得伪造版本或回退到无哈希数据。正式冻结只接受干净 Git 或存在的代码归档，`diff_hash` 不能替代可复现代码。快照系列按 `(截止日, 基线, Schema)` 幂等续跑，不重复创建或重写 FROZEN 快照。正式快照前不得进入正式回测或自动交易。
 
 Research 审计规则：`ACTIVE` 观察池只能归档；ACTIVE 成员和证据只能追加；ARCHIVED 观察池、成员和证据全部不可变；证据必须属于快照股票，绑定观察池时必须属于该观察池成员；修正必须新建 `watchlist_id`。
+
+阶段三运行门禁补充：`sql/030_create_phase3_ops_gate.sql` 的 `ops.market_data_quality_gate` 只追加门禁记录；按日全市场增量以历史 Raw 前五交易日的中位股票数检查覆盖率，下降超过 1%、无基线或抽样都不可发布，失败在 Raw 版本写入前中止。PASS 只表示接口覆盖率，Raw/Standard/checkpoint 或全局派生重建失败时必须追加最新 `BLOCKED`，防止旧 PASS 让 Research freeze 放行。Research 冻结会检查该截止日最近门禁。`data_collect/jobs/phase3_validation.py` 是只读 PIT 截面校验入口；物化遇到涨跌停空值/100000 哨兵会保留价格但关闭买卖并标记 WARNING；Dataset 创建还要求 warmup 到 evaluation_end 的每个 SSE 开市日都有 FROZEN Research Snapshot；规则同主键内容冲突会拒绝静默跳过，审核元数据未 APPROVED 时禁止 `--confirm`，Dataset build/freeze 代码身份必须一致；Dataset 执行行情按构建事务内 `fetched_at DESC, record_id DESC` 选取 Raw 版本并冻结 source version/hash，缺少日线、状态或可交易性来源的行标记 `MISSING_SOURCE` 并阻断正式验证；历史无 Raw version 的行允许版本号为空但必须有确定性 payload hash；市场温度倍率目前仅为显式适配器，未加入未版本化的默认回测输入。Dataset build/validate/freeze 会重新检查基线仍为 validated，失败会持久化为 FAILED；Run 子表仅在 RUNNING 状态可写，Portfolio 数据库还校验审批人、费用、现金账本余额和持仓数量单调性，现金账本会锁定组合账户并以唯一部分索引保证单一 `INIT`；规则有效区间另由 PostgreSQL `EXCLUDE USING gist` 防止同一作用域并发重叠。最新定向测试为 59 项通过，全量测试结果以实际运行记录为准，另有 2 个既有通知前缀失败。
+规则输入补充：市场/费用规则只能通过 `data_collect/jobs/backtest_rules.py` 导入；JSON 必须带 `parameters.provenance`、有效日期和版本，默认只校验，`--confirm` 才追加入库。`backtest.market_rule_effective` 与 Dataset 规则快照均由数据库约束禁止 UPDATE/DELETE，修订必须新增规则版本。
+
+阶段三冻结补充：`VALIDATED→FROZEN` 只允许状态、冻结时间和代码血缘字段变化；规则导入除文件内有效区间检查外，还必须检查数据库已有的同市场/同市场规则版本/费用规则版本区间，禁止跨文件形成重叠规则。该门禁已在 PostgreSQL 回滚烟测中验证，测试数据未持久化。
+
+阶段三 Backtest 规则：正式回测必须基于多日期 `FROZEN` Research Snapshot 和不可变 Dataset/Run Manifest；不能直接读取实时 PIT/Feature，也不能在生产模式自动回退合成数据。一个 snapshot 只对应一个截止日；`research_snapshot_series.py` 只负责按显式日期或标准交易日历编排多个单日快照，且截止日必须为开市日。执行行情使用原始 OHLC/成交量/涨跌停价，复权价格只用于指标；Dataset 构建时按 `tushare_market_raw_version.fetched_at DESC, record_id DESC` 选择每个日线业务键的最新 Raw 版本，并把 source version/hash 物化冻结；必须区分 warm-up 与 evaluation 区间、信号/订单/成交时间，并版本化交易日历、市场规则、费用、滑点、策略参数、适配器和代码。第一版默认 T 日收盘出信号、T+1 日开盘尝试成交、只做多、不模拟部分成交、暂不模拟配股；使用信号时确定的固定止损，不宣称已实现 ATR/Trailing Stop；缺规则必须 fail-closed。Dataset 成员必须同时保存执行行情和公司行为切片哈希，`validate` 必须重新对账最终物化子表的全局及按日哈希，并独立检查 warm-up 到 evaluation_end 的每个开市日覆盖；市场规则必须按 `market_rule_version`、`fee_rule_version` 和有效日期筛选，公司行为按业务键选择有效版本；送转只分配给除权日前持仓并落为 `CORPORATE_ACTION` 批次，卖出结算日超出 Dataset 时拒绝成交，不提前释放未结算资金。结果按 signal→order→fill/reject/expire→cash/position→daily performance 事件链保存。Portfolio 当前仅允许人工批准的 `PAPER_MANUAL` 模拟成交，组合 Manifest 必须保存 T+1、现金结算、费用和最小价位规则，不连接券商；数据库还要独立拒绝不符合成交股数、现金、价位、止损、已有持仓、SSE 开市日和快照截止日的成交，现金账本和持仓日期也必须命中冻结交易日历。Portfolio 每日估值必须绑定同一 FROZEN Snapshot 和 `valuation_input_hash`；相同输入只能幂等重放，不同输入、更新和删除均拒绝，且不得在更晚成交后回补过去估值。开发任务和详细契约见 `dev_doc/agent_tasks.md` 的 T-018/T-019/T-020/T-021/T-022/T-023/T-024/T-025/T-026/T-027 与 `dev_doc/backtest_design.md`、`dev_doc/portfolio_design.md`。
+当前阶段状态（2026-08-07）：阶段三核心代码开发已完成，正式历史回测可以进入生产准备；当前数据库尚无正式 Dataset/Run/Portfolio/规则记录，后续执行生产门禁即可。生产顺序为规则审批入库、clean Git commit、多日期 FROZEN Snapshot、Dataset build/validate/freeze、正式 Run 和结果审计。自动实盘交易仍禁止，Backtest→Portfolio 必须人工审批并使用 PAPER_MANUAL。

@@ -16,20 +16,24 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from data_collect.backtest.validation import verify_pit_cutoff_consistency
+from data_collect.ops.market_coverage import assert_market_coverage_publishable
 from data_collect.utils.db import get_connection, require_psycopg2
 
 
-SCHEMA_VERSION = "research-v1"
+SCHEMA_VERSION = "research-v1.3"
+LEGACY_V12_SCHEMA_VERSION = "research-v1.2"
 REQUIRED_LINEAGE_GROUPS = (
     "universe", "tradeability", "price", "valuation", "financial",
-    "shareholder_return", "lifecycle", "instrument",
+    "shareholder_return", "lifecycle", "instrument", "market_facts",
+    "fundamental_history",
 )
 
 # 这些表名和字段均为代码内固定定义，不接受命令行直接拼接，避免把哈希范围变成隐式变化。
 INPUTS = (
     {
         "schema": "pit", "table": "universe_daily",
-        "columns": ("trade_date", "ts_code", "is_listed_asof", "is_st_asof", "is_suspended_asof", "has_price_history", "quality_status", "source_asof_date"),
+        "columns": ("trade_date", "ts_code", "is_listed_asof", "is_st_asof", "is_suspended_asof", "has_price_history", "eligible_by_market", "quality_status", "source_asof_date"),
         "predicate": "trade_date = :research_cutoff_date",
         "where": "trade_date = %s", "params": lambda cutoff: (cutoff,),
         "order": "trade_date, ts_code", "date_column": "trade_date",
@@ -42,25 +46,39 @@ INPUTS = (
         "order": "trade_date, ts_code", "date_column": "trade_date",
     },
     {
-        "schema": "feature", "table": "price_daily_v1",
-        "columns": ("ts_code", "trade_date", "raw_close", "adj_close_base", "return_1d", "return_20d", "return_60d", "ma20", "ma60", "ma120", "volume_ratio_20d", "quality_status", "source_asof_date"),
+        "schema": "feature", "table": "price_daily_v2",
+        "columns": ("ts_code", "trade_date", "raw_close", "asof_close", "asof_adjustment_factor", "return_1d", "return_20d", "return_60d", "ma20", "ma60", "ma120", "volume_ratio_20d", "available_observation_count", "ma20_observation_count", "ma60_observation_count", "ma120_observation_count", "feature_set_version", "adjustment_mode", "quality_status", "source_asof_date"),
         "predicate": "trade_date = :research_cutoff_date",
         "where": "trade_date = %s", "params": lambda cutoff: (cutoff,),
         "order": "trade_date, ts_code", "date_column": "trade_date",
     },
     {
         "schema": "feature", "table": "valuation_daily_v1",
-        "columns": ("ts_code", "trade_date", "pe_ttm", "pb", "ps_ttm", "dv_ratio", "total_mv", "circ_mv", "pe_pct_3y", "pe_pct_5y", "pb_pct_3y", "pb_pct_5y", "is_pe_meaningful", "quality_status", "source_asof_date"),
+        "columns": ("ts_code", "trade_date", "pe_ttm", "pb", "ps_ttm", "dv_ratio", "total_mv", "circ_mv", "pe_pct_3y", "pe_pct_5y", "pb_pct_3y", "pb_pct_5y", "is_pe_meaningful", "valuation_observation_count", "pe_window_start_date_5y", "pe_observation_count_5y", "has_full_pe_5y_history", "quality_status", "source_asof_date"),
         "predicate": "trade_date = :research_cutoff_date",
         "where": "trade_date = %s", "params": lambda cutoff: (cutoff,),
         "order": "trade_date, ts_code", "date_column": "trade_date",
     },
     {
         "schema": "pit", "table": "financial_asof",
-        "columns": ("decision_date", "ts_code", "report_date", "effective_announce_date", "record_version", "source_record_key", "roe", "roa", "debt_to_assets", "revenue_yoy", "tr_yoy", "q_sales_yoy", "netprofit_yoy", "quality_status", "payload_hash"),
+        "columns": ("decision_date", "ts_code", "report_date", "effective_announce_date", "version_available_date", "vintage_quality", "source_observed_at", "record_version", "source_record_key", "roe", "roa", "debt_to_assets", "revenue_yoy", "tr_yoy", "q_sales_yoy", "netprofit_yoy", "quality_status", "payload_hash"),
         "predicate": "decision_date = :research_cutoff_date",
         "where": "decision_date = %s", "params": lambda cutoff: (cutoff,),
         "order": "decision_date, ts_code", "date_column": "decision_date",
+    },
+    {
+        "schema": "public", "table": "daily_kline",
+        "columns": ("stock_code", "trade_date", "open", "high", "low", "close", "volume", "amount"),
+        "predicate": "trade_date = :research_cutoff_date",
+        "where": "trade_date = %s", "params": lambda cutoff: (cutoff,),
+        "order": "trade_date, stock_code", "date_column": "trade_date",
+    },
+    {
+        "schema": "std", "table": "security_status_daily",
+        "columns": ("trade_date", "ts_code", "up_limit", "down_limit", "close_price", "limit_status", "quality_status"),
+        "predicate": "trade_date = :research_cutoff_date",
+        "where": "trade_date = %s", "params": lambda cutoff: (cutoff,),
+        "order": "trade_date, ts_code", "date_column": "trade_date",
     },
     {
         "schema": "feature", "table": "shareholder_return_v1",
@@ -70,11 +88,14 @@ INPUTS = (
         "order": "asof_date, ts_code", "date_column": "asof_date",
     },
     {
-        "schema": "public", "table": "stock_basic_info",
-        "columns": ("stock_code", "symbol", "name", "market", "list_status", "list_date", "delist_date", "source"),
-        "predicate": "list_date <= :research_cutoff_date AND (delist_date IS NULL OR delist_date >= :research_cutoff_date)",
-        "where": "list_date <= %s AND (delist_date IS NULL OR delist_date >= %s)", "params": lambda cutoff: (cutoff, cutoff),
-        "order": "stock_code", "date_column": "list_date",
+        "schema": "public", "table": "tushare_stock_basic_raw_version",
+        "columns": ("record_id", "ts_code", "business_key", "payload", "payload_hash", "fetched_at"),
+        "predicate": "record_id <= :baseline_stock_basic_max_record_id",
+        "where": "record_id <= %s",
+        "params_from_manifest": lambda cutoff, manifest: (
+            manifest["append_only_sources"]["tushare_stock_basic_raw_version"]["max_record_id"],
+        ),
+        "order": "record_id", "date_column": None,
     },
     {
         "schema": "std", "table": "security_lifecycle",
@@ -111,11 +132,18 @@ def _row_bytes(row) -> bytes:
                        sort_keys=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n")
 
 
-def _input_stats(conn, definition: dict, cutoff: date) -> dict:
+def _input_stats(conn, definition: dict, cutoff: date, source_manifest: dict | None = None) -> dict:
     columns = definition["columns"]
     qualified = _qualified(definition["schema"], definition["table"])
     where = definition["where"]
-    params = definition["params"](cutoff)
+    if "params_from_manifest" in definition:
+        if not source_manifest:
+            raise RuntimeError(
+                f"{definition['schema']}.{definition['table']} 缺少基线来源 Manifest"
+            )
+        params = definition["params_from_manifest"](cutoff, source_manifest)
+    else:
+        params = definition["params"](cutoff)
     date_column = definition["date_column"]
     with conn.cursor() as cur:
         if date_column:
@@ -154,46 +182,211 @@ def _manifest_hash(stats: list[dict]) -> str:
 
 def _git_metadata() -> dict:
     root = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=root, text=True,
+        )
+        dirty = bool(status.strip())
+        diff_hash = None
+        if dirty:
+            digest = hashlib.sha256()
+            digest.update(subprocess.check_output(
+                ["git", "diff", "--binary", "HEAD"], cwd=root
+            ))
+            untracked = subprocess.check_output(
+                ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                cwd=root,
+            )
+            for raw_path in untracked.split(b"\0"):
+                if not raw_path:
+                    continue
+                path = root / raw_path.decode("utf-8", "surrogateescape")
+                digest.update(raw_path)
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+            diff_hash = digest.hexdigest()
+        return {
+            "commit": commit,
+            "dirty": dirty,
+            "diff_hash": diff_hash,
+            "code_version": commit + ("+dirty" if dirty else ""),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {
+            "commit": None, "dirty": True,
+            "diff_hash": "unavailable", "code_version": "unknown+dirty",
+        }
 
-    def run(*args) -> str:
-        try:
-            return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.DEVNULL).decode("utf-8", "replace").strip()
-        except (OSError, subprocess.CalledProcessError):
-            return ""
 
-    commit = run("rev-parse", "HEAD")
-    status = run("status", "--porcelain", "--untracked-files=all")
-    tracked_diff = run("diff", "--binary", "HEAD")
-    diff_hash = hashlib.sha256((status + "\n" + tracked_diff).encode("utf-8")).hexdigest() if status or tracked_diff else None
-    dirty = bool(status)
-    code_version = f"{commit}+dirty" if dirty and commit else (commit or "unknown")
-    return {"commit": commit or None, "dirty": dirty, "diff_hash": diff_hash, "code_version": code_version}
+def _sha256_file(path: str | Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size
 
 
-def _quality_report() -> tuple[dict, str]:
+def _quality_report(cutoff: date | None = None) -> tuple[dict, str]:
     from data_collect.jobs.tushare_release import _quality_gate
 
-    report = _quality_gate()
-    encoded = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    report = _quality_gate(cutoff)
+    encoded = json.dumps(
+        _canonical(report), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    )
     return report, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _baseline(cutoff: date, tag: str):
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("""SELECT release_tag, baseline_cutoff_date, status
+def _assert_adj_factor_vintage(conn, cutoff: date) -> None:
+    """Reject adjusted factors first observed after the research cutoff.
+
+    Price features use ``adj_factor_daily``.  Because the current model does
+    not store an external announcement timestamp for each factor, the safe
+    rule is to require warehouse observation no later than the cutoff for the
+    technical warm-up window.  Missing or late factors fail closed instead of
+    silently using a later final value.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+              FROM daily_kline d
+              LEFT JOIN adj_factor_daily a
+                ON a.stock_code = d.stock_code
+               AND a.trade_date = d.trade_date
+               AND a.source = 'tushare'
+             WHERE d.trade_date BETWEEN (%s - INTERVAL '365 days')::date AND %s
+               AND (a.adj_factor IS NULL OR a.fetched_at::date > %s)
+            """,
+            (cutoff, cutoff, cutoff),
+        )
+        invalid_rows = int(cur.fetchone()[0] or 0)
+    if invalid_rows:
+        raise RuntimeError(
+            "adj_factor vintage unavailable/future-observed for technical window: "
+            f"cutoff={cutoff}, invalid_rows={invalid_rows}; "
+            "pre-cutoff adjusted-factor vintages are required before building a formal snapshot"
+        )
+
+
+def _assert_price_vintage_for_schema(conn, cutoff: date, schema_version: str) -> None:
+    """Apply the correct price-input gate for each Research schema."""
+    if schema_version == LEGACY_V12_SCHEMA_VERSION:
+        _assert_adj_factor_vintage(conn, cutoff)
+        return
+    if schema_version != SCHEMA_VERSION:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM daily_kline WHERE trade_date <= %s),
+                (SELECT COUNT(*) FROM feature.price_daily_v2 WHERE trade_date <= %s),
+                (SELECT COUNT(*) FROM feature.price_adjustment_factor_asof
+                   WHERE trade_date <= %s),
+                (SELECT COUNT(*) FROM feature.price_daily_v2
+                   WHERE trade_date <= %s AND quality_status = 'MISSING_SOURCE')
+            """,
+            (cutoff, cutoff, cutoff, cutoff),
+        )
+        daily_rows, price_rows, factor_rows, invalid_rows = cur.fetchone()
+    if daily_rows != price_rows or daily_rows != factor_rows or invalid_rows:
+        raise RuntimeError(
+            "point-in-time price Feature is incomplete or invalid: "
+            f"cutoff={cutoff}, daily={daily_rows}, price_v2={price_rows}, "
+            f"factor_asof={factor_rows}, missing_source={invalid_rows}"
+        )
+
+
+def _assert_price_vintage_for_dates(conn, cutoffs: list[date], schema_version: str) -> None:
+    """Check exact-date price coverage for a batch without repeated history scans."""
+    if not cutoffs:
+        return
+    if schema_version == LEGACY_V12_SCHEMA_VERSION:
+        for cutoff in cutoffs:
+            _assert_adj_factor_vintage(conn, cutoff)
+        return
+    if schema_version != SCHEMA_VERSION:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH dates(trade_date) AS (SELECT unnest(%s::date[])),
+            daily AS (
+                SELECT trade_date, COUNT(*) AS n FROM daily_kline
+                 WHERE trade_date = ANY(%s::date[]) GROUP BY trade_date
+            ), prices AS (
+                SELECT trade_date, COUNT(*) AS n FROM feature.price_daily_v2
+                 WHERE trade_date = ANY(%s::date[]) GROUP BY trade_date
+            ), factors AS (
+                SELECT trade_date, COUNT(*) AS n FROM feature.price_adjustment_factor_asof
+                 WHERE trade_date = ANY(%s::date[]) GROUP BY trade_date
+            ), invalid AS (
+                SELECT trade_date, COUNT(*) AS n FROM feature.price_daily_v2
+                 WHERE trade_date = ANY(%s::date[]) AND quality_status='MISSING_SOURCE'
+                 GROUP BY trade_date
+            )
+            SELECT d.trade_date, COALESCE(x.n,0), COALESCE(p.n,0),
+                   COALESCE(f.n,0), COALESCE(i.n,0)
+              FROM dates d
+              LEFT JOIN daily x USING (trade_date)
+              LEFT JOIN prices p USING (trade_date)
+              LEFT JOIN factors f USING (trade_date)
+              LEFT JOIN invalid i USING (trade_date)
+             WHERE COALESCE(x.n,0) <> COALESCE(p.n,0)
+                OR COALESCE(x.n,0) <> COALESCE(f.n,0)
+                OR COALESCE(i.n,0) <> 0
+            """,
+            (list(cutoffs), list(cutoffs), list(cutoffs), list(cutoffs), list(cutoffs)),
+        )
+        invalid_rows = cur.fetchall()
+    if invalid_rows:
+        raise RuntimeError(f"point-in-time price batch coverage invalid: {invalid_rows[:10]}")
+
+
+def _baseline(cutoff: date, tag: str, connection=None):
+    """确认基线仍可用；传入连接时与当前快照事务使用同一数据库会话。"""
+    if connection is None:
+        with get_connection() as conn:
+            return _baseline(cutoff, tag, conn)
+    with connection.cursor() as cur:
+        cur.execute("""SELECT release_tag, baseline_cutoff_date, status,
+                               quality_report_hash, source_manifest_hash,
+                               source_manifest
                        FROM tushare_data_release WHERE release_tag=%s""", (tag,))
         row = cur.fetchone()
     if not row or row[2] != "validated":
         raise RuntimeError(f"数据基线必须是 validated: {tag}")
     if cutoff > row[1]:
         raise ValueError(f"research_cutoff_date {cutoff} 晚于数据基线截止日 {row[1]}")
+    if not row[3]:
+        raise RuntimeError(f"数据基线缺少质量报告哈希: {tag}")
+    if not row[4] or not row[5]:
+        raise RuntimeError(f"数据基线缺少 Raw 来源 Manifest: {tag}")
+    # Release 之后如果同一截止区间又追加了修订 Raw，旧 release 只能作为
+    # 历史审计记录，不能继续生成新的 Snapshot。必须先重建派生层并发布新基线。
+    from data_collect.jobs.tushare_release import _source_manifest
+
+    _, current_source_hash = _source_manifest(connection, row[1])
+    if current_source_hash != row[4]:
+        raise RuntimeError(
+            f"数据基线 Raw 来源边界已变化，必须重建派生层并发布新基线: {tag}"
+        )
     return row
 
 
 def create(cutoff: str, baseline_tag: str, schema_version: str = SCHEMA_VERSION, notes: str = "") -> str:
     cutoff_date = date.fromisoformat(cutoff)
-    _baseline(cutoff_date, baseline_tag)
-    quality_report, quality_hash = _quality_report()
+    baseline = _baseline(cutoff_date, baseline_tag)
+    with get_connection() as vintage_conn:
+        _assert_price_vintage_for_schema(vintage_conn, cutoff_date, schema_version)
+    quality_report, quality_hash = _quality_report(cutoff_date)
     if quality_report["failures"]:
         raise RuntimeError(f"质量门禁未通过，不能创建 Research 快照: {quality_report['failures']}")
     metadata = _git_metadata()
@@ -204,89 +397,232 @@ def create(cutoff: str, baseline_tag: str, schema_version: str = SCHEMA_VERSION,
         cur.execute("""INSERT INTO research.snapshot_manifest
             (snapshot_id, research_cutoff_date, data_baseline_tag, schema_version,
              code_version, git_commit, git_dirty, diff_hash, quality_report_hash,
+             baseline_quality_report_hash, baseline_source_manifest_hash,
              quality_report, status, notes)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'DRAFT',%s)""",
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'DRAFT',%s)""",
                     (snapshot_id, cutoff_date, baseline_tag, schema_version,
                      metadata["code_version"], metadata["commit"], metadata["dirty"],
-                     metadata["diff_hash"], quality_hash, Json(quality_report), notes))
+                     metadata["diff_hash"], quality_hash, baseline[3], baseline[4],
+                     Json(quality_report), notes))
         conn.commit()
     return snapshot_id
 
 
-def _manifest(conn, snapshot_id: str):
+def existing_snapshot(cutoff: str, baseline_tag: str, schema_version: str = SCHEMA_VERSION):
+    """Return the existing snapshot for a logical key, if any.
+
+    A snapshot is logically identified by cutoff date, data baseline and schema
+    version.  The unique database index is the final guard; this read helper
+    lets a multi-date orchestration task resume instead of creating duplicates.
+    """
+    cutoff_date = date.fromisoformat(cutoff)
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT snapshot_id, status
+                 FROM research.snapshot_manifest
+                WHERE research_cutoff_date=%s
+                  AND data_baseline_tag=%s
+                  AND schema_version=%s""",
+            (cutoff_date, baseline_tag, schema_version),
+        )
+        row = cur.fetchone()
+    return (str(row[0]), row[1]) if row else None
+
+
+def _manifest(conn, snapshot_id: str, *, for_update: bool = False):
     with conn.cursor() as cur:
-        cur.execute("""SELECT snapshot_id, research_cutoff_date, data_baseline_tag,
+        query = """SELECT snapshot_id, research_cutoff_date, data_baseline_tag,
                schema_version, status, code_version, git_commit, git_dirty,
-               diff_hash, code_archive_path, quality_report_hash, input_manifest_hash
-               FROM research.snapshot_manifest WHERE snapshot_id=%s""", (snapshot_id,))
+               diff_hash, code_archive_path, code_archive_sha256,
+               code_archive_size_bytes, quality_report_hash,
+               baseline_quality_report_hash, baseline_source_manifest_hash,
+               input_manifest_hash
+               FROM research.snapshot_manifest WHERE snapshot_id=%s"""
+        if for_update:
+            query += " FOR UPDATE"
+        cur.execute(query, (snapshot_id,))
         row = cur.fetchone()
     if not row:
         raise ValueError(f"不存在的 snapshot_id: {snapshot_id}")
     return dict(zip(("snapshot_id", "cutoff", "baseline", "schema_version", "status",
                      "code_version", "git_commit", "git_dirty", "diff_hash",
-                     "code_archive_path", "quality_hash", "input_hash"), row))
+                     "code_archive_path", "code_archive_sha256", "code_archive_size",
+                     "quality_hash", "baseline_quality_hash",
+                     "baseline_source_manifest_hash", "input_hash"), row))
 
 
 def _stock_snapshot_sql():
     return """
     INSERT INTO research.stock_snapshot_daily
     (snapshot_id, research_date, ts_code, symbol, name, market, list_status, list_date, delist_date,
-     is_listed_asof, is_st_asof, is_suspended_asof, is_tradeable, can_buy, can_sell, limit_status,
-     raw_close, adj_close_base, return_1d, return_20d, return_60d, ma20, ma60, ma120, volume_ratio_20d,
+     is_listed_asof, is_st_asof, is_suspended_asof, eligible_by_market, is_tradeable, can_buy, can_sell, limit_status,
+     raw_open, raw_high, raw_low, raw_close, raw_volume, raw_amount, up_limit, down_limit,
+     adj_close_base, price_feature_version, price_adjustment_mode,
+     return_1d, return_20d, return_60d, ma20, ma60, ma120, volume_ratio_20d,
+     available_observation_count, ma20_observation_count, ma60_observation_count, ma120_observation_count,
      pe_ttm, pb, ps_ttm, dv_ratio, total_mv, circ_mv, pe_pct_3y, pe_pct_5y, pb_pct_3y, pb_pct_5y,
-     is_pe_meaningful, report_date, effective_announce_date, financial_record_version,
-     financial_source_record_key, financial_payload_hash, roe, roa, debt_to_assets, revenue_yoy,
+     is_pe_meaningful, valuation_observation_count, pe_window_start_date_5y,
+     has_full_pe_5y_history, report_date, effective_announce_date,
+     financial_version_available_date, financial_record_version,
+     financial_source_record_key, financial_payload_hash, financial_vintage_quality,
+     financial_source_observed_at,
+     roe, roa, debt_to_assets, revenue_yoy,
      tr_yoy, q_sales_yoy, netprofit_yoy, operating_cashflow, net_profit, cash_div_12m,
-     dividend_event_count_3y, dividend_year_count_3y, quality_status)
-    SELECT %s, u.trade_date, u.ts_code, b.symbol, COALESCE(l.name, b.name), b.market,
-           b.list_status, b.list_date, b.delist_date,
-           u.is_listed_asof, u.is_st_asof, u.is_suspended_asof,
+     dividend_event_count_3y, dividend_year_count_3y,
+     annual_report_count_5y, roe_above_15_years_5y, roe_5y_min,
+     roe_5y_all_above_15, ocf_report_count_3y, ocf_positive_years_3y,
+     ocf_3y_all_positive, quarterly_report_count_4q,
+     q_sales_yoy_above_30_quarters_4q, q_sales_yoy_4q_all_above_30,
+     instrument_source_record_key, instrument_source_record_version,
+     instrument_source_payload_hash,
+     quality_status)
+     SELECT %s, u.trade_date, u.ts_code, b.payload->>'symbol',
+            COALESCE(l.name, b.payload->>'name'),
+            COALESCE(l.market, b.payload->>'market'),
+            CASE
+              WHEN to_date(NULLIF(b.payload->>'list_date',''), 'YYYYMMDD') > u.trade_date
+              THEN 'N'
+              WHEN u.is_listed_asof THEN 'L'
+              ELSE 'D'
+            END,
+            CASE
+              WHEN to_date(NULLIF(b.payload->>'list_date',''), 'YYYYMMDD') <= u.trade_date
+              THEN to_date(NULLIF(b.payload->>'list_date',''), 'YYYYMMDD')
+              ELSE NULL
+            END,
+            CASE
+              WHEN to_date(NULLIF(b.payload->>'delist_date',''), 'YYYYMMDD') <= u.trade_date
+              THEN to_date(NULLIF(b.payload->>'delist_date',''), 'YYYYMMDD')
+              ELSE NULL
+            END,
+           u.is_listed_asof, u.is_st_asof, u.is_suspended_asof, u.eligible_by_market,
            t.is_tradeable, t.can_buy, t.can_sell, t.limit_status,
-           p.raw_close, p.adj_close_base, p.return_1d, p.return_20d, p.return_60d,
+           d.open, d.high, d.low, p.raw_close, d.volume, d.amount,
+           st.up_limit, st.down_limit,
+            p.asof_close, p.feature_set_version, p.adjustment_mode,
+            p.return_1d, p.return_20d, p.return_60d,
            p.ma20, p.ma60, p.ma120, p.volume_ratio_20d,
+           p.available_observation_count, p.ma20_observation_count,
+           p.ma60_observation_count, p.ma120_observation_count,
            v.pe_ttm, v.pb, v.ps_ttm, v.dv_ratio, v.total_mv, v.circ_mv,
-           v.pe_pct_3y, v.pe_pct_5y, v.pb_pct_3y, v.pb_pct_5y, v.is_pe_meaningful,
-           f.report_date, f.effective_announce_date, f.record_version,
-           f.source_record_key, f.payload_hash, f.roe, f.roa, f.debt_to_assets,
-           f.revenue_yoy, f.tr_yoy, f.q_sales_yoy, f.netprofit_yoy,
+           v.pe_pct_3y, v.pe_pct_5y, v.pb_pct_3y, v.pb_pct_5y,
+           v.is_pe_meaningful, v.valuation_observation_count,
+           v.pe_window_start_date_5y, COALESCE(v.has_full_pe_5y_history, FALSE),
+            cf.report_date, cf.effective_announce_date, cf.version_available_date,
+            cf.record_version,
+            cf.source_record_key, cf.payload_hash, cf.vintage_quality,
+            cf.source_observed_at,
+            cf.roe, cf.roa, cf.debt_to_assets,
+            cf.revenue_yoy, cf.tr_yoy, cf.q_sales_yoy, cf.netprofit_yoy,
            cf.operating_cashflow, cf.net_profit,
            sr.cash_div_12m, sr.dividend_event_count_3y, sr.dividend_year_count_3y,
+           COALESCE(fh.annual_report_count_5y, 0),
+           COALESCE(fh.roe_above_15_years_5y, 0), fh.roe_5y_min,
+           COALESCE(fh.roe_5y_all_above_15, FALSE),
+           COALESCE(fh.ocf_report_count_3y, 0),
+           COALESCE(fh.ocf_positive_years_3y, 0),
+           COALESCE(fh.ocf_3y_all_positive, FALSE),
+           COALESCE(fh.quarterly_report_count_4q, 0),
+           COALESCE(fh.q_sales_yoy_above_30_quarters_4q, 0),
+           COALESCE(fh.q_sales_yoy_4q_all_above_30, FALSE),
+           b.business_key, b.record_id, b.payload_hash,
            CASE WHEN 'MISSING_SOURCE' = ANY(ARRAY[
                     COALESCE(u.quality_status,'MISSING_SOURCE'), COALESCE(t.quality_status,'MISSING_SOURCE'),
                     COALESCE(p.quality_status,'MISSING_SOURCE'), COALESCE(v.quality_status,'MISSING_SOURCE'),
-                    COALESCE(f.quality_status,'MISSING_SOURCE'), COALESCE(sr.quality_status,'MISSING_SOURCE')])
+                    COALESCE(cf.quality_status,'MISSING_SOURCE'), COALESCE(sr.quality_status,'MISSING_SOURCE')])
                 THEN 'MISSING_SOURCE'
                 WHEN 'WARNING' = ANY(ARRAY[
                     COALESCE(u.quality_status,'WARNING'), COALESCE(t.quality_status,'WARNING'),
                     COALESCE(p.quality_status,'WARNING'), COALESCE(v.quality_status,'WARNING'),
-                    COALESCE(f.quality_status,'WARNING'), COALESCE(sr.quality_status,'WARNING')])
+                    COALESCE(cf.quality_status,'WARNING'), COALESCE(sr.quality_status,'WARNING')])
                 THEN 'WARNING' ELSE 'VALID' END
     FROM pit.universe_daily u
+    JOIN LATERAL (
+      SELECT record_id, business_key, payload, payload_hash
+      FROM tushare_stock_basic_raw_version b
+      WHERE b.ts_code=u.ts_code AND b.record_id <= %s
+      ORDER BY b.fetched_at DESC, b.record_id DESC LIMIT 1
+    ) b ON TRUE
     LEFT JOIN pit.security_tradeability_daily t
       ON t.trade_date=u.trade_date AND t.ts_code=u.ts_code
-    LEFT JOIN feature.price_daily_v1 p
+     LEFT JOIN feature.price_daily_v2 p
       ON p.trade_date=u.trade_date AND p.ts_code=u.ts_code
+    LEFT JOIN LATERAL (
+      SELECT d.open, d.high, d.low, d.close, d.volume, d.amount
+      FROM daily_kline d
+      WHERE d.trade_date=u.trade_date AND d.stock_code=u.ts_code
+      LIMIT 1
+    ) d ON TRUE
+    LEFT JOIN std.security_status_daily st
+      ON st.trade_date=u.trade_date AND st.ts_code=u.ts_code
     LEFT JOIN feature.valuation_daily_v1 v
       ON v.trade_date=u.trade_date AND v.ts_code=u.ts_code
-    LEFT JOIN pit.financial_asof f
-      ON f.decision_date=u.trade_date AND f.ts_code=u.ts_code
     LEFT JOIN feature.shareholder_return_v1 sr
       ON sr.asof_date=u.trade_date AND sr.ts_code=u.ts_code
-    LEFT JOIN stock_basic_info b ON b.stock_code=u.ts_code
     LEFT JOIN LATERAL (
-      SELECT l.name FROM std.security_lifecycle l
+       SELECT l.name, l.market FROM std.security_lifecycle l
       WHERE l.ts_code=u.ts_code AND l.effective_from <= u.trade_date
         AND (l.effective_to IS NULL OR l.effective_to >= u.trade_date)
       ORDER BY l.effective_from DESC, l.lifecycle_id DESC LIMIT 1
     ) l ON TRUE
     LEFT JOIN LATERAL (
-      SELECT c.operating_cashflow, c.net_profit
+      SELECT c.report_date, c.effective_announce_date, c.version_available_date,
+             c.record_version, c.source_record_key, c.payload_hash,
+             c.roe, c.roa, c.debt_to_assets, c.revenue_yoy, c.tr_yoy,
+             c.q_sales_yoy, c.netprofit_yoy, c.operating_cashflow, c.net_profit,
+             c.vintage_quality, c.source_observed_at, c.quality_status
       FROM feature.company_financial_v1 c
-      WHERE c.ts_code=u.ts_code AND c.effective_announce_date IS NOT NULL
-        AND c.effective_announce_date <= u.trade_date
-      ORDER BY c.effective_announce_date DESC, c.report_date DESC,
+      WHERE c.ts_code=u.ts_code AND c.version_available_date IS NOT NULL
+        AND c.version_available_date <= u.trade_date
+      ORDER BY c.report_date DESC, c.version_available_date DESC,
                c.record_version DESC, c.feature_id DESC LIMIT 1
     ) cf ON TRUE
+    LEFT JOIN LATERAL (
+      WITH visible AS (
+        SELECT DISTINCT ON (c.report_date)
+               c.report_date, c.roe, c.operating_cashflow, c.q_sales_yoy
+        FROM feature.company_financial_v1 c
+        WHERE c.ts_code=u.ts_code
+          AND c.version_available_date IS NOT NULL
+          AND c.version_available_date <= u.trade_date
+        ORDER BY c.report_date, c.version_available_date DESC,
+                 c.record_version DESC, c.feature_id DESC
+      ), annual5 AS (
+        SELECT * FROM visible
+        WHERE EXTRACT(MONTH FROM report_date)=12
+          AND EXTRACT(DAY FROM report_date)=31
+        ORDER BY report_date DESC LIMIT 5
+      ), annual3 AS (
+        SELECT * FROM annual5 ORDER BY report_date DESC LIMIT 3
+      ), quarter4 AS (
+        SELECT * FROM visible ORDER BY report_date DESC LIMIT 4
+      )
+      SELECT
+        (SELECT COUNT(*)::integer FROM annual5) AS annual_report_count_5y,
+        (SELECT COUNT(*) FILTER (WHERE roe > 15)::integer FROM annual5) AS roe_above_15_years_5y,
+        (SELECT MIN(roe) FROM annual5) AS roe_5y_min,
+        COALESCE((SELECT COUNT(*)=5 AND COUNT(roe)=5
+                         AND MAX(EXTRACT(YEAR FROM report_date))
+                             - MIN(EXTRACT(YEAR FROM report_date))=4
+                         AND BOOL_AND(roe > 15)
+                  FROM annual5), FALSE) AS roe_5y_all_above_15,
+        (SELECT COUNT(*)::integer FROM annual3) AS ocf_report_count_3y,
+        (SELECT COUNT(*) FILTER (WHERE operating_cashflow > 0)::integer FROM annual3) AS ocf_positive_years_3y,
+        COALESCE((SELECT COUNT(*)=3 AND COUNT(operating_cashflow)=3
+                         AND MAX(EXTRACT(YEAR FROM report_date))
+                             - MIN(EXTRACT(YEAR FROM report_date))=2
+                         AND BOOL_AND(operating_cashflow > 0)
+                  FROM annual3), FALSE) AS ocf_3y_all_positive,
+        (SELECT COUNT(*)::integer FROM quarter4) AS quarterly_report_count_4q,
+        (SELECT COUNT(*) FILTER (WHERE q_sales_yoy > 30)::integer FROM quarter4) AS q_sales_yoy_above_30_quarters_4q,
+        COALESCE((SELECT COUNT(*)=4 AND COUNT(q_sales_yoy)=4
+                         AND MAX(EXTRACT(YEAR FROM report_date)::integer * 4
+                                 + EXTRACT(QUARTER FROM report_date)::integer)
+                             - MIN(EXTRACT(YEAR FROM report_date)::integer * 4
+                                   + EXTRACT(QUARTER FROM report_date)::integer)=3
+                         AND BOOL_AND(q_sales_yoy > 30)
+                  FROM quarter4), FALSE) AS q_sales_yoy_4q_all_above_30
+    ) fh ON TRUE
     WHERE u.trade_date=%s
     ON CONFLICT (snapshot_id, research_date, ts_code) DO NOTHING
     """
@@ -302,7 +638,8 @@ def _lineage_sql():
         FROM research.stock_snapshot_daily s
         CROSS JOIN LATERAL unnest(ARRAY[
             'universe','tradeability','price','valuation','financial',
-            'shareholder_return','lifecycle','instrument'
+            'shareholder_return','lifecycle','instrument','market_facts',
+            'fundamental_history'
         ]::varchar[]) AS g(field_group)
         WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
     ), refs AS (
@@ -316,6 +653,7 @@ def _lineage_sql():
                    'trade_date', u.trade_date, 'ts_code', u.ts_code,
                    'is_listed_asof', u.is_listed_asof, 'is_st_asof', u.is_st_asof,
                    'is_suspended_asof', u.is_suspended_asof,
+                   'eligible_by_market', u.eligible_by_market,
                    'has_price_history', u.has_price_history,
                    'quality_status', u.quality_status,
                    'source_asof_date', u.source_asof_date
@@ -339,18 +677,25 @@ def _lineage_sql():
         WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
         UNION ALL
         SELECT s.snapshot_id, s.research_date, s.ts_code, 'price',
-               'feature.price_daily_v1', p.ts_code || ':' || p.trade_date::text,
+                'feature.price_daily_v2', p.ts_code || ':' || p.trade_date::text,
                1::bigint,
                encode(digest(convert_to(jsonb_build_object(
                    'ts_code', p.ts_code, 'trade_date', p.trade_date,
-                   'raw_close', p.raw_close, 'adj_close_base', p.adj_close_base,
+                    'raw_close', p.raw_close, 'asof_close', p.asof_close,
+                    'asof_adjustment_factor', p.asof_adjustment_factor,
                    'return_1d', p.return_1d, 'return_20d', p.return_20d,
                    'return_60d', p.return_60d, 'ma20', p.ma20, 'ma60', p.ma60,
                    'ma120', p.ma120, 'volume_ratio_20d', p.volume_ratio_20d,
-                   'quality_status', p.quality_status, 'source_asof_date', p.source_asof_date
+                   'available_observation_count', p.available_observation_count,
+                   'ma20_observation_count', p.ma20_observation_count,
+                   'ma60_observation_count', p.ma60_observation_count,
+                   'ma120_observation_count', p.ma120_observation_count,
+                    'feature_set_version', p.feature_set_version,
+                    'adjustment_mode', p.adjustment_mode,
+                    'quality_status', p.quality_status, 'source_asof_date', p.source_asof_date
                )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
         FROM research.stock_snapshot_daily s
-        JOIN feature.price_daily_v1 p ON p.trade_date=s.research_date AND p.ts_code=s.ts_code
+         JOIN feature.price_daily_v2 p ON p.trade_date=s.research_date AND p.ts_code=s.ts_code
         WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
         UNION ALL
         SELECT s.snapshot_id, s.research_date, s.ts_code, 'valuation',
@@ -363,6 +708,10 @@ def _lineage_sql():
                    'pe_pct_3y', v.pe_pct_3y, 'pe_pct_5y', v.pe_pct_5y,
                    'pb_pct_3y', v.pb_pct_3y, 'pb_pct_5y', v.pb_pct_5y,
                    'is_pe_meaningful', v.is_pe_meaningful,
+                   'valuation_observation_count', v.valuation_observation_count,
+                   'pe_window_start_date_5y', v.pe_window_start_date_5y,
+                   'pe_observation_count_5y', v.pe_observation_count_5y,
+                   'has_full_pe_5y_history', v.has_full_pe_5y_history,
                    'quality_status', v.quality_status, 'source_asof_date', v.source_asof_date
                )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
         FROM research.stock_snapshot_daily s
@@ -370,7 +719,7 @@ def _lineage_sql():
         WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
         UNION ALL
         SELECT s.snapshot_id, s.research_date, s.ts_code, 'financial',
-               'pit.financial_asof', COALESCE(s.financial_source_record_key,
+               'feature.company_financial_v1', COALESCE(s.financial_source_record_key,
                    s.ts_code || ':' || s.research_date::text || ':missing'),
                s.financial_record_version, s.financial_payload_hash
         FROM research.stock_snapshot_daily s WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
@@ -402,10 +751,42 @@ def _lineage_sql():
         WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
         UNION ALL
         SELECT s.snapshot_id, s.research_date, s.ts_code, 'instrument',
-               'tushare_stock_basic_raw', b.ts_code, 1::bigint,
-               encode(digest(convert_to(b.payload::text, 'UTF8'), 'sha256'), 'hex')::char(64)
+               'tushare_stock_basic_raw_version', s.instrument_source_record_key,
+               s.instrument_source_record_version,
+               s.instrument_source_payload_hash
         FROM research.stock_snapshot_daily s
-        JOIN tushare_stock_basic_raw b ON b.ts_code=s.ts_code
+        WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
+        UNION ALL
+        SELECT s.snapshot_id, s.research_date, s.ts_code, 'market_facts',
+               'research.stock_snapshot_daily',
+               s.ts_code || ':' || s.research_date::text || ':market-facts',
+               1::bigint,
+               encode(digest(convert_to(jsonb_build_object(
+                   'raw_open', s.raw_open, 'raw_high', s.raw_high,
+                   'raw_low', s.raw_low, 'raw_close', s.raw_close,
+                   'raw_volume', s.raw_volume, 'raw_amount', s.raw_amount,
+                   'up_limit', s.up_limit, 'down_limit', s.down_limit
+               )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
+        FROM research.stock_snapshot_daily s
+        WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
+        UNION ALL
+        SELECT s.snapshot_id, s.research_date, s.ts_code, 'fundamental_history',
+               'feature.company_financial_v1:pit-visible-summary',
+               s.ts_code || ':' || s.research_date::text || ':fundamental-history',
+               1::bigint,
+               encode(digest(convert_to(jsonb_build_object(
+                   'annual_report_count_5y', s.annual_report_count_5y,
+                   'roe_above_15_years_5y', s.roe_above_15_years_5y,
+                   'roe_5y_min', s.roe_5y_min,
+                   'roe_5y_all_above_15', s.roe_5y_all_above_15,
+                   'ocf_report_count_3y', s.ocf_report_count_3y,
+                   'ocf_positive_years_3y', s.ocf_positive_years_3y,
+                   'ocf_3y_all_positive', s.ocf_3y_all_positive,
+                   'quarterly_report_count_4q', s.quarterly_report_count_4q,
+                   'q_sales_yoy_above_30_quarters_4q', s.q_sales_yoy_above_30_quarters_4q,
+                   'q_sales_yoy_4q_all_above_30', s.q_sales_yoy_4q_all_above_30
+               )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
+        FROM research.stock_snapshot_daily s
         WHERE s.snapshot_id=(SELECT snapshot_id FROM params)
     )
     SELECT g.snapshot_id, g.research_date, g.ts_code, g.field_group,
@@ -419,17 +800,275 @@ def _lineage_sql():
     """
 
 
-def build(snapshot_id: str) -> None:
-    quality_report, quality_hash = _quality_report()
+def _stock_snapshot_batch_sql():
+    """Return the set-based materialization SQL for several cutoff dates."""
+    sql = _stock_snapshot_sql()
+    marker = "    INSERT INTO research.stock_snapshot_daily"
+    if marker not in sql:
+        raise RuntimeError("单日 Snapshot SQL 结构已变化，无法生成批量 SQL")
+    sql = sql.replace(
+        marker,
+        "    WITH params AS (\n"
+        "        SELECT snapshot_id, research_cutoff_date, %s::bigint AS stock_basic_max_record_id\n"
+        "          FROM research.snapshot_manifest\n"
+        "         WHERE snapshot_id = ANY(%s::uuid[])\n"
+        "    )\n" + marker,
+        1,
+    )
+    sql = sql.replace("SELECT %s, u.trade_date", "SELECT m.snapshot_id, u.trade_date", 1)
+    sql = sql.replace("FROM pit.universe_daily u", "FROM params m JOIN pit.universe_daily u ON u.trade_date=m.research_cutoff_date", 1)
+    sql = sql.replace("b.record_id <= %s", "b.record_id <= m.stock_basic_max_record_id", 1)
+    sql = sql.replace("WHERE u.trade_date=%s", "WHERE TRUE", 1)
+    return sql
+
+
+def _lineage_batch_sql():
+    """Return the lineage SQL with a UUID array instead of one UUID."""
+    sql = _lineage_sql()
+    marker = "WITH params AS (SELECT %s::uuid AS snapshot_id), groups AS ("
+    if marker not in sql:
+        raise RuntimeError("单日 lineage SQL 结构已变化，无法生成批量 SQL")
+    sql = sql.replace(
+        marker,
+        "WITH params AS (SELECT unnest(%s::uuid[]) AS snapshot_id), groups AS (",
+        1,
+    )
+    sql = sql.replace(
+        "WHERE s.snapshot_id=(SELECT snapshot_id FROM params)",
+        "WHERE s.snapshot_id IN (SELECT snapshot_id FROM params)",
+    )
+    return sql
+
+
+def create_snapshots_batch(
+    cutoff_dates: list[date],
+    baseline_tag: str,
+    schema_version: str = SCHEMA_VERSION,
+    notes_prefix: str = "",
+) -> tuple[dict[str, str], ...]:
+    """Create several DRAFT manifests with one baseline/quality read.
+
+    The manifests remain one-per-date, but the inserts use one execute_values
+    call.  This is the resume-safe creation path used by the series runner.
+    """
+    dates = tuple(sorted(set(cutoff_dates)))
+    if not dates:
+        return ()
+    baseline, quality_report, quality_hash = None, None, None
+    with get_connection() as conn:
+        baseline = _baseline(max(dates), baseline_tag, conn)
+    quality_report, _ = _quality_report(max(dates))
     if quality_report["failures"]:
-        raise RuntimeError(f"质量门禁未通过，不能构建快照: {quality_report['failures']}")
+        raise RuntimeError(f"质量门禁未通过，不能创建 Research 快照: {quality_report['failures']}")
+    metadata = _git_metadata()
+    psycopg2, execute_values = require_psycopg2()
+    Json = psycopg2.extras.Json
+    candidates: list[tuple] = []
+    result: dict[str, str] = {}
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT snapshot_id, research_cutoff_date, status
+                 FROM research.snapshot_manifest
+                WHERE data_baseline_tag=%s AND schema_version=%s
+                  AND research_cutoff_date = ANY(%s::date[])""",
+            (baseline_tag, schema_version, list(dates)),
+        )
+        existing = {row[1]: (str(row[0]), row[2]) for row in cur.fetchall()}
+        for cutoff in dates:
+            if cutoff in existing:
+                snapshot_id, status = existing[cutoff]
+                if status == "BUILDING":
+                    raise RuntimeError(f"检测到同一截止日已有 BUILDING 快照: {snapshot_id}")
+                result[cutoff.isoformat()] = snapshot_id
+                continue
+            snapshot_id = str(uuid.uuid4())
+            report = dict(quality_report)
+            report["cutoff_date"] = cutoff.isoformat()
+            report_encoded = json.dumps(
+                _canonical(report), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            )
+            report_hash = hashlib.sha256(report_encoded.encode("utf-8")).hexdigest()
+            candidates.append(
+                (
+                    snapshot_id, cutoff, baseline_tag, schema_version,
+                    metadata["code_version"], metadata["commit"], metadata["dirty"],
+                    metadata["diff_hash"], report_hash, baseline[3], baseline[4],
+                    Json(report), (f"{notes_prefix} cutoff={cutoff.isoformat()}").strip(),
+                )
+            )
+            result[cutoff.isoformat()] = snapshot_id
+        if candidates:
+            execute_values(
+                cur,
+                """INSERT INTO research.snapshot_manifest
+                    (snapshot_id, research_cutoff_date, data_baseline_tag, schema_version,
+                     code_version, git_commit, git_dirty, diff_hash, quality_report_hash,
+                     baseline_quality_report_hash, baseline_source_manifest_hash,
+                     quality_report, status, notes)
+                    VALUES %s""",
+                candidates,
+                template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'DRAFT',%s)",
+                page_size=100,
+            )
+        conn.commit()
+    return tuple(
+        {"snapshot_id": result[cutoff.isoformat()], "research_cutoff_date": cutoff.isoformat()}
+        for cutoff in dates
+    )
+
+
+def build_snapshots_batch(
+    snapshot_ids: list[str],
+    *,
+    baseline=None,
+    quality_reports: dict[str, tuple[dict, str]] | None = None,
+) -> None:
+    """Build several DRAFT/FAILED snapshots using set-based inserts."""
+    ids = tuple(str(value) for value in snapshot_ids)
+    if not ids:
+        return
+    metadata = _git_metadata()
+    from data_collect.jobs.tushare_release import _lock_release_inputs
+
+    conn = get_connection()
+    try:
+        conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
+        _lock_release_inputs(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT snapshot_id, research_cutoff_date, data_baseline_tag,
+                              schema_version, status, baseline_quality_report_hash,
+                              baseline_source_manifest_hash
+                         FROM research.snapshot_manifest
+                        WHERE snapshot_id = ANY(%s::uuid[])
+                        ORDER BY research_cutoff_date
+                        FOR UPDATE""",
+                (list(ids),),
+            )
+            rows = cur.fetchall()
+        if len(rows) != len(ids):
+            raise ValueError("批量构建包含不存在的 Snapshot")
+        if any(row[4] not in {"DRAFT", "FAILED"} for row in rows):
+            raise RuntimeError("批量构建只允许 DRAFT/FAILED Snapshot")
+        baseline_tags = {row[2] for row in rows}
+        schema_versions = {row[3] for row in rows}
+        if len(baseline_tags) != 1 or len(schema_versions) != 1:
+            raise ValueError("同一批次必须使用同一 baseline_tag/schema_version")
+        baseline_tag = next(iter(baseline_tags))
+        schema_version = next(iter(schema_versions))
+        if baseline is None:
+            baseline = _baseline(max(row[1] for row in rows), baseline_tag, conn)
+        cutoffs = [row[1] for row in rows]
+        _assert_price_vintage_for_dates(conn, cutoffs, schema_version)
+        for row in rows:
+            if baseline[3] != row[5] or baseline[4] != row[6]:
+                raise RuntimeError("数据基线 Manifest 已变化，拒绝批量构建")
+        reports = {}
+        for row in rows:
+            if quality_reports is not None:
+                report, quality_hash = quality_reports[str(row[0])]
+            else:
+                report, quality_hash = _quality_report(row[1])
+            if report["failures"]:
+                raise RuntimeError(f"质量门禁未通过: {row[1]} {report['failures']}")
+            reports[row[0]] = (report, quality_hash)
+        psycopg2, execute_values = require_psycopg2()
+        Json = psycopg2.extras.Json
+        with conn.cursor() as cur:
+            for row in rows:
+                report, quality_hash = reports[row[0]]
+                cur.execute(
+                    """UPDATE research.snapshot_manifest
+                          SET status='BUILDING', quality_report_hash=%s,
+                              quality_report=%s, code_version=%s, git_commit=%s,
+                              git_dirty=%s, diff_hash=%s, failure_reason=NULL
+                        WHERE snapshot_id=%s""",
+                    (quality_hash, Json(report), metadata["code_version"], metadata["commit"],
+                     metadata["dirty"], metadata["diff_hash"], row[0]),
+                )
+            for table in ("research.snapshot_lineage", "research.stock_snapshot_daily", "research.snapshot_input"):
+                cur.execute(
+                    f"DELETE FROM {table} WHERE snapshot_id = ANY(%s::uuid[])",
+                    (list(ids),),
+                )
+            stock_basic_max_record_id = baseline[5]["append_only_sources"][
+                "tushare_stock_basic_raw_version"
+            ]["max_record_id"]
+            if stock_basic_max_record_id is None:
+                raise RuntimeError("基线缺少 stock_basic Raw 版本高水位")
+            cur.execute(_stock_snapshot_batch_sql(), (stock_basic_max_record_id, list(ids)))
+            if cur.rowcount <= 0:
+                raise RuntimeError("批量截止日没有可生成的 universe 数据")
+            cur.execute(_lineage_batch_sql(), (list(ids),))
+            input_rows = []
+            for row in rows:
+                stats = [_input_stats(conn, definition, row[1], baseline[5]) for definition in INPUTS]
+                input_hash = _manifest_hash(stats)
+                for item in stats:
+                    input_rows.append(
+                        (row[0], item["schema_name"], item["table_name"], item["selection_predicate"],
+                         item["selected_columns"], item["hash_algorithm"], item["row_count"],
+                         item["min_date"], item["max_date"], item["content_hash"])
+                    )
+                cur.execute(
+                    "UPDATE research.snapshot_manifest SET input_manifest_hash=%s WHERE snapshot_id=%s",
+                    (input_hash, row[0]),
+                )
+            execute_values(
+                cur,
+                """INSERT INTO research.snapshot_input
+                    (snapshot_id,schema_name,table_name,selection_predicate,selected_columns,
+                     hash_algorithm,row_count,min_date,max_date,content_hash)
+                    VALUES %s""",
+                input_rows,
+                page_size=500,
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE research.snapshot_manifest
+                          SET status='FAILED', failed_at=CURRENT_TIMESTAMP,
+                              failure_reason=%s
+                        WHERE snapshot_id = ANY(%s::uuid[])
+                          AND status IN ('DRAFT','BUILDING','FAILED')""",
+                    (str(exc)[:2000], list(ids)),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def build(snapshot_id: str) -> None:
     metadata = _git_metadata()
     conn = get_connection()
     try:
         conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
-        manifest = _manifest(conn, snapshot_id)
+        # The quality report is intentionally read through the existing
+        # quality-gate connections, so acquire the same shared input locks on
+        # this transaction before opening that read boundary.  This prevents a
+        # Raw/derived rebuild from landing between the quality report and the
+        # snapshot materialization.
+        from data_collect.jobs.tushare_release import _lock_release_inputs
+        _lock_release_inputs(conn)
+        manifest = _manifest(conn, snapshot_id, for_update=True)
+        _assert_price_vintage_for_schema(conn, manifest["cutoff"], manifest["schema_version"])
         if manifest["status"] not in {"DRAFT", "FAILED"}:
             raise RuntimeError(f"只有 DRAFT/FAILED 快照可构建: {snapshot_id} ({manifest['status']})")
+        quality_report, quality_hash = _quality_report(manifest["cutoff"])
+        if quality_report["failures"]:
+            raise RuntimeError(f"质量门禁未通过，不能构建快照: {quality_report['failures']}")
+        baseline = _baseline(manifest["cutoff"], manifest["baseline"], conn)
+        if baseline[3] != manifest["baseline_quality_hash"]:
+            raise RuntimeError("数据基线质量哈希已变化，拒绝使用旧 Manifest 构建")
+        if baseline[4] != manifest["baseline_source_manifest_hash"]:
+            raise RuntimeError("数据基线 Raw 来源 Manifest 已变化，拒绝构建")
         with conn.cursor() as cur:
             cur.execute("""UPDATE research.snapshot_manifest
                            SET status='BUILDING', quality_report_hash=%s, quality_report=%s,
@@ -444,11 +1083,24 @@ def build(snapshot_id: str) -> None:
             cur.execute("DELETE FROM research.snapshot_lineage WHERE snapshot_id=%s", (snapshot_id,))
             cur.execute("DELETE FROM research.stock_snapshot_daily WHERE snapshot_id=%s", (snapshot_id,))
             cur.execute("DELETE FROM research.snapshot_input WHERE snapshot_id=%s", (snapshot_id,))
-            cur.execute(_stock_snapshot_sql(), (snapshot_id, manifest["cutoff"]))
+            stock_basic_max_record_id = (
+                baseline[5].get("append_only_sources", {})
+                .get("tushare_stock_basic_raw_version", {})
+                .get("max_record_id")
+            )
+            if stock_basic_max_record_id is None:
+                raise RuntimeError("基线缺少 stock_basic Raw 版本高水位")
+            cur.execute(
+                _stock_snapshot_sql(),
+                (snapshot_id, stock_basic_max_record_id, manifest["cutoff"]),
+            )
             if cur.rowcount <= 0:
                 raise RuntimeError(f"截止日没有可生成的 universe 数据: {manifest['cutoff']}")
             cur.execute(_lineage_sql(), (snapshot_id,))
-            stats = [_input_stats(conn, definition, manifest["cutoff"]) for definition in INPUTS]
+            stats = [
+                _input_stats(conn, definition, manifest["cutoff"], baseline[5])
+                for definition in INPUTS
+            ]
             for item in stats:
                 cur.execute("""INSERT INTO research.snapshot_input
                     (snapshot_id,schema_name,table_name,selection_predicate,selected_columns,
@@ -474,14 +1126,111 @@ def build(snapshot_id: str) -> None:
         conn.close()
 
 
-def _check_snapshot(conn, manifest: dict) -> list[dict]:
-    stats = [_input_stats(conn, definition, manifest["cutoff"]) for definition in INPUTS]
+def validate_snapshots_batch(
+    snapshot_ids: list[str],
+    *,
+    baseline=None,
+    quality_reports: dict[str, tuple[dict, str]] | None = None,
+) -> None:
+    """Validate several BUILDING snapshots under one read boundary."""
+    ids = tuple(str(value) for value in snapshot_ids)
+    if not ids:
+        return
+    from data_collect.jobs.tushare_release import _lock_release_inputs
+
+    conn = get_connection()
+    try:
+        conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
+        _lock_release_inputs(conn)
+        manifests = []
+        for snapshot_id in ids:
+            manifest = _manifest(conn, snapshot_id, for_update=True)
+            if manifest["status"] != "BUILDING":
+                raise RuntimeError(f"只有 BUILDING 快照可批量校验: {snapshot_id} ({manifest['status']})")
+            manifests.append(manifest)
+        baseline_tags = {item["baseline"] for item in manifests}
+        schema_versions = {item["schema_version"] for item in manifests}
+        if len(baseline_tags) != 1 or len(schema_versions) != 1:
+            raise ValueError("同一批次必须使用同一 baseline_tag/schema_version")
+        if baseline is None:
+            baseline = _baseline(max(item["cutoff"] for item in manifests), next(iter(baseline_tags)), conn)
+        _assert_price_vintage_for_dates(
+            conn, [item["cutoff"] for item in manifests], next(iter(schema_versions))
+        )
+        issues_by_date = {}
+        for manifest in manifests:
+            if baseline[3] != manifest["baseline_quality_hash"]:
+                raise RuntimeError("数据基线质量哈希已变化，拒绝批量校验")
+            if baseline[4] != manifest["baseline_source_manifest_hash"]:
+                raise RuntimeError("数据基线 Raw 来源 Manifest 已变化，拒绝批量校验")
+            if quality_reports is not None:
+                quality_report, quality_hash = quality_reports[str(manifest["snapshot_id"])]
+            else:
+                quality_report, quality_hash = _quality_report(manifest["cutoff"])
+            if quality_report["failures"] or quality_hash != manifest["quality_hash"]:
+                raise RuntimeError(f"质量报告已变化或门禁失败: {manifest['cutoff']}")
+            issues = _check_snapshot(conn, manifest, baseline[5])
+            pit_report = verify_pit_cutoff_consistency(manifest["cutoff"])
+            if not pit_report["passed"]:
+                issues.append({"pit_cutoff": pit_report})
+            if issues:
+                issues_by_date[str(manifest["cutoff"])] = issues
+        if issues_by_date:
+            raise RuntimeError(f"Research 快照批量校验失败: {issues_by_date}")
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE research.snapshot_manifest
+                      SET status='VALIDATED'
+                    WHERE snapshot_id = ANY(%s::uuid[])
+                      AND status='BUILDING'""",
+                (list(ids),),
+            )
+            if cur.rowcount != len(ids):
+                raise RuntimeError("批量校验期间 Snapshot 状态发生变化")
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE research.snapshot_manifest
+                          SET status='FAILED', failed_at=CURRENT_TIMESTAMP,
+                              failure_reason=%s
+                        WHERE snapshot_id = ANY(%s::uuid[])
+                          AND status='BUILDING'""",
+                    (str(exc)[:2000], list(ids)),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _check_snapshot(conn, manifest: dict, source_manifest: dict) -> list[dict]:
+    stats = [
+        _input_stats(conn, definition, manifest["cutoff"], source_manifest)
+        for definition in INPUTS
+    ]
     issues = []
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*), COUNT(DISTINCT research_date), MIN(research_date), MAX(research_date) FROM research.stock_snapshot_daily WHERE snapshot_id=%s", (manifest["snapshot_id"],))
         rows, dates, min_date, max_date = cur.fetchone()
         if rows == 0 or dates != 1 or min_date != manifest["cutoff"] or max_date != manifest["cutoff"]:
             issues.append({"snapshot_rows": rows, "distinct_dates": dates, "min_date": min_date, "max_date": max_date})
+        cur.execute(
+            "SELECT COUNT(*) FROM pit.universe_daily WHERE trade_date=%s",
+            (manifest["cutoff"],),
+        )
+        expected_universe_rows = cur.fetchone()[0]
+        if rows != expected_universe_rows:
+            issues.append({
+                "snapshot_universe_row_mismatch": {
+                    "snapshot_rows": rows,
+                    "universe_rows": expected_universe_rows,
+                }
+            })
         cur.execute("""SELECT COUNT(*) FROM (
             SELECT snapshot_id,research_date,ts_code
             FROM research.snapshot_lineage WHERE snapshot_id=%s
@@ -500,6 +1249,30 @@ def _check_snapshot(conn, manifest: dict) -> list[dict]:
         incomplete_refs = cur.fetchall()
         if incomplete_refs:
             issues.append({"lineage_refs_without_version_or_hash": incomplete_refs})
+        if manifest["schema_version"] == SCHEMA_VERSION:
+            cur.execute("""SELECT
+                COUNT(*) FILTER (WHERE ma20 IS NOT NULL AND COALESCE(ma20_observation_count,0) < 20),
+                COUNT(*) FILTER (WHERE ma60 IS NOT NULL AND COALESCE(ma60_observation_count,0) < 60),
+                COUNT(*) FILTER (WHERE ma120 IS NOT NULL AND COALESCE(ma120_observation_count,0) < 120),
+                COUNT(*) FILTER (WHERE pe_pct_5y IS NOT NULL AND (
+                    NOT COALESCE(has_full_pe_5y_history,FALSE)
+                    OR COALESCE(valuation_observation_count,0) < 1000
+                    OR pe_window_start_date_5y IS NULL
+                    OR research_date - pe_window_start_date_5y < 1794)),
+                COUNT(*) FILTER (WHERE financial_version_available_date > research_date),
+                COUNT(*) FILTER (WHERE financial_vintage_quality='WAREHOUSE_OBSERVED_ONLY'
+                                  AND financial_source_observed_at::date > research_date),
+                COUNT(*) FILTER (WHERE instrument_source_record_key IS NULL
+                                  OR instrument_source_record_version IS NULL
+                                  OR instrument_source_payload_hash IS NULL),
+                COUNT(*) FILTER (WHERE roe_5y_all_above_15 AND annual_report_count_5y <> 5),
+                COUNT(*) FILTER (WHERE ocf_3y_all_positive AND ocf_report_count_3y <> 3),
+                COUNT(*) FILTER (WHERE q_sales_yoy_4q_all_above_30 AND quarterly_report_count_4q <> 4)
+              FROM research.stock_snapshot_daily WHERE snapshot_id=%s""",
+                        (manifest["snapshot_id"],))
+            maturity_failures = cur.fetchone()
+            if any(maturity_failures):
+                issues.append({"research_v1_2_maturity_or_pit_failures": maturity_failures})
     current_hash = _manifest_hash(stats)
     if current_hash != manifest["input_hash"]:
         issues.append({"input_manifest_hash_changed": {"stored": manifest["input_hash"], "current": current_hash}})
@@ -507,16 +1280,25 @@ def _check_snapshot(conn, manifest: dict) -> list[dict]:
 
 
 def validate(snapshot_id: str) -> None:
-    quality_report, quality_hash = _quality_report()
     conn = get_connection()
     try:
         conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
-        manifest = _manifest(conn, snapshot_id)
+        manifest = _manifest(conn, snapshot_id, for_update=True)
+        _assert_price_vintage_for_schema(conn, manifest["cutoff"], manifest["schema_version"])
         if manifest["status"] != "BUILDING":
             raise RuntimeError(f"只有 BUILDING 快照可校验: {snapshot_id} ({manifest['status']})")
+        quality_report, quality_hash = _quality_report(manifest["cutoff"])
+        baseline = _baseline(manifest["cutoff"], manifest["baseline"], conn)
+        if baseline[3] != manifest["baseline_quality_hash"]:
+            raise RuntimeError("数据基线质量哈希已变化，必须重新创建快照")
+        if baseline[4] != manifest["baseline_source_manifest_hash"]:
+            raise RuntimeError("数据基线 Raw 来源 Manifest 已变化，必须重新创建快照")
         if quality_report["failures"] or quality_hash != manifest["quality_hash"]:
             raise RuntimeError("质量报告已变化或门禁失败，必须重新 build 快照")
-        issues = _check_snapshot(conn, manifest)
+        issues = _check_snapshot(conn, manifest, baseline[5])
+        pit_report = verify_pit_cutoff_consistency(manifest["cutoff"])
+        if not pit_report["passed"]:
+            issues.append({"pit_cutoff": pit_report})
         if issues:
             raise RuntimeError(f"Research 快照校验失败: {issues}")
         with conn.cursor() as cur:
@@ -536,13 +1318,49 @@ def validate(snapshot_id: str) -> None:
 
 
 def freeze(snapshot_id: str, code_archive_path: str | None = None) -> None:
+    metadata = _git_metadata()
+    if metadata["dirty"] and not code_archive_path:
+        raise RuntimeError(
+            "正式冻结要求 Git 工作区干净；脏工作区必须显式提供存在的 code_archive_path"
+        )
+    if code_archive_path and not Path(code_archive_path).exists():
+        raise FileNotFoundError(f"代码归档不存在: {code_archive_path}")
+    archive_hash = archive_size = None
+    if code_archive_path:
+        archive_hash, archive_size = _sha256_file(code_archive_path)
     with get_connection() as conn, conn.cursor() as cur:
-        manifest = _manifest(conn, snapshot_id)
+        manifest = _manifest(conn, snapshot_id, for_update=True)
+        _assert_price_vintage_for_schema(conn, manifest["cutoff"], manifest["schema_version"])
         if manifest["status"] != "VALIDATED":
             raise RuntimeError(f"只有 VALIDATED 快照可冻结: {snapshot_id} ({manifest['status']})")
-        if code_archive_path:
-            cur.execute("UPDATE research.snapshot_manifest SET code_archive_path=%s WHERE snapshot_id=%s", (code_archive_path, snapshot_id))
-        cur.execute("UPDATE research.snapshot_manifest SET status='FROZEN' WHERE snapshot_id=%s", (snapshot_id,))
+        baseline = _baseline(manifest["cutoff"], manifest["baseline"], conn)
+        if baseline[3] != manifest["baseline_quality_hash"]:
+            raise RuntimeError("数据基线质量哈希已变化，拒绝冻结")
+        if baseline[4] != manifest["baseline_source_manifest_hash"]:
+            raise RuntimeError("数据基线 Raw 来源 Manifest 已变化，拒绝冻结")
+        quality_report, quality_hash = _quality_report(manifest["cutoff"])
+        if quality_report["failures"] or quality_hash != manifest["quality_hash"]:
+            raise RuntimeError("质量报告已变化或门禁失败，必须重新 build/validate 快照")
+        pit_report = verify_pit_cutoff_consistency(
+            manifest["cutoff"], snapshot_id=snapshot_id
+        )
+        if not pit_report["passed"]:
+            raise RuntimeError(f"正式冻结前 PIT 截面校验失败: {pit_report['issues']}")
+        assert_market_coverage_publishable(manifest["cutoff"])
+        cur.execute(
+            """UPDATE research.snapshot_manifest
+                  SET code_archive_path=COALESCE(%s, code_archive_path),
+                      code_archive_sha256=COALESCE(%s, code_archive_sha256),
+                      code_archive_size_bytes=COALESCE(%s, code_archive_size_bytes),
+                      code_version=%s, git_commit=%s, git_dirty=%s, diff_hash=%s,
+                      status='FROZEN'
+                WHERE snapshot_id=%s AND status='VALIDATED'""",
+            (code_archive_path, archive_hash, archive_size,
+             metadata["code_version"], metadata["commit"],
+             metadata["dirty"], metadata["diff_hash"], snapshot_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Research 快照状态在冻结期间发生变化，拒绝并发冻结")
         conn.commit()
 
 

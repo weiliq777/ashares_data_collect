@@ -15,6 +15,7 @@ def rebuild_after_market() -> dict:
     standard.update(standard_run("tradeability"))
     features = {}
     features.update(feature_run("price"))
+    features.update(feature_run("price_v2"))
     features.update(feature_run("valuation"))
     return {"standard": standard, "features": features}
 

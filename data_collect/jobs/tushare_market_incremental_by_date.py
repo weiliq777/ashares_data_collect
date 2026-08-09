@@ -26,6 +26,10 @@ from data_collect.jobs.tushare_daily_incremental import (
     _version_and_snapshot,
 )
 from data_collect.normalize.tushare_daily import normalize_daily, normalize_daily_basic
+from data_collect.ops.market_coverage import (
+    persist_market_coverage_blocked,
+    persist_market_coverage_gate,
+)
 from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.utils.db import get_connection
 
@@ -134,6 +138,39 @@ def _sync_one_date(
     sample_codes: set[str] | None = None,
     dry_run: bool = False,
 ) -> int:
+    """执行单日同步；任何物化异常都会追加 BLOCKED 门禁。"""
+    state = {"actual_rows": 0}
+    try:
+        return _sync_one_date_impl(
+            pro, dataset, day, batch_id, sample_codes, dry_run, state
+        )
+    except Exception as exc:
+        if not dry_run and not sample_codes:
+            try:
+                blocked_batch = (
+                    f"{batch_id}-blocked-{dataset}-{_date(day).strftime('%Y%m%d')}"
+                )
+                persist_market_coverage_blocked(
+                    dataset, _date(day), state["actual_rows"], blocked_batch, str(exc)
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "failed to persist BLOCKED coverage gate dataset=%s trade_date=%s",
+                    dataset,
+                    day,
+                )
+        raise
+
+
+def _sync_one_date_impl(
+    pro,
+    dataset: str,
+    day: str,
+    batch_id: str,
+    sample_codes: set[str] | None = None,
+    dry_run: bool = False,
+    state: dict | None = None,
+) -> int:
     standard_table, api_name = DATASETS[dataset]
     checkpoint_dataset = f"{dataset}_incremental_by_date"
 
@@ -141,11 +178,29 @@ def _sync_one_date(
     frame = _request_market_frame(pro, dataset, day)
     frame = _filter_sample(frame, sample_codes)
     rows = 0 if frame is None else len(frame)
+    if state is not None:
+        state["actual_rows"] = (
+            int(frame["ts_code"].nunique())
+            if frame is not None and not frame.empty and "ts_code" in frame.columns
+            else rows
+        )
     if frame is None or frame.empty:
         message = "Tushare 返回空数据，未删除已有 Standard"
         logger.warning("dataset=%s trade_date=%s rows=0: %s", dataset, day, message)
         if not dry_run:
-            _checkpoint(checkpoint_dataset, day, "empty", 0, message)
+            gate = persist_market_coverage_gate(
+                dataset, _date(day), 0, batch_id, sample_mode=bool(sample_codes)
+            )
+            if not sample_codes and not gate.publishable:
+                raise RuntimeError(
+                    f"{dataset} {day} 覆盖率门禁失败: {gate.status} {gate.reason}"
+                )
+            _checkpoint(
+                checkpoint_dataset, day,
+                "sample" if sample_codes else "failed",
+                0,
+                message if sample_codes else f"{message}; coverage_gate={gate.status}",
+            )
         return 0
 
     limit = ROW_LIMITS[dataset]
@@ -163,10 +218,22 @@ def _sync_one_date(
         )
         return rows
 
+    gate = persist_market_coverage_gate(
+        dataset,
+        _date(day),
+        int(frame["ts_code"].nunique()) if "ts_code" in frame.columns else rows,
+        batch_id,
+        sample_mode=bool(sample_codes),
+    )
+    if not sample_codes and not gate.publishable:
+        raise RuntimeError(
+            f"{dataset} {day} 覆盖率门禁失败: {gate.status} {gate.reason}"
+        )
+
     versions, snapshots = _version_and_snapshot(dataset, frame, batch_id)
     _rebuild_market_date(frame, dataset, _date(day))
     actual = _assert_standard_count(dataset, _date(day), standard_table)
-    _checkpoint(checkpoint_dataset, day, "done", versions)
+    _checkpoint(checkpoint_dataset, day, "sample" if sample_codes else "done", versions)
     logger.info(
         "dataset=%s trade_date=%s api_rows=%s versions=%s raw_attempted=%s standard_rows=%s",
         dataset,
@@ -188,6 +255,7 @@ def run(
     dry_run: bool = False,
     baseline_cutoff: str | None = None,
     rebuild_derived: bool = True,
+    run_date: str | None = None,
 ) -> str:
     """同步最近交易日。
 
@@ -201,11 +269,16 @@ def run(
     if limit_stocks is not None and int(limit_stocks) <= 0:
         raise ValueError("limit_stocks 必须大于 0")
 
-    end = end_date or date.today().strftime("%Y%m%d")
+    if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
+        raise ValueError("end_date 与 run_date 不一致")
+    end = (end_date or run_date or date.today().strftime("%Y%m%d")).replace("-", "")
+    batch_id = uuid.uuid4().hex
     pro = get_pro()
     calendar = _trade_dates(pro, end, int(lookback_days))
     if calendar is None or calendar.empty:
         return "没有找到需要同步的交易日"
+    if not dry_run:
+        _version_and_snapshot("trade_cal", calendar, batch_id)
 
     cutoff = _validated_baseline_cutoff(baseline_cutoff)
     calendar = calendar[pd.to_datetime(calendar["cal_date"]) > pd.Timestamp(cutoff)]
@@ -219,7 +292,6 @@ def run(
         sample_codes = set(_codes()[: int(limit_stocks)])
         logger.warning("sample mode enabled: only %s stocks", len(sample_codes))
 
-    batch_id = uuid.uuid4().hex
     logger.info(
         "date-batch incremental started batch_id=%s dates=%s datasets=%s",
         batch_id,
@@ -253,7 +325,23 @@ def run(
 
     if rebuild_derived and not dry_run and total:
         from data_collect.jobs.tushare_derived_rebuild import rebuild_after_market
-        rebuild_after_market()
+        try:
+            rebuild_after_market()
+        except Exception as exc:
+            # Per-date PASS 只证明接口覆盖率；全局派生重建失败时也必须
+            # 追加一个最新 BLOCKED 事实，防止 Research freeze 误放行。
+            last_day = _date(days[-1])
+            try:
+                persist_market_coverage_blocked(
+                    "phase2_derived",
+                    last_day,
+                    0,
+                    f"{batch_id}-derived-blocked",
+                    str(exc),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to persist derived rebuild BLOCKED gate")
+            raise
     return f"按交易日增量完成 batch_id={batch_id} dates={days} versions={total} derived_rebuilt={rebuild_derived and not dry_run and bool(total)}"
 
 

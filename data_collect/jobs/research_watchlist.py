@@ -13,7 +13,7 @@ from datetime import date
 from data_collect.utils.db import get_connection, require_psycopg2
 
 
-RULE_VERSION = "watchlist-v1"
+RULE_VERSION = "watchlist-v2"
 
 
 def _snapshot_status(conn, snapshot_id: str):
@@ -32,15 +32,24 @@ def _candidate_sql():
     return """
     WITH base AS (
         SELECT s.*,
-               CASE WHEN s.roe >= 15 AND s.debt_to_assets < 50
-                          AND s.operating_cashflow > 0
+               CASE WHEN s.debt_to_assets < 50
+                          AND s.has_full_pe_5y_history IS TRUE
+                          AND s.valuation_observation_count >= 1000
+                          AND s.annual_report_count_5y = 5
+                          AND s.roe_5y_all_above_15 IS TRUE
+                          AND s.roe_5y_min > 15
+                          AND s.ocf_report_count_3y = 3
+                          AND s.ocf_3y_all_positive IS TRUE
                           AND s.is_pe_meaningful IS TRUE
                           AND s.pe_pct_5y IS NOT NULL AND s.pe_pct_5y <= 0.30
                     THEN 'value_quality' END AS value_track,
-               CASE WHEN s.revenue_yoy >= 30 AND s.debt_to_assets < 50
-                          AND s.raw_close > s.ma20 AND s.ma20 > s.ma60
-                          AND s.volume_ratio_20d >= 1.5
-                    THEN 'growth_trend' END AS growth_track
+               CASE WHEN s.debt_to_assets < 50
+                          AND s.list_date IS NOT NULL
+                          AND s.list_date <= s.research_date - INTERVAL '2 years'
+                          AND s.quarterly_report_count_4q = 4
+                          AND s.q_sales_yoy_4q_all_above_30 IS TRUE
+                          AND s.q_sales_yoy_above_30_quarters_4q = 4
+                    THEN 'growth_quality' END AS growth_track
         FROM research.stock_snapshot_daily s
         WHERE s.snapshot_id=%s AND s.can_buy IS TRUE
           AND s.quality_status NOT IN ('MISSING_SOURCE','INVALID')
@@ -51,12 +60,11 @@ def _candidate_sql():
     ), scored AS (
         SELECT t.*,
                CASE WHEN t.selection_track='value_quality' THEN
-                    COALESCE(t.roe,0) / 15.0
+                    COALESCE(t.roe_5y_min,0) / 15.0
                     + COALESCE(1 - t.pe_pct_5y,0)
-                    + CASE WHEN t.operating_cashflow > 0 THEN 1 ELSE 0 END
-                    ELSE COALESCE(t.revenue_yoy,0) / 30.0
-                    + CASE WHEN t.raw_close > t.ma20 AND t.ma20 > t.ma60 THEN 1 ELSE 0 END
-                    + COALESCE(t.volume_ratio_20d,0) / 1.5
+                    + CASE WHEN t.ocf_3y_all_positive THEN 1 ELSE 0 END
+                    ELSE COALESCE(t.q_sales_yoy_above_30_quarters_4q,0) / 4.0
+                    + GREATEST(0, 1 - COALESCE(t.debt_to_assets,50) / 50.0)
                END AS score
         FROM tracks t
     ), deduped AS (
@@ -74,10 +82,18 @@ def _candidate_sql():
     )
     SELECT ts_code, research_date, rank_no, score, selection_track,
            jsonb_build_object(
-               'roe', roe, 'debt_to_assets', debt_to_assets,
-               'operating_cashflow', operating_cashflow, 'revenue_yoy', revenue_yoy,
-               'pe_pct_5y', pe_pct_5y, 'raw_close', raw_close, 'ma20', ma20,
-               'ma60', ma60, 'volume_ratio_20d', volume_ratio_20d,
+               'debt_to_assets', debt_to_assets, 'pe_pct_5y', pe_pct_5y,
+               'has_full_pe_5y_history', has_full_pe_5y_history,
+               'valuation_observation_count', valuation_observation_count,
+               'annual_report_count_5y', annual_report_count_5y,
+               'roe_5y_min', roe_5y_min,
+               'roe_5y_all_above_15', roe_5y_all_above_15,
+               'ocf_report_count_3y', ocf_report_count_3y,
+               'ocf_3y_all_positive', ocf_3y_all_positive,
+               'quarterly_report_count_4q', quarterly_report_count_4q,
+               'q_sales_yoy_above_30_quarters_4q', q_sales_yoy_above_30_quarters_4q,
+               'q_sales_yoy_4q_all_above_30', q_sales_yoy_4q_all_above_30,
+               'list_date', list_date,
                'can_buy', can_buy, 'quality_status', quality_status
            ) AS rationale
     FROM ranked WHERE rank_no <= %s
@@ -157,9 +173,20 @@ def add_evidence(
     source_url: str | None = None,
     content_hash: str | None = None,
     claim_role: str = "context",
+    authority_level: str = "OTHER",
+    published_at=None,
+    effective_date=None,
     locator: dict | None = None,
     note: str | None = None,
 ) -> str:
+    if authority_level not in {"OFFICIAL", "PROFESSIONAL", "MEDIA", "INTERNAL_FACT", "OTHER"}:
+        raise ValueError("authority_level 不受支持")
+    if claim_role not in {"supporting", "contrary", "context"}:
+        raise ValueError("claim_role 不受支持")
+    if claim_role in {"supporting", "contrary"} and (
+        not content_hash or len(str(content_hash).strip()) != 64
+    ):
+        raise ValueError("支持/反对证据必须保存 64 位内容哈希")
     evidence_id = str(uuid.uuid4())
     psycopg2, _ = require_psycopg2()
     Json = psycopg2.extras.Json
@@ -172,6 +199,12 @@ def add_evidence(
         snapshot = cur.fetchone()
         if not snapshot or snapshot[0] not in {"VALIDATED", "FROZEN"}:
             raise RuntimeError(f"证据引用要求 VALIDATED/FROZEN 快照: {snapshot_id}")
+        cutoff = snapshot[1]
+        published_day = published_at.date() if hasattr(published_at, "date") else published_at
+        if published_day is not None and published_day > cutoff:
+            raise ValueError("证据发布时间晚于 Research 截止日")
+        if effective_date is not None and effective_date > cutoff:
+            raise ValueError("证据生效日期晚于 Research 截止日")
         cur.execute(
             """SELECT 1 FROM research.stock_snapshot_daily
                WHERE snapshot_id=%s AND research_date=%s AND ts_code=%s""",
@@ -198,11 +231,12 @@ def add_evidence(
             """INSERT INTO research.evidence_reference
                (evidence_id,watchlist_id,snapshot_id,ts_code,source_system,source_type,
                 source_locator,document_index,document_id,source_url,content_hash,
-                claim_role,locator,note)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                claim_role,authority_level,published_at,effective_date,locator,note)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (evidence_id, watchlist_id, snapshot_id, ts_code, source_system, source_type,
              source_locator, document_index, document_id, source_url, content_hash,
-             claim_role, Json(locator or {}), note),
+             claim_role, authority_level, published_at, effective_date,
+             Json(locator or {}), note),
         )
         conn.commit()
     return evidence_id
@@ -217,7 +251,7 @@ def add_snapshot_lineage_evidence(watchlist_id: str) -> int:
     Json = psycopg2.extras.Json
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            """SELECT w.snapshot_id, w.status, m.status
+            """SELECT w.snapshot_id, w.status, m.status, m.research_cutoff_date
                FROM research.watchlist w
                JOIN research.snapshot_manifest m ON m.snapshot_id=w.snapshot_id
                WHERE w.watchlist_id=%s""",
@@ -245,12 +279,15 @@ def add_snapshot_lineage_evidence(watchlist_id: str) -> int:
             cur.execute(
                 """INSERT INTO research.evidence_reference
                    (evidence_id,watchlist_id,snapshot_id,ts_code,source_system,source_type,
-                    source_locator,document_id,content_hash,claim_role,locator,note)
-                   VALUES (%s,%s,%s,%s,'postgres','snapshot_lineage',%s,%s,%s,'context',%s,%s)
+                    source_locator,document_id,content_hash,claim_role,authority_level,
+                    effective_date,locator,note)
+                   VALUES (%s,%s,%s,%s,'postgres','snapshot_lineage',%s,%s,%s,
+                           'context','INTERNAL_FACT',%s,%s,%s)
                    ON CONFLICT DO NOTHING""",
                 (
                     str(uuid.uuid4()), watchlist_id, snapshot_id, ts_code,
                     f"{source_table}:{key}", key, payload_hash,
+                    parent[3],
                     Json({"field_group": group, "source_table": source_table,
                           "source_record_key": key, "source_record_version": version}),
                     "Research 快照事实来源；不代表外部新闻或公告证据。",

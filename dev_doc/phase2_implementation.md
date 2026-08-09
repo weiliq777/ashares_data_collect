@@ -136,6 +136,8 @@ checkpoint，避免静默截断。
 
 增量任务允许回补最近 5 个交易日和最近 30 个自然日。Raw 继续通过完整 payload、
 payload_hash 和批次号追加保存；Standard/PIT 只允许重建，不得修改或删除 Raw。
+覆盖率 PASS 只代表接口响应达到历史基准；Raw 写入、Standard/checkpoint 或全局派生
+重建失败时，任务会追加最新 `BLOCKED` 门禁，防止旧 PASS 让 Research freeze 放行。
 
 当前实现：行情增量完成后自动重建状态/PIT、价格和估值 Feature；分红增量完成后自动重建分红 Standard 和股东回报 Feature；财务增量完成后自动重建三张财务 Standard、指标 Standard、财务 PIT 和公司财务 Feature。财务报表按公告日期窗口增量；`fina_indicator` 只能按股票查询，单次最多 100 条，按季度报告期窗口拆分并使用 checkpoint、重试，达到上限时拒绝把截断结果标记为完成。`namechange` 的开放 `end_date` 通过下一条 `start_date - 1 天` 归并；`dividend` 区分预案/实施，按业务键保留最新版本，只有实施且 `ex_date <= decision_date` 的事件进入回报 Feature。发布命令会在替换 validated 基线前执行质量门禁。
 `data_collect.jobs.tushare_release` 负责创建、验收和查询历史基线标签。
@@ -168,3 +170,8 @@ tushare_fina_indicator_raw
 `or_yoy` 作为营业收入同比，`tr_yoy` 作为营业总收入同比，`q_sales_yoy` 作为单季度营业收入同比；三者不能混用。版本层和 Standard 必须保留 `ann_date`、可用时的 `f_ann_date`、业务版本字段、`payload_hash` 和抓取批次。`effective_announce_date` 使用 `COALESCE(f_ann_date, ann_date)`，不得伪造来源未提供的 `f_ann_date`。
 
 旧 `stock_financial_indicator` 暂作为只读兼容表保留。新旧 PIT 结果不要求逐行完全相同，但所有差异必须能由公告日期、版本和指标口径解释并审计。财务链路验收完成前，不进入正式 Research/Backtest；验收通过后以实际完整数据日 `2026-08-03` 创建 `baseline_20260803`，并保留 `baseline_20260731`。
+## 2026-08-07 当前状态覆盖
+
+阶段二 Raw → Standard → PIT → Feature 主链路已完成历史基线和日增量实测。行情、估值、复权因子、交易日历及阶段二派生层当前最大日期为 2026-08-06；Raw failed checkpoint 当前为 0，PIT/Research 截面校验通过。
+
+财务链路仍按公告可见性运行：财务 Feature 最大日期不要求与行情日期一致；`fina_indicator` 的 `or_yoy → revenue_yoy` 映射和版本血缘已接入。所有增量先写 Raw/Raw version，再重建受影响 Standard/PIT/Feature，禁止回写 Raw。

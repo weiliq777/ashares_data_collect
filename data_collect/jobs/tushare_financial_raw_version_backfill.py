@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import uuid
+from datetime import datetime
 
 import pandas as pd
 
@@ -20,16 +21,20 @@ def _date(value):
 def _payload_values(data: dict, dataset: str, batch_id: str, fetched_at=None):
     encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str, allow_nan=False)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    # A logical report identity must not include announcement/version metadata.
+    # ann_date/update_flag describe revisions of the same report, not different
+    # reports.  Existing immutable version rows keep their stored key; Standard
+    # rebuilds derive the same logical identity from explicit columns.
     business_key = ":".join(
         str(data.get(key) or "")
-        for key in ("ts_code", "ann_date", "end_date", "report_type", "comp_type", "update_flag")
+        for key in ("ts_code", "end_date", "report_type", "comp_type", "end_type")
     )
     return (
         dataset, business_key, data.get("ts_code"), _date(data.get("ann_date")),
         _date(data.get("f_ann_date")), _date(data.get("end_date")),
         data.get("report_type"), data.get("comp_type"), data.get("end_type"),
         data.get("update_flag"), encoded, "tushare", batch_id, digest,
-        fetched_at,
+        fetched_at or datetime.now(),
     )
 
 

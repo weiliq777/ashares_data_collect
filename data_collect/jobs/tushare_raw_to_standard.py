@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime
+import uuid
 
 import pandas as pd
 
@@ -14,12 +15,71 @@ from data_collect.normalize.tushare_daily import normalize_daily, normalize_dail
 from data_collect.utils.db import get_connection, save_to_postgres
 
 
-def _payload_frames(table: str, chunk_size: int = 5000):
-    """使用服务端游标分块读取 JSON，避免把千万级 Raw 表整体载入内存。"""
+def _payload_frames(
+    table: str,
+    chunk_size: int = 5000,
+    *,
+    version_dataset: str | None = None,
+    key_kind: str = "security_date",
+):
+    """分块读取当前有效 Raw payload。
+
+    ``*_raw`` 保存第一次看到的业务记录，后续修订保存在
+    ``tushare_market_raw_version``。全量重建必须优先选版本层中每个业务键
+    最新的一条；只有从未进入版本层的历史记录才回退 legacy Raw。否则一次
+    全量重建会把增量任务已经接收的上游修订静默恢复成旧值。
+    """
     with get_connection() as conn:
         with conn.cursor(name=f"raw_to_standard_{table}") as cur:
             cur.itersize = chunk_size
-            cur.execute(f'SELECT payload FROM "{table}" ORDER BY 1')
+            if version_dataset is None:
+                cur.execute(f'SELECT payload FROM "{table}" ORDER BY 1')
+            elif key_kind == "calendar":
+                cur.execute(
+                    f"""
+                    WITH latest AS (
+                        SELECT DISTINCT ON (exchange, cal_date)
+                               exchange, cal_date, payload
+                          FROM tushare_market_raw_version
+                         WHERE dataset=%s
+                         ORDER BY exchange, cal_date, fetched_at DESC, record_id DESC
+                    )
+                    SELECT payload FROM latest
+                    UNION ALL
+                    SELECT legacy.payload
+                      FROM "{table}" legacy
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM tushare_market_raw_version version
+                          WHERE version.dataset=%s
+                            AND version.exchange=legacy.exchange
+                            AND version.cal_date=legacy.cal_date
+                     )
+                    """,
+                    (version_dataset, version_dataset),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    WITH latest AS (
+                        SELECT DISTINCT ON (ts_code, trade_date)
+                               ts_code, trade_date, payload
+                          FROM tushare_market_raw_version
+                         WHERE dataset=%s
+                         ORDER BY ts_code, trade_date, fetched_at DESC, record_id DESC
+                    )
+                    SELECT payload FROM latest
+                    UNION ALL
+                    SELECT legacy.payload
+                      FROM "{table}" legacy
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM tushare_market_raw_version version
+                          WHERE version.dataset=%s
+                            AND version.ts_code=legacy.ts_code
+                            AND version.trade_date=legacy.trade_date
+                     )
+                    """,
+                    (version_dataset, version_dataset),
+                )
             while True:
                 rows = cur.fetchmany(chunk_size)
                 if not rows:
@@ -27,23 +87,60 @@ def _payload_frames(table: str, chunk_size: int = 5000):
                 yield pd.json_normalize([value if isinstance(value, dict) else json.loads(value) for (value,) in rows])
 
 
-def _write_chunks(table: str, transform, chunk_size: int = 5000) -> tuple[int, int]:
+def _write_chunks(
+    table: str,
+    transform,
+    chunk_size: int = 5000,
+    *,
+    version_dataset: str | None = None,
+    key_kind: str = "security_date",
+) -> tuple[int, int]:
+    """Build a Standard table off to the side and replace it atomically."""
     attempted = affected = 0
-    for raw in _payload_frames(table, chunk_size):
-        frame = transform(raw)
-        if frame is None or frame.empty:
-            continue
-        current, inserted = save_to_postgres(frame, table_name=transform.table_name)
-        attempted += current
-        affected += inserted
-    return attempted, affected
+    target = transform.table_name
+    staging = f"_rebuild_{target}_{uuid.uuid4().hex[:12]}"
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE UNLOGGED TABLE "{staging}" (LIKE "{target}" INCLUDING ALL)')
+        conn.commit()
+    try:
+        for raw in _payload_frames(
+            table,
+            chunk_size,
+            version_dataset=version_dataset,
+            key_kind=key_kind,
+        ):
+            frame = transform(raw)
+            if frame is None or frame.empty:
+                continue
+            current, inserted = save_to_postgres(frame, table_name=staging)
+            attempted += current
+            affected += inserted
+        with get_connection() as conn, conn.cursor() as cur:
+            # MVCC readers continue seeing the previous target contents until
+            # this transaction commits; a crash never exposes an empty or
+            # partially rebuilt Standard table.
+            cur.execute(f'LOCK TABLE "{target}" IN ACCESS EXCLUSIVE MODE')
+            cur.execute(f'TRUNCATE TABLE "{target}"')
+            cur.execute(f'INSERT INTO "{target}" SELECT * FROM "{staging}"')
+            if cur.rowcount != affected:
+                raise RuntimeError(
+                    f"{target} 原子替换行数不一致: staged={affected}, copied={cur.rowcount}"
+                )
+            cur.execute(f'DROP TABLE "{staging}"')
+            conn.commit()
+        return attempted, affected
+    except Exception:
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
+            conn.commit()
+        raise
 
 
 def rebuild_daily() -> tuple[int, int]:
     def transform(frame):
         return normalize_daily(frame)
     transform.table_name = "daily_kline"
-    return _write_chunks("tushare_daily_raw", transform)
+    return _write_chunks("tushare_daily_raw", transform, version_dataset="daily")
 
 
 def rebuild_valuation() -> tuple[int, int]:
@@ -57,7 +154,7 @@ def rebuild_valuation() -> tuple[int, int]:
         frame["fetched_at"] = datetime.now()
         return frame
     transform.table_name = "valuation_daily"
-    return _write_chunks("tushare_daily_basic_raw", transform)
+    return _write_chunks("tushare_daily_basic_raw", transform, version_dataset="daily_basic")
 
 
 def rebuild_adj_factor() -> tuple[int, int]:
@@ -70,7 +167,7 @@ def rebuild_adj_factor() -> tuple[int, int]:
         frame["fetched_at"] = datetime.now()
         return frame
     transform.table_name = "adj_factor_daily"
-    return _write_chunks("tushare_adj_factor_raw", transform)
+    return _write_chunks("tushare_adj_factor_raw", transform, version_dataset="adj_factor")
 
 
 def rebuild_calendar() -> tuple[int, int]:
@@ -83,7 +180,10 @@ def rebuild_calendar() -> tuple[int, int]:
         frame["fetched_at"] = datetime.now()
         return frame[["exchange", "trade_date", "is_open", "pretrade_date", "source", "fetched_at"]]
     transform.table_name = "trading_calendar"
-    return _write_chunks("tushare_trade_cal_raw", transform)
+    return _write_chunks(
+        "tushare_trade_cal_raw", transform,
+        version_dataset="trade_cal", key_kind="calendar",
+    )
 
 
 def rebuild_financial() -> tuple[int, int]:

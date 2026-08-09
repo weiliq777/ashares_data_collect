@@ -1,0 +1,7 @@
+interface:
+  display_name: "A-share Decision Audit"
+  short_description: "审计冻结快照候选与风险"
+  default_prompt: "Use $ashares-decision-audit to audit one FROZEN A-share candidate and return the required JSON."
+
+policy:
+  allow_implicit_invocation: true

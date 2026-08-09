@@ -6,7 +6,16 @@ from data_collect.jobs.research_snapshot import (
     _manifest_hash,
     _row_bytes,
     _lineage_sql,
+    _stock_snapshot_sql,
 )
+
+
+def test_snapshot_freeze_rechecks_baseline_and_quality_gate():
+    source = __import__("pathlib").Path("data_collect/jobs/research_snapshot.py").read_text(encoding="utf-8")
+    assert '_baseline(manifest["cutoff"], manifest["baseline"], conn)' in source
+    assert 'quality_hash != manifest["quality_hash"]' in source
+    assert "def _manifest(conn, snapshot_id: str, *, for_update: bool = False)" in source
+    assert "_manifest(conn, snapshot_id, for_update=True)" in source
 
 
 def test_row_hash_is_deterministic_for_same_values():
@@ -42,14 +51,15 @@ def test_snapshot_input_definitions_are_explicit_and_unique():
 def test_lineage_contract_has_all_required_groups():
     assert set(REQUIRED_LINEAGE_GROUPS) == {
         "universe", "tradeability", "price", "valuation", "financial",
-        "shareholder_return", "lifecycle", "instrument",
+        "shareholder_return", "lifecycle", "instrument", "market_facts",
+        "fundamental_history",
     }
 
 
 def test_lineage_sql_uses_real_source_metadata_for_derived_groups():
     sql = _lineage_sql()
     for source_table in (
-        "feature.price_daily_v1",
+        "feature.price_daily_v2",
         "feature.valuation_daily_v1",
         "feature.shareholder_return_v1",
         "std.security_lifecycle",
@@ -59,3 +69,18 @@ def test_lineage_sql_uses_real_source_metadata_for_derived_groups():
     assert "source_record_version" in sql
     assert "source_payload_hash" in sql
     assert "digest(" in sql
+
+
+def test_snapshot_uses_asof_lifecycle_and_not_current_status_for_history():
+    sql = _stock_snapshot_sql()
+    assert "u.is_listed_asof" in sql
+    assert "SELECT l.name, l.market" in sql
+    assert "l.effective_from <= u.trade_date" in sql
+    assert "b.payload->>'list_date'" in sql
+
+
+def test_snapshot_code_contains_adjusted_factor_vintage_gate():
+    source = __import__("pathlib").Path("data_collect/jobs/research_snapshot.py").read_text(encoding="utf-8")
+    assert "def _assert_adj_factor_vintage" in source
+    assert "a.fetched_at::date > %s" in source
+    assert "_assert_price_vintage_for_schema" in source

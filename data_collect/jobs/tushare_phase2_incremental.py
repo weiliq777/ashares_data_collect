@@ -21,6 +21,7 @@ from data_collect.jobs.tushare_phase2_raw_init import (
     _save_frame,
     _trade_dates,
 )
+from data_collect.jobs.tushare_history_init import _save_calendar
 from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.utils.db import get_connection
 
@@ -99,6 +100,26 @@ def _trading_days(end: str, lookback_days: int, cutoff):
     if not frame:
         return []
     return [day for day in frame if _date(day) > cutoff]
+
+
+def _refresh_trade_calendar(pro, start: str, end: str, dry_run: bool) -> int:
+    """Refresh the local calendar before deriving phase-2 trading-day windows.
+
+    The market-by-date job queries Tushare's calendar directly, while the
+    phase-2 job historically read only ``tushare_trade_cal_raw``.  Without
+    this refresh, a successful market increment could still leave status,
+    limit, tradeability and universe derivations stuck at the old calendar
+    cutoff.  Calendar rows are append-only and idempotent in Raw.
+    """
+    frame = call_api(pro.trade_cal, exchange="SSE", start_date=start, end_date=end)
+    rows = 0 if frame is None else len(frame)
+    if dry_run:
+        logger.info("dry-run trade_cal window=%s:%s api_rows=%s", start, end, rows)
+        return rows
+    if rows:
+        _save_calendar(frame, normalize_standard=True)
+    logger.info("trade_cal refreshed window=%s:%s api_rows=%s", start, end, rows)
+    return rows
 
 
 def _stock_codes() -> list[str]:
@@ -277,9 +298,9 @@ def _rebuild_standard(datasets: set[str]):
 
     feature_tasks = set()
     if datasets & set(DATE_DATASETS):
-        feature_tasks.update({"price", "valuation"})
+        feature_tasks.update({"price", "price_v2", "valuation"})
     if "dividend" in datasets:
-        feature_tasks.add("shareholder_return")
+        feature_tasks.update({"price_v2", "shareholder_return"})
     if feature_tasks:
         for task in sorted(feature_tasks):
             logger.info("rebuilding phase2 feature task=%s", task)
@@ -295,6 +316,7 @@ def run(
     baseline_cutoff: str | None = None,
     dry_run: bool = False,
     rebuild_standard: bool = True,
+    run_date: str | None = None,
 ) -> str:
     allowed = {"all", "date", "dividend", "namechange", "index_daily"}
     if dataset not in allowed:
@@ -302,8 +324,15 @@ def run(
     if lookback_days <= 0 or event_lookback_days <= 0:
         raise ValueError("lookback_days 和 event_lookback_days 必须大于 0")
 
-    end = end_date or date.today().strftime("%Y%m%d")
+    if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
+        raise ValueError("end_date 与 run_date 不一致")
+    end = (end_date or run_date or date.today().strftime("%Y%m%d")).replace("-", "")
     cutoff = _baseline_cutoff(baseline_cutoff)
+    calendar_start = (
+        pd.to_datetime(end) - timedelta(days=max(lookback_days * 3, 10))
+    ).strftime("%Y%m%d")
+    pro = get_pro()
+    _refresh_trade_calendar(pro, calendar_start, end, dry_run)
     trade_days = _trading_days(end, lookback_days, cutoff)
     event_start = max(cutoff + timedelta(days=1), datetime.strptime(end, "%Y%m%d").date() - timedelta(days=event_lookback_days - 1))
     event_days = _calendar_days(event_start, datetime.strptime(end, "%Y%m%d").date())
@@ -312,7 +341,6 @@ def run(
     if not event_days and dataset in {"all", "dividend", "namechange"}:
         logger.warning("基线之后没有可用事件日期，event 任务跳过")
 
-    pro = get_pro()
     batch_id = f"phase2-incremental-{uuid.uuid4().hex}"
     selected = {"stock_st", "suspend_d", "stk_limit", "dividend", "namechange", "index_daily"} if dataset == "all" else set()
     if dataset == "date":

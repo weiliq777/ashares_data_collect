@@ -1,6 +1,10 @@
 # Research 快照实施设计 v1
 
-更新时间：2026-08-05
+更新时间：2026-08-08
+
+当前运行基线：`baseline_20260806` 已通过质量门禁并保存完整 `source_manifest_hash`，状态为 `validated`；旧 `baseline_20260803` 仅保留为 `superseded` 审计记录。正式 `research-v1.3` 快照仍需基于该基线重新生成并完成 `build → validate → freeze`，不得复用旧版快照系列。
+
+多日期生成使用 `data_collect.jobs.research_snapshot_series`：Manifest 采用批量 `execute_values`，股票快照、血缘和输入统计按每批 10 个截止日集合写入；每个 `snapshot_id` 仍保持单日粒度，`validate` 保留逐日审计语义。默认只完成 `build → validate`，正式 `freeze` 仍要求干净 Git 或显式代码归档。
 
 ## 1. 目标与边界
 
@@ -8,7 +12,9 @@ Research 快照是 PIT/Feature 到 Research/Backtest 的不可变边界。第一
 `snapshot_id` 只对应一个 `research_cutoff_date`；快照生成器可以读取通过质量门禁的
 PIT/Feature，Research 分析和 Backtest 只允许读取 `FROZEN` 快照。
 
-本阶段只建立可复现基础，不自动生成正式快照、不接入自动交易。
+本设计已完成可复现基础实现；当前不自动生成新的正式快照、不接入自动交易。数据库中已有的旧
+`research-v1` FROZEN 快照只读保留，新正式 Backtest 只能使用重新生成并验收通过的
+`research-v1.3` 快照系列。
 
 ## 2. 数据对象
 
@@ -18,7 +24,7 @@ PIT/Feature，Research 分析和 Backtest 只允许读取 `FROZEN` 快照。
 |---|---|
 | `research.snapshot_manifest` | 快照身份、基线、代码、质量和状态 |
 | `research.snapshot_input` | 本次实际使用的表切片、字段、行数、日期范围和内容哈希 |
-| `research.stock_snapshot_daily` | 指定截止日的统一个股研究输入 |
+| `research.stock_snapshot_daily` | 指定截止日的统一个股研究输入，含 PIT `eligible_by_market` |
 | `research.snapshot_lineage` | 快照字段组到 PIT/Feature/Standard 记录的来源血缘 |
 
 `stock_snapshot_daily.research_date` 必须等于 Manifest 的
@@ -31,7 +37,7 @@ PIT/Feature，Research 分析和 Backtest 只允许读取 `FROZEN` 快照。
 - `snapshot_id`：UUID，数据库主键且不可复用；
 - `research_cutoff_date`：研究截止日；
 - `data_baseline_tag`：必须指向 `tushare_data_release.status='validated'`；
-- `schema_version`：Research 模型版本；
+- `schema_version`：Research 模型版本；当前新建快照使用 `research-v1.3`，使用 `feature.price_daily_v2` 的时点总回报指标，并哈希 PIT `eligible_by_market` 及成熟度字段；旧版本 FROZEN 快照只读保留，不能回写升级；
 - `code_version`：Git commit，工作区有修改时追加 `+dirty`；
 - `git_commit`、`git_dirty`、`diff_hash`、`code_archive_path`：代码可复现信息；
 - `quality_report_hash`、`quality_report`：生成前质量门禁结果；
@@ -49,13 +55,26 @@ PIT/Feature，Research 分析和 Backtest 只允许读取 `FROZEN` 快照。
 ```text
 pit.universe_daily
 pit.security_tradeability_daily
-feature.price_daily_v1
+feature.price_daily_v2
 feature.valuation_daily_v1
 pit.financial_asof
+public.daily_kline
+std.security_status_daily
 feature.shareholder_return_v1
-stock_basic_info
+public.tushare_stock_basic_raw_version（受 validated baseline record_id 上限约束）
 std.security_lifecycle
 ```
+
+股票名称、市场和历史状态不能直接使用当前 `stock_basic_info` 倒灌到历史日期。
+Snapshot 生成时以 `pit.universe_daily` 的上市状态和 `std.security_lifecycle` 的有效区间
+为时点权威；`tushare_stock_basic_raw_version` 只提供基准内的代码、静态身份和上市/退市
+日期字段，并将尚未到达研究日的日期裁剪为 NULL。
+
+价格 Feature 使用 `feature.price_daily_v2` 的时点总回报坐标：只纳入
+`std.dividend_event.implementation_status='实施'` 且 `ex_date <= trade_date` 的公司行为。
+`feature.price_daily_v1` 仍保留为只读兼容表，不再作为新 Research/Backtest 的正式输入。
+`price_daily_v2` 不依赖后来抓到的最终 `adj_factor`，因此不需要伪造历史 `fetched_at`；
+Raw/Standard/PIT 数据仍全部保留并可追溯。
 
 `content_hash` 只计算本次切片和选定字段，不计算整张物理表。每个输入记录：
 
@@ -149,3 +168,26 @@ source_payload_hash
 - `FROZEN` 后 Manifest、输入统计、股票快照和血缘的更新/删除均失败；
 - 正式 Backtest 接口拒绝非 `FROZEN` 快照。
 
+## 9. 重跑与正式冻结规则（2026-08-06）
+
+`research.snapshot_manifest` 对 `(research_cutoff_date, data_baseline_tag, schema_version)`
+建立唯一逻辑键。`research_snapshot_series.py` 重跑时复用 DRAFT/FAILED 快照，
+不重建 VALIDATED/FROZEN 快照；并发发现 BUILDING 快照时直接失败，避免两个任务同时写入。
+
+正式 `freeze` 会再次检查 validated 基线和质量报告哈希，避免 validate 之后基线降级或质量门禁变化仍被发布；只接受干净 Git 工作区，若确需脏工作区，必须提供已存在的代码归档路径。
+`diff_hash` 只用于审计，不能单独替代可复现代码。
+
+快照系列任务还会校验每个截止日属于 SSE 开市日；当前正式 Backtest 适配器只接受
+`research-v1.3`（包含时点价格 Feature、`eligible_by_market` 及成熟度字段），已有旧 `research-v1`/`research-v1.1`/`research-v1.2` FROZEN 快照只读保留，
+不得静默升级或作为正式 Dataset 输入。
+## 2026-08-07 当前状态覆盖
+
+Snapshot 基础代码此前生成过三份 `research-v1.1` FROZEN 日快照（2026-07-30、2026-07-31、2026-08-03），并物化到旧版三日烟测 Dataset；它们继续只读保留，不自动升级。当前正式生产目标是重新生成 `research-v1.3` 系列。
+
+阶段三当前仍需补齐完整评价区间的逐 SSE 开市日 Snapshot 系列；三日 Snapshot 仅用于 Baseline 烟测，不能代表五年回测结果。Snapshot 生成器可以读取通过质量门禁的 PIT/Feature，但 Research/Backtest 只能读取 FROZEN 快照。
+
+## 2026-08-08 数据库复核
+
+实现默认版本已升级为 `research-v1.3`，并启用成熟度/PIT 检查、时点价格 Feature 及 Snapshot 输入边界锁。数据库当前没有 FROZEN `research-v1.3` 快照；已有 `research-v1.1` 记录为历史数据：690 条 FROZEN、1 条 DRAFT，`2021-08-02` 至 `2026-08-03` 的 SSE 开市日缺少 522 个，且 FROZEN 记录存在 dirty 代码/基线哈希缺口。它们只读保留，不能作为当前 Backtest Dataset v2 的正式输入。正式生产必须在干净代码版本上重新生成 `research-v1.3` 系列。
+
+当前 `baseline_20260803` 的数据库记录虽然为 `validated`，但 `source_manifest_hash/source_manifest` 为空；现行代码会在 Snapshot 创建前拒绝该基线。这是保护性门禁，不应通过手工填空值绕过；必须在 Raw/Standard/PIT/Feature 稳定后发布带完整 Source Manifest 的新基线。

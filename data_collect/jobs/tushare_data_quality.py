@@ -43,6 +43,8 @@ CHECKS = {
     "pit.security_tradeability_daily": ("trade_date", "ts_code"),
     "pit.financial_asof": ("decision_date", "ts_code"),
     "feature.price_daily_v1": ("ts_code", "trade_date"),
+    "feature.price_adjustment_factor_asof": ("ts_code", "trade_date"),
+    "feature.price_daily_v2": ("ts_code", "trade_date"),
     "feature.valuation_daily_v1": ("ts_code", "trade_date"),
     "feature.company_financial_v1": ("ts_code", "report_date", "source_record_key", "record_version"),
     "feature.shareholder_return_v1": ("ts_code", "asof_date"),
@@ -78,6 +80,8 @@ DATE_COLUMNS = {
     "pit.security_tradeability_daily": "trade_date",
     "pit.financial_asof": "decision_date",
     "feature.price_daily_v1": "trade_date",
+    "feature.price_adjustment_factor_asof": "trade_date",
+    "feature.price_daily_v2": "trade_date",
     "feature.valuation_daily_v1": "trade_date",
     "feature.company_financial_v1": "report_date",
     "feature.shareholder_return_v1": "asof_date",
@@ -232,8 +236,67 @@ def inspect_phase2_invariants() -> dict:
     queries = {
         "financial_future_rows": """
             SELECT COUNT(*) FROM pit.financial_asof
-            WHERE effective_announce_date IS NOT NULL
-              AND effective_announce_date > decision_date
+            WHERE (effective_announce_date IS NOT NULL
+                   AND effective_announce_date > decision_date)
+               OR (version_available_date IS NOT NULL
+                   AND version_available_date > decision_date)
+        """,
+        "financial_standard_invalid_version_availability": """
+            SELECT SUM(failures) FROM (
+              SELECT COUNT(*) FILTER (WHERE version_available_date IS NULL
+                    OR version_available_date < effective_announce_date) AS failures
+                FROM fina_indicator_standard
+              UNION ALL
+              SELECT COUNT(*) FILTER (WHERE version_available_date IS NULL
+                    OR version_available_date < announce_date)
+                FROM financial_income_standard
+              UNION ALL
+              SELECT COUNT(*) FILTER (WHERE version_available_date IS NULL
+                    OR version_available_date < announce_date)
+                FROM financial_balance_sheet_standard
+              UNION ALL
+              SELECT COUNT(*) FILTER (WHERE version_available_date IS NULL
+                    OR version_available_date < announce_date)
+                FROM financial_cash_flow_standard
+            ) x
+        """,
+        "financial_feature_invalid_version_availability": """
+            SELECT COUNT(*) FROM feature.company_financial_v1
+            WHERE version_available_date IS NULL
+               OR version_available_date < effective_announce_date
+        """,
+        "financial_vintage_metadata_missing_or_backdated": """
+            SELECT SUM(failures) FROM (
+              SELECT COUNT(*) FILTER (WHERE vintage_quality IS NULL
+                    OR source_observed_at IS NULL
+                    OR (vintage_quality='WAREHOUSE_OBSERVED_ONLY'
+                        AND version_available_date < source_observed_at::date)) AS failures
+                FROM fina_indicator_standard
+              UNION ALL
+              SELECT COUNT(*) FILTER (WHERE vintage_quality IS NULL
+                    OR source_observed_at IS NULL
+                    OR (vintage_quality='WAREHOUSE_OBSERVED_ONLY'
+                        AND version_available_date < source_observed_at::date))
+                FROM financial_income_standard
+              UNION ALL
+              SELECT COUNT(*) FILTER (WHERE vintage_quality IS NULL
+                    OR source_observed_at IS NULL
+                    OR (vintage_quality='WAREHOUSE_OBSERVED_ONLY'
+                        AND version_available_date < source_observed_at::date))
+                FROM financial_balance_sheet_standard
+              UNION ALL
+              SELECT COUNT(*) FILTER (WHERE vintage_quality IS NULL
+                    OR source_observed_at IS NULL
+                    OR (vintage_quality='WAREHOUSE_OBSERVED_ONLY'
+                        AND version_available_date < source_observed_at::date))
+                FROM financial_cash_flow_standard
+            ) x
+        """,
+        "financial_pit_vintage_future_rows": """
+            SELECT COUNT(*) FROM pit.financial_asof
+             WHERE vintage_quality IS NULL OR source_observed_at IS NULL
+                OR (vintage_quality='WAREHOUSE_OBSERVED_ONLY'
+                    AND source_observed_at::date > decision_date)
         """,
         "tradeability_null_buy_sell": """
             SELECT COUNT(*) FROM pit.security_tradeability_daily
@@ -244,7 +307,7 @@ def inspect_phase2_invariants() -> dict:
             WHERE is_tradeable IS TRUE AND (close_price IS NULL OR close_price <= 0)
         """,
         "missing_adj_factor_feature_rows": """
-            SELECT COUNT(*) FROM feature.price_daily_v1
+            SELECT COUNT(*) FROM feature.price_daily_v2
             WHERE quality_status = 'MISSING_SOURCE'
         """,
         "raw_phase2_failed_checkpoints": """
@@ -253,13 +316,22 @@ def inspect_phase2_invariants() -> dict:
               AND status = 'failed'
         """,
         "fina_indicator_standard_missing_or_yoy": """
-            SELECT COUNT(*) FROM fina_indicator_raw_version r
-            WHERE (r.payload ? 'or_yoy')
-              AND NOT EXISTS (
-                  SELECT 1 FROM fina_indicator_standard s
-                  WHERE s.source_record_key = r.business_key
-                    AND s.payload_hash = r.payload_hash
-              )
+            /*
+             * The immutable version table may contain the same payload under
+             * legacy business-key spellings.  Standard deliberately keeps one
+             * row per payload_hash, so lineage completeness must be checked at
+             * the payload level rather than treating duplicate source keys as
+             * missing facts.
+             */
+            SELECT COUNT(*) FROM (
+              SELECT DISTINCT r.payload_hash
+                FROM fina_indicator_raw_version r
+               WHERE r.payload ? 'or_yoy'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM fina_indicator_standard s
+                      WHERE s.payload_hash = r.payload_hash
+                 )
+            ) missing
         """,
         "fina_indicator_standard_missing_lineage": """
             SELECT COUNT(*) FROM fina_indicator_standard
@@ -275,10 +347,24 @@ def inspect_phase2_invariants() -> dict:
             WHERE s.or_yoy IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM feature.company_financial_v1 f
-                  WHERE f.source_record_key = s.source_record_key
-                    AND f.record_version = s.record_version
+                  WHERE f.ts_code=s.ts_code AND f.report_date=s.report_date
+                    AND f.version_available_date=s.version_available_date
                     AND f.revenue_yoy = s.or_yoy
               )
+        """,
+        "immature_price_features_exposed": """
+            SELECT COUNT(*) FROM feature.price_daily_v2
+             WHERE (ma20 IS NOT NULL AND COALESCE(ma20_observation_count,0)<20)
+                OR (ma60 IS NOT NULL AND COALESCE(ma60_observation_count,0)<60)
+                OR (ma120 IS NOT NULL AND COALESCE(ma120_observation_count,0)<120)
+        """,
+        "immature_valuation_percentiles_exposed": """
+            SELECT COUNT(*) FROM feature.valuation_daily_v1
+             WHERE pe_pct_5y IS NOT NULL AND (
+                   NOT COALESCE(has_full_pe_5y_history,FALSE)
+                   OR COALESCE(pe_observation_count_5y,0)<1000
+                   OR pe_window_start_date_5y IS NULL
+                   OR trade_date-pe_window_start_date_5y<1794)
         """,
     }
     result = {}

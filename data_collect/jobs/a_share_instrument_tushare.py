@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
+import uuid
 import pandas as pd
 
 from data_collect.providers.tushare_client import call_api, get_pro
@@ -13,14 +16,27 @@ def run(run_date: str, **kwargs) -> str:
     if df is None or df.empty:
         return "Tushare stock_basic 无数据"
     raw_rows = df.astype(object).where(pd.notna(df), None).to_dict("records")
+    batch_id = f"stock-basic-{run_date}-{uuid.uuid4().hex}"
     with get_connection() as conn:
         with conn.cursor() as cur:
             for row in raw_rows:
-                import json
+                encoded = json.dumps(
+                    row, ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"),
+                )
+                payload_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                business_key = str(row["ts_code"])
                 cur.execute(
-                    "INSERT INTO tushare_stock_basic_raw (ts_code,payload) VALUES (%s,%s) "
-                    "ON CONFLICT (ts_code) DO UPDATE SET payload=EXCLUDED.payload,fetched_at=CURRENT_TIMESTAMP",
-                    (row["ts_code"], json.dumps(row, ensure_ascii=False, allow_nan=False)),
+                    """INSERT INTO tushare_stock_basic_raw_version
+                       (ts_code,business_key,payload,payload_hash,batch_id)
+                       VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT (business_key,payload_hash) DO NOTHING""",
+                    (row["ts_code"], business_key, encoded, payload_hash, batch_id),
+                )
+                cur.execute(
+                    """INSERT INTO tushare_stock_basic_raw (ts_code,payload)
+                       VALUES (%s,%s) ON CONFLICT (ts_code) DO NOTHING""",
+                    (row["ts_code"], encoded),
                 )
         conn.commit()
     out = df.rename(columns={"ts_code": "stock_code"}).copy()

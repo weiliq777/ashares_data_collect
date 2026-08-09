@@ -60,6 +60,9 @@ adj_factor  → tushare_adj_factor_raw  → adj_factor_daily
 
 重复运行允许捕获接口修正；Standard 按交易日重建，Raw 版本表按内容哈希幂等保存。正式任务不能使用 `--limit-stocks` 或 `--dry-run`。
 
+覆盖率门禁的 PASS 只证明接口响应行数达到历史基准；如果 Raw/Standard/checkpoint 或
+全局派生重建在之后失败，任务会追加最新 `BLOCKED` 门禁，Research 冻结会拒绝使用该日数据。
+
 该任务对 `daily`、`daily_basic`、`adj_factor` 都调用 `trade_date=YYYYMMDD`，每次运行每个数据集每个交易日只请求一次；最近 5 个交易日允许重复回补，以便捕获接口修正。Raw 仍通过版本表幂等保存，Standard 按日重建。正式任务示例：
 
 ```powershell
@@ -94,6 +97,17 @@ data_collect.jobs.tushare_adj_factor_incremental_retry
 ```
 
 正常每日任务必须优先使用按交易日脚本；接口达到返回上限时由正式脚本自动按代码分片，并拒绝把截断结果标记为完成。
+
+历史初始化脚本同样对 `daily`、`daily_basic` 做上限保护：单个交易日首次返回达到接口
+行数上限时，会按当前 L/D/P/G 股票代码列表分片重新请求并按
+`ts_code + trade_date` 去重后写入 Raw 版本层。新写入的 checkpoint 保存本次 Raw 版本
+行数，续跑时会检查 Raw 行数不低于 checkpoint；旧的 `rows_written=0` checkpoint 只能
+证明该日曾有数据，不能证明完整覆盖，正式验收仍必须执行交易日覆盖与行数审计。
+
+Research 时点安全：`adj_factor_daily` 的最终复权值不能直接视为历史当时可见。正式
+Research Snapshot 在创建、构建、校验和冻结阶段，要求技术预热窗口内每条日线都有
+`fetched_at <= research_cutoff_date` 的复权因子；不满足时 fail-closed，先补齐对应
+vintage 后再生成快照，不回写或删除 Raw。
 
 历史 Raw/Standard 验收后，使用 `tushare_release.py` 建立并验收基线。只有 `validated` 基线才能被任务自动读取：
 

@@ -1,6 +1,36 @@
 # 当前金融数据模型与来源说明
 
-更新时间：2026-08-05
+## 2026-08-07 手动每日决策层
+
+新增 `research.candidate_run`、`research.candidate`、`research.ai_audit`、
+`research.human_decision` 和 `portfolio.snapshot_binding`。它们把一个
+FROZEN Snapshot 的策略候选、AI 反方审计、人工作决定和纸面组合意图串成
+可追溯链路；`portfolio.order_intent.source_type=DAILY_SIGNAL` 必须同时匹配
+候选哈希、AI 审计、Snapshot 和 `PENDING_APPROVAL` 状态。
+
+`skills/ashares-decision-audit` 是手动 Skill：候选包和历史数据读取受
+截止日期约束，AI 只能返回 `ai-audit-v1` JSON。当前版本没有调度器、券商
+连接或自动交易；人工作决定后仍需单独批准纸面意图和录入 `PAPER_MANUAL`
+成交。
+
+## 2026-08-07 当前开发状态
+
+阶段三核心代码已完成并通过验证；三日 Baseline Dataset/Run 已真实执行并通过订单、现金、输入哈希和 Raw 不变性审计。当前生产数据库存在三日 FROZEN Dataset 和 SUCCEEDED Run，但尚未生成完整五年历史 Dataset/Run。
+
+完整历史回测前仍需生成每个 SSE 开市日的 `research-v1.3` FROZEN Snapshot，重新执行 v2 Dataset `build→validate→freeze` 和正式 Run 对账。自动实盘交易不在当前范围，Portfolio 保留人工 `PAPER_MANUAL` Air-Gap。完整代码路径和当前 ID 见 `dev_doc/current_implementation_state_20260807.md`。
+
+## 2026-08-06 阶段三生产增强字段
+
+当前 Backtest/Portfolio 模型已补齐以下能力（Raw 层保持只读）：
+
+- `backtest.order`：`requested_shares`、`planned_shares`、`actual_shares`、`order_audit_hash`、`volume_capacity_shares`、`liquidity_status`、`liquidity_reject_reason`、`risk_policy_version`、理论股数/所需资金/止损风险/跳空压力/费用/滑点/实际风险字段。
+- `portfolio.order_intent`：`source_type` 支持 `BACKTEST`，并通过 `source_backtest_run_id`、`source_backtest_order_id`、`source_dataset_id`、`source_signal_id`、`source_order_hash` 建立可审计血缘；BACKTEST 只能进入 `PENDING_APPROVAL`，成交仍固定为 `PAPER_MANUAL`。
+- `sql/032_backtest_portfolio_airgap.sql` 是上述字段和触发器的迁移；它不创建、修改或删除任何 `tushare_*_raw` 表。
+- Dataset 对非停牌异常成交量/成交额执行失败门禁；规则 JSON 的 `max_volume_participation_pct`、`liquidity_policy` 会进入冻结后的执行规则。期末假设清仓以 `END_OF_DATA_LIQUIDATION` Metric/审计元数据保存，不写入真实 Fill。
+
+执行单位口径：Tushare Raw 的 `daily.vol` 为手、`daily.amount` 为千元；Backtest Dataset 物化后分别统一为股、元。后续任何执行适配器都必须使用标准单位，不得再次乘系数。
+
+更新时间：2026-08-06
 
 本文只描述当前实际启用、已接入或作为分析主模型使用的数据。不列出尚未启用、依赖QMT/MiniQMT且当前为空的QMT专用表。
 
@@ -388,7 +418,7 @@ QMT/MiniQMT               当前不启用
 
 ## 11. 完整性审计与当前状态
 
-截至 2026-08-05，以下为当前真实状态；“每日增量”表示持续运行机制，不代表历史基线未完成：
+截至 2026-08-06，以下为当前真实状态；“每日增量”表示持续运行机制，不代表历史基线未完成：
 
 | 项目 | 当前状态 | 影响 |
 |---|---|---|
@@ -402,14 +432,10 @@ QMT/MiniQMT               当前不启用
 | Research 快照 | 已生成并冻结正式快照 `9afb9a08...` | 当前只有一个截止日，足够研究观察池，不足以直接支撑历史回测 |
 | Research 观察池与证据 | 已建立 ACTIVE 观察池和 PostgreSQL 事实引用；外部证据候选检索已实现 | 外部证据仍需人工核验后绑定 |
 
-因此，当前数据模型和阶段二基线已经足以进入 Research/Backtest 开发，但不能用单一
-`2026-08-03` FROZEN 快照直接回测历史策略。下一步顺序为：
-
-1. 完成外部证据人工核验和 supporting/contrary 引用绑定。
-2. 设计多个历史截止日的 FROZEN 快照，或建立引用多个日快照的 Backtest Dataset Manifest。
-3. 冻结 Backtest 表结构、输入契约和快照依赖。
-4. 实现回测引擎，并处理费用、停牌、涨跌停、分红、退市和信号/成交时间。
-5. 完成回测质量验证；暂不接入自动下单。
+这里的状态表只描述阶段二基线；早期“下一步”清单已由阶段三实现取代。当前以第 19 节门禁为准：
+Backtest/Portfolio 代码和契约已落地，但单一 `2026-08-03` 旧版 FROZEN 快照不能直接
+支撑历史回测；正式运行仍需多个 `research-v1.2` FROZEN 快照、经确认的有效日期市场/费用规则
+以及干净 Git 版本。外部证据绑定仍是 Research 审计工作，不得成为回测输入的隐式替代品。
 ### 11.1 原始市场数据表（新增）
 
 为保证接口异常、字段映射错误或标准模型调整后可以离线重算，行情类数据统一采用 raw 原始层加标准层双层保存。新增迁移文件为 `sql/014_create_tushare_market_raw.sql`。
@@ -487,7 +513,7 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 - `pit.universe_daily`：按历史日期还原研究范围，保留退市股票，不使用当前幸存者名单替代历史集合。
 - `pit.security_tradeability_daily`：按停牌、价格和涨跌停区分可交易、可买、可卖；ST 是风险状态，不自动等同于不可交易。
 - `pit.financial_asof`：只使用 `effective_announce_date <= decision_date` 的财务记录；当前财务指标 Standard 未提供的 `f_ann_date` 等字段保持 NULL，不伪造。
-- `feature.price_daily_v1`、`feature.valuation_daily_v1`、`feature.company_financial_v1`、`feature.shareholder_return_v1`：分别提供价格趋势、估值分位、财务质量和股东回报特征，均记录质量状态和来源日期。
+- `feature.price_daily_v2`、`feature.valuation_daily_v1`、`feature.company_financial_v1`、`feature.shareholder_return_v1`：分别提供时点价格趋势、估值分位、财务质量和股东回报特征，均记录质量状态和来源日期；`price_daily_v1` 仅作只读兼容。
 
 阶段二当前进度以 `dev_doc/phase2_implementation.md` 和 `dev_doc/agent_tasks.md` 为准；旧的阶段一状态描述仅作历史记录，不代表当前进度。
 
@@ -495,7 +521,7 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 
 新增控制表 `tushare_data_release`：记录历史基线标签、截止日、验收状态和质量报告哈希。`draft` 仅用于准备，`validated` 才能被增量任务自动读取；`superseded` 保留历史发布审计记录。
 
-## 15. Research 快照模型（2026-08-05）
+## 15. Research 快照模型（2026-08-06）
 
 阶段三使用 `research.snapshot_manifest` 作为 Research/Backtest 的不可变边界。
 快照生成器可以读取通过质量门禁的 PIT/Feature，但 Research 分析和 Backtest
@@ -507,7 +533,7 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 
 - `research.snapshot_manifest`：基线标签、Schema 版本、Git commit/dirty/diff、质量哈希、输入汇总哈希和状态；
 - `research.snapshot_input`：本次实际切片的筛选条件、字段集合、哈希算法、行数、日期范围和内容哈希；
-- `research.stock_snapshot_daily`：指定截止日的个股研究输入；
+- `research.stock_snapshot_daily`：指定截止日的个股研究输入，包含 PIT 的 `eligible_by_market` 交易范围事实；
 - `research.snapshot_lineage`：字段组到来源表、记录键、版本和 payload 哈希的血缘。派生 PIT/Feature v1 记录使用实际字段哈希和 v1 版本；财务、生命周期使用真实 Raw/Standard 版本链路；非缺失来源缺少版本或哈希时由快照校验拒绝。
 
 `sql/024_create_research_snapshot.sql` 通过触发器禁止非法状态流转、删除 Manifest，
@@ -519,7 +545,14 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 `baseline_20260803`，包含 5,535 条股票快照、8 张输入统计和 44,280 条血缘记录。
 该快照基于干净 Git commit `658a8c8` 生成并通过 build、validate、freeze。
 
-## 16. Research 观察池与证据引用模型（2026-08-05）
+Backtest Dataset 除保存 `data_baseline_tag` 外，还必须保存创建时读取的
+`baseline_quality_report_hash`；该值进入 Dataset `input_manifest_hash`，并由数据库
+触发器校验与当前 validated 发布点一致。基线质量报告变化后，旧 Dataset 不得继续
+build/validate/freeze，必须重新创建。送转股份在 Backtest v1 中按
+`floor(entitled_shares * stock_rate)` 只记整数股，零碎部分不产生持仓或现金补偿；
+真实券商零碎股政策需通过新的规则版本单独建模。
+
+## 16. Research 观察池与证据引用模型（2026-08-06）
 
 Research 观察池建立在 FROZEN 快照之上，不读取实时 PIT/Feature，不修改 Raw/Standard/PIT/Feature，
 也不自动下单。相关迁移为 `sql/026_create_research_watchlist.sql` 和
@@ -544,3 +577,124 @@ Research 观察池建立在 FROZEN 快照之上，不读取实时 PIT/Feature，
 `REVIEW_REQUIRED`，不会自动写入证据表。当前真实联调未命中 3 个成员的股票标签，
 名称文本搜索存在误匹配风险，不能直接作为 supporting 或 contrary 证据；必须人工核验后使用
 `add_evidence` 绑定真实文档。
+## 17. Backtest Dataset/Run 模型（2026-08-06）
+
+阶段三新增迁移：`sql/028_create_backtest_model.sql` 和审计收口迁移
+`sql/031_phase3_final_audit_contract.sql`。它们不替换任何 Raw/Standard/PIT/Feature
+表，而是把已冻结的 Research 输入复制成不可变回测数据集。
+
+| 表 | 含义 | 主要来源/用途 |
+|---|---|---|
+| `backtest.dataset_manifest` | Dataset 版本、基线、warmup/evaluation、规则版本、切片哈希和冻结状态 | 多个 `research.snapshot_manifest` 的组合清单 |
+| `backtest.dataset_member` | 每个研究日的 Snapshot 成员、warm-up/evaluation 角色、行数、行情切片哈希和公司行为切片哈希 | `research.stock_snapshot_daily`、`std.dividend_event` |
+| `backtest.dataset_execution_bar` | 冻结的原始 OHLC、成交量、涨跌停、可交易状态及来源版本/哈希 | `tushare_market_raw_version` 优先、无版本时回退 `tushare_daily_raw`，并结合 `std.security_status_daily`、`pit.security_tradeability_daily`；历史未建立 Raw version 的记录允许版本号为空，但必须有选中 payload 的确定性哈希 |
+| `backtest.dataset_calendar` | 回测区间的交易日历切片和来源哈希 | `trading_calendar` |
+| `backtest.dataset_dividend_event` | 实施分红/送转事件切片及版本血缘 | `std.dividend_event` |
+| `backtest.market_rule_effective` | 按市场和生效日期配置的整手、T+1、价位、费用、滑点和资金结算规则 | 人工审定配置，不从当前规则隐式回退 |
+| `backtest.dataset_rule_snapshot` | Dataset 冻结时实际采用的规则副本及哈希 | `market_rule_effective` |
+| `backtest.strategy_definition` | 追加式策略名称、版本、参数哈希和代码版本 | 确定性策略实现 |
+| `backtest.run_manifest` | 单次回测的 Dataset、策略、现金、规则、代码和运行状态 | 只接受 FROZEN Dataset |
+| `backtest.signal/order/fill` | 信号（含 `signal_score`）、订单（含 T 收盘计划股数与 T+1 实际股数）、成交/拒单/过期事件 | 纯 Python 日线引擎结果 |
+| `backtest.position_lot/position_daily` | 持仓批次、T+1 可卖日、每日持仓估值；送转形成 `CORPORATE_ACTION` 批次并保留事件键 | 成交事件、公司行为和原始收盘价 |
+| `backtest.cash_ledger/performance_daily/metric` | 现金账本、每日权益和绩效指标（含最后收盘估值、假设清仓估值及不可直接清仓计数） | 回测结算结果 |
+
+当前实现规则：T 收盘生成信号、T+1 开盘尝试成交、只做多、不模拟部分成交；同日 BUY 按
+`signal_score DESC, ts_code ASC` 排序，正式 Run 必须显式设置组合总风险上限，T+1 开盘按实际价格重算股数；
+复权价格只用于
+指标，原始 OHLC 用于成交/止损；配股暂不模拟。Dataset/Run 冻结要求干净 Git commit，
+脏工作区必须提供存在的代码归档；FROZEN 或 SUCCEEDED 后数据库触发器禁止改写/删除。
+`market_rule_effective` 和 `dataset_rule_snapshot` 同时保存 `market_rule_version`、
+`fee_rule_version`，物化时按两者和有效日期筛选，禁止仅按一个可变规则名或 Python 默认值回退。
+送转事件以 `stk_div` 合计为唯一有效送转率，合计与送股/转增分项不一致时拒绝验收；
+除权日会调整持仓/待成交订单的原始止损坐标，退市持仓未形成真实退出事件时回测 fail-closed。
+执行行情版本存在时只解析一个完整 payload，不在新旧 Raw 之间按字段拼接；Run 的输入哈希和规则版本
+由数据库触发器强制与 Dataset 一致。
+
+当前数据库尚未具备正式 Dataset：交易日历已由 Raw 重建并覆盖到 2026-08-03，与现有 FROZEN
+Research Snapshot 截止日一致；但 `backtest.market_rule_effective` 尚未配置，且当前只有一个日
+FROZEN Research Snapshot。因此现阶段只能继续做代码/契约验证，不能伪造日期、费用或市场规则后
+启动正式回测。
+
+## 18. Portfolio 模拟组合模型（2026-08-06）
+
+阶段三新增迁移：`sql/029_create_portfolio_model.sql`。Portfolio 只接受人工批准的模拟成交，
+不连接券商、不发送真实订单，也不生成历史信号。组合必须绑定同一 `FROZEN` Research Snapshot；
+可选的观察池必须是该快照下的 `ACTIVE` 观察池。
+
+| 表 | 含义 | 主要来源/用途 |
+|---|---|---|
+| `portfolio.account_manifest` | 组合版本、快照、整手/T+1/现金结算/费用/预留现金/最小价位规则和状态 | FROZEN Snapshot / ACTIVE Watchlist |
+| `portfolio.order_intent` | 人工或研究产生的待批准交易意图及状态 | Research 观察结果，不能直接成交 |
+| `portfolio.trade_fill` | 仅 `PAPER_MANUAL` 的模拟成交及费用/滑点 | 人工批准的成交输入 |
+| `portfolio.position_lot` | 按成交批次记录开仓、T+1 可卖日、剩余数量和关闭信息 | `trade_fill` |
+| `portfolio.cash_ledger` | 初始化、买卖、分红/调整的追加式现金账本 | 组合事件 |
+| `portfolio.position_daily/performance_daily` | 每日持仓与总权益估值；保存 `source_snapshot_id` 和 `valuation_input_hash`，同输入幂等、冲突拒绝、数据库禁止更新/删除 | FROZEN Snapshot 原始收盘价 |
+| `portfolio.audit_event` | 创建意图、人工审批、成交和估值的审计事件 | 组合操作流水 |
+
+Portfolio v1 禁止已有持仓 BUY，避免向下摊平；不模拟部分成交；意图股票必须属于绑定快照，
+估值行还要求估值日期不晚于已写入成交的时间边界，不能在更晚成交后回补过去估值；同一组合/日期只能使用相同现金、持仓和快照价格输入，修正必须创建新的 Portfolio 版本。
+指定观察池时还必须属于 ACTIVE 成员；估值日必须严格对应 FROZEN Snapshot 截止日，且价格
+必须与快照原始收盘价一致。缺少持仓收盘价时拒绝生成有效估值。
+详细契约见 `dev_doc/portfolio_design.md`。当前数据库仅完成迁移和空库验证，尚未创建正式组合；
+数据库触发器还独立校验成交股数、T+1、现金/费用、价位、止损、已有持仓、Snapshot 截止日和 SSE 开市日；现金账本首笔必须等于账户初始现金，重复 INIT 被拒绝。
+
+## 19. 阶段三当前门禁（2026-08-06）
+
+- `trading_calendar` 已由 Raw 重建并覆盖到 `2026-08-03`，与当前 FROZEN Research Snapshot 截止日一致。
+- `backtest.dataset_manifest` 额外记录 `selection_predicate`、`selected_columns`、`hash_algorithm`、`availability_rules`；`backtest.run_manifest` 记录 `parameters_hash`。
+- `backtest.dataset_member` 额外记录执行行情和按 `ex_date` 聚合的公司行为切片哈希；两者进入 Dataset 输入 Manifest。`research_snapshot_series.py` 只编排多个单日快照，不改变一个 `snapshot_id` 只对应一个截止日的约束。
+- Research Snapshot schema 已升级为 `research-v1.3`，接入时点价格 Feature，并新增并哈希保存 PIT 的 `eligible_by_market` 及成熟度字段。现有 `research-v1`/`research-v1.1`/`research-v1.2` FROZEN 快照继续只读保留；正式 Backtest Dataset v2 只接受新版本快照，不能回写旧快照子表。
+- 回测引擎先处理止损，再处理同日策略卖出；正式 Frozen Dataset 缺少有效市场规则时直接失败，不回退 Python 默认值。
+- 公司行为仅纳入“实施”版本，并校验公告可见性；送转股份按除权日前持仓生成独立公司行为批次，使用 `div_list_date`（缺失时回退到账日/除权日）确定可卖日期，不会分配给除权日后的新买入批次。
+- 快照系列、Dataset 来源快照和 evaluation 边界必须是开市日；公司行为按业务键选择有效版本并校验重复；缺失 `volume_ratio_20d` 按 fail-closed 处理。
+- 当前仍未配置 `backtest.market_rule_effective`，数据库没有正式 Dataset/Run，且只有一个日 Research Snapshot；因此仍不能宣称历史回测已具备正式数据条件。
+- `backtest_dataset.py validate` 会重新读取 Dataset 自身的执行行情、交易日历、公司行为和规则子表，计算物化行哈希，并与 Manifest 及 `dataset_member` 的按日哈希逐项对账；不能只凭上游查询结果或非空字段通过验收。
+- Dataset `VALIDATED→FROZEN` 的数据库触发器只允许状态、冻结时间和代码血缘字段变化；规则导入除文件内重叠检查外，还会检查数据库已有的同市场/同版本有效日期区间，避免跨文件形成规则歧义。
+- 阶段三最终审计专项验证已通过 47 项定向测试、`compileall`、迁移执行和 PostgreSQL 回滚烟测；Dataset 创建已增加全区间开市日 Snapshot 覆盖门禁，规则冲突、审核批准和 build/freeze 代码身份门禁已接通；执行行情缺少日线、状态或可交易性来源时 fail-closed；行情物化或派生重建中途失败会追加最新 `BLOCKED` 门禁；规则有效区间另由 PostgreSQL `EXCLUDE USING gist` 防止同一作用域重叠；送转合计/分项、除权止损坐标、退市持仓、分数排序、T+1 重算和 Run/Dataset 哈希门禁均已接通；另在临时隔离数据库完成 Dataset→Run→Portfolio 全链路联调并自动清理。全量 pytest 最新实测为 `640 passed, 1 skipped, 5 deselected`，另有 2 个既有通知前缀测试失败；当前生产数据库仍没有正式 Dataset/Run/Portfolio，Raw 表未被修改。
+- 执行行情的 vintage 已明确：Dataset 构建事务按 `tushare_market_raw_version.fetched_at DESC, record_id DESC` 选择每个日线业务键的最新 Raw 版本，并将 source version/hash 随物化行冻结；版本存在时只解析一个完整 payload，不与旧 Raw 按字段拼接；这不等同于该修订在原交易日已可见，PIT 财务字段仍按公告可见日期单独门禁。
+
+### 16.1 时点价格 Feature v2（2026-08-08）
+
+`feature.price_daily_v1` 使用仓库最终复权因子，现作为只读兼容表；新的 Research/Backtest
+正式输入改为：
+
+```text
+std.dividend_event（实施且 ex_date <= trade_date）
+→ feature.price_adjustment_factor_asof
+→ feature.price_daily_v2
+→ research-v1.3 Snapshot
+```
+
+`price_daily_v2` 构造时只使用截至当前交易日已经生效的现金分红、送股和转增，生成
+时点总回报坐标、收益率和 MA20/60/120。原始 OHLC 始终用于成交、涨跌停和止损，v2
+调整价格只用于研究指标。Raw、`price_daily_v1` 和旧 Snapshot 均不覆盖、不删除；配股
+仍属于第一版明确不模拟的范围。
+- `sql/030_create_phase3_ops_gate.sql` 新增 `ops.market_data_quality_gate`：按日增量以历史 Raw 的前五个交易日中位股票数为基准，覆盖下降超过 1%、无历史基线和抽样结果均不可发布；正式全市场门禁失败会在 Raw 版本写入前中止，Research 冻结时再次检查该截止日最近门禁。该表只追加门禁事实，不承载行情源数据。
+- `data_collect/jobs/phase3_validation.py` 提供 PIT 截面只读校验，当前对 `2026-08-03` 的财务公告可见性、价格/估值 Feature、交易状态来源日期和 Research 财务可见性检查均为 0 违规；该命令不会修改 Raw 或派生表。物化时遇到涨跌停空值/100000 哨兵会保留价格但标记 WARNING 并关闭买卖，缺少日线/状态/可交易性来源则标记 `MISSING_SOURCE` 并阻断 Dataset 验证；历史无 Raw version 的记录允许 `source_record_version=NULL`，但必须有 payload 哈希。温度风险倍率目前仅作为显式适配器，尚未作为未版本化的隐式回测输入。Portfolio 的决定日、计划执行日、成交日、现金和持仓日期均必须命中 SSE 开市日。
+- Backtest Dataset build/validate 会检查 warm-up 到 evaluation_end 区间内已有的最新覆盖门禁；历史未记录门禁的日期由绑定 `validated` 基线的 `quality_report_hash` 等价覆盖，不伪造逐日门禁；任何最新非 PASS 记录都会阻断物化或验收。
+- Dataset 现额外保存 `baseline_quality_report_hash`，并将其纳入 `input_manifest_hash`；`build/validate/freeze` 会重新核验该哈希，PostgreSQL 触发器也会校验它与 validated 发布点一致。T+1 开盘按实际成交价重算股数，只有 `actual_shares != planned_shares` 才记录 `resized_at_execution`。送转零碎股 v1 按 `floor(entitled_shares * stock_rate)` 记整数股，不生成现金补偿；真实券商零碎股政策必须通过新规则版本建模。
+- `actual_shares` 只由真实 Fill 写入；计划、拒单、过期和未成交订单均为 0。`backtest.order.order_audit_hash` 由 PostgreSQL 按完整订单行和绑定 Dataset 版本生成，Portfolio Air-Gap 要求 `source_order_hash` 与其完全一致。对应迁移为 `sql/033_backtest_order_audit_hash.sql`。
+## 2026-08-07 最新模型与实测状态覆盖
+
+本文前部关于“生产数据库尚无 Dataset/Run/规则记录”的内容属于历史进度记录，当前以 `dev_doc/current_implementation_state_20260807.md` 为准。
+
+当前真实关系为：
+
+```text
+Tushare Raw
+→ Standard
+→ PIT
+→ Feature
+→ research.snapshot_manifest / stock_snapshot_daily / snapshot_lineage
+→ backtest.dataset_manifest / dataset_member / dataset_execution_bar / dataset_rule_snapshot
+→ backtest.run_manifest / signal / order / fill / position_lot / cash_ledger / performance_daily / metric
+→ portfolio.order_intent（仅 PENDING_APPROVAL）
+```
+
+当前数据库已有 `FROZEN` 三日 Dataset 和 `SUCCEEDED` Baseline Run。Run 使用 FROZEN Dataset 的规则快照，不使用 Python 隐式默认规则；Run Manifest 记录有效规则快照、参数、参数哈希、Dataset 输入哈希和代码归档。`actual_shares` 只有真实 Fill 后才产生，拒单/过期订单必须为 0。
+
+行情 Raw、Standard、PIT/Feature 当前最大日期为 2026-08-06；阶段三 PIT 截面校验和 Raw failed checkpoint 检查通过。完整五年回测仍待生成每个 SSE 开市日的当前契约 `research-v1.3` FROZEN Snapshot，三日烟测和旧 v1.1/v1.2 快照系列不能替代五年回测结果。Portfolio 未创建正式业务组合，人工 Air-Gap 仍然有效。
+
+## 2026-08-08 当前数据库复核
+
+当前源码契约为 `research-v1.3`、`backtest-dataset-v2`、`research-to-backtest-v2` 和 `daily-next-open-v2`。数据库尚未生成当前 v1.3 FROZEN 系列；现有 690 条 v1.1 FROZEN、1 条 v1.1 DRAFT，五年区间仍缺 522 个 SSE 开市日。旧 v1.1/v1.2 快照及 v1 Dataset/Run 记录保持不可变，仅作为历史烟测证据，不能描述为完整五年生产回测。

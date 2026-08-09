@@ -223,6 +223,7 @@ data/
 tempdata/
 news_spool/
 logs/
+code_archive_*.zip
 *.sqlite
 *.sqlite3
 *.db

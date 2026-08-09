@@ -27,7 +27,6 @@ def _execute(sql: str, params=None) -> int:
 
 
 def rebuild_lifecycle() -> int:
-    _execute("TRUNCATE TABLE std.security_lifecycle RESTART IDENTITY")
     # namechange 是名称历史的权威来源；同一证券同一开始日只保留最新 Raw 快照。
     # 开放 end_date 用下一次 start_date - 1 天推导，避免与下一段名称重叠。
     lifecycle_sql = """
@@ -84,11 +83,10 @@ def rebuild_lifecycle() -> int:
     FROM all_rows
     ON CONFLICT DO NOTHING
     """
-    return _execute(lifecycle_sql)
+    return _execute("TRUNCATE TABLE std.security_lifecycle RESTART IDENTITY;\n" + lifecycle_sql)
 
 
 def rebuild_status_daily() -> int:
-    _execute("TRUNCATE TABLE std.security_status_daily")
     sql = """
     INSERT INTO std.security_status_daily
         (trade_date, ts_code, is_listed, is_st, is_suspended, is_tradeable,
@@ -161,11 +159,10 @@ def rebuild_status_daily() -> int:
        status_reason=EXCLUDED.status_reason, quality_status=EXCLUDED.quality_status,
        fetched_at=CURRENT_TIMESTAMP
     """
-    return _execute(sql)
+    return _execute("TRUNCATE TABLE std.security_status_daily;\n" + sql)
 
 
 def rebuild_universe() -> int:
-    _execute("TRUNCATE TABLE pit.universe_daily")
     sql = """
     INSERT INTO pit.universe_daily
         (trade_date, ts_code, is_listed_asof, is_st_asof, is_suspended_asof,
@@ -191,23 +188,20 @@ def rebuild_universe() -> int:
       exclusion_reason=EXCLUDED.exclusion_reason, quality_status=EXCLUDED.quality_status,
       source_asof_date=EXCLUDED.source_asof_date, calculated_at=CURRENT_TIMESTAMP
     """
-    return _execute(sql)
+    return _execute("TRUNCATE TABLE pit.universe_daily;\n" + sql)
 
 
 def rebuild_tradeability() -> int:
-    _execute("TRUNCATE TABLE pit.security_tradeability_daily")
     sql = """
     INSERT INTO pit.security_tradeability_daily
         (trade_date, ts_code, is_tradeable, can_buy, can_sell, is_suspended,
          limit_status, blocked_reason, quality_status, source_asof_date)
     SELECT trade_date, ts_code, is_tradeable,
-           is_tradeable AND COALESCE(limit_status, 'NONE') <> 'UP_LIMIT',
-           is_tradeable AND COALESCE(limit_status, 'NONE') <> 'DOWN_LIMIT',
+           is_tradeable,
+           is_tradeable,
            is_suspended, limit_status,
            NULLIF(concat_ws(',',
-             CASE WHEN NOT is_tradeable THEN 'NOT_TRADEABLE' END,
-             CASE WHEN limit_status = 'UP_LIMIT' THEN 'UP_LIMIT_BUY_RISK' END,
-             CASE WHEN limit_status = 'DOWN_LIMIT' THEN 'DOWN_LIMIT_SELL_RISK' END
+             CASE WHEN NOT is_tradeable THEN 'NOT_TRADEABLE' END
            ), ''),
            quality_status, trade_date
     FROM std.security_status_daily
@@ -218,11 +212,10 @@ def rebuild_tradeability() -> int:
       quality_status=EXCLUDED.quality_status, source_asof_date=EXCLUDED.source_asof_date,
       calculated_at=CURRENT_TIMESTAMP
     """
-    return _execute(sql)
+    return _execute("TRUNCATE TABLE pit.security_tradeability_daily;\n" + sql)
 
 
 def rebuild_dividend() -> int:
-    _execute("TRUNCATE TABLE std.dividend_event RESTART IDENTITY")
     sql = """
     INSERT INTO std.dividend_event
         (ts_code, report_date, announce_date, implementation_status, stock_div,
@@ -242,14 +235,14 @@ def rebuild_dividend() -> int:
            source, business_key, record_id, business_key, payload_hash,
            CASE WHEN div_proc = '实施' AND ex_date IS NULL THEN 'WARNING' ELSE 'VALID' END
     FROM (
-      SELECT DISTINCT ON (ts_code, end_date, ann_date, div_proc, record_date, ex_date, (payload->>'imp_ann_date'))
+      SELECT DISTINCT ON (ts_code, end_date, div_proc, record_date, ex_date, (payload->>'imp_ann_date'))
              record_id, ts_code, end_date, ann_date, div_proc, record_date, ex_date,
              payload, source, payload_hash,
-             ts_code || ':' || COALESCE(end_date::text,'') || ':' || COALESCE(ann_date::text,'') || ':' ||
+             ts_code || ':' || COALESCE(end_date::text,'') || ':' ||
              COALESCE(div_proc,'') || ':' || COALESCE(record_date::text,'') || ':' ||
              COALESCE(ex_date::text,'') || ':' || COALESCE((payload->>'imp_ann_date'),'') AS business_key
       FROM tushare_dividend_raw
-      ORDER BY ts_code, end_date, ann_date, div_proc, record_date, ex_date, (payload->>'imp_ann_date'),
+      ORDER BY ts_code, end_date, div_proc, record_date, ex_date, (payload->>'imp_ann_date'),
                fetched_at DESC, record_id DESC
     ) d
     ON CONFLICT (source, source_record_key, record_version) DO UPDATE SET
@@ -262,11 +255,10 @@ def rebuild_dividend() -> int:
       business_key=EXCLUDED.business_key, payload_hash=EXCLUDED.payload_hash,
       quality_status=EXCLUDED.quality_status, fetched_at=CURRENT_TIMESTAMP
     """
-    return _execute(sql)
+    return _execute("TRUNCATE TABLE std.dividend_event RESTART IDENTITY;\n" + sql)
 
 
 def rebuild_index_daily() -> int:
-    _execute("TRUNCATE TABLE std.index_daily_tushare")
     sql = """
     INSERT INTO std.index_daily_tushare
         (ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg,
@@ -288,27 +280,32 @@ def rebuild_index_daily() -> int:
       pre_close=EXCLUDED.pre_close, change=EXCLUDED.change, pct_chg=EXCLUDED.pct_chg,
       volume=EXCLUDED.volume, amount=EXCLUDED.amount, fetched_at=CURRENT_TIMESTAMP
     """
-    return _execute(sql)
+    return _execute("TRUNCATE TABLE std.index_daily_tushare;\n" + sql)
 
 
 def rebuild_financial_asof() -> int:
-    _execute("TRUNCATE TABLE pit.financial_asof")
     sql = """
     INSERT INTO pit.financial_asof
-        (decision_date, ts_code, report_date, effective_announce_date, ann_date,
+        (decision_date, ts_code, report_date, effective_announce_date,
+         version_available_date, ann_date,
          f_ann_date, report_type, comp_type, record_version, source_record_key,
          roe, roa, debt_to_assets, revenue_yoy, netprofit_yoy, or_yoy, tr_yoy,
-         q_sales_yoy, payload_hash, quality_status)
+         q_sales_yoy, payload_hash, vintage_quality, source_observed_at,
+         quality_status)
     SELECT f.trade_date, f.ts_code, f.report_date, f.effective_announce_date,
-        f.ann_date, f.f_ann_date, f.report_type, f.comp_type, f.record_version,
+        f.version_available_date, f.ann_date, f.f_ann_date, f.report_type,
+        f.comp_type, f.record_version,
         f.source_record_key, f.roe, f.roa, f.debt_to_assets, f.or_yoy,
         f.netprofit_yoy, f.or_yoy, f.tr_yoy, f.q_sales_yoy, f.payload_hash,
+        f.vintage_quality, f.source_observed_at,
         f.quality_status
     FROM (
         SELECT d.trade_date, i.ts_code, i.report_date, i.effective_announce_date,
+               i.version_available_date,
                i.ann_date, i.f_ann_date, i.report_type, i.comp_type, i.record_version,
                i.source_record_key, i.roe, i.roa, i.debt_to_assets, i.or_yoy,
                i.tr_yoy, i.q_sales_yoy, i.netprofit_yoy, i.payload_hash,
+               i.vintage_quality, i.source_observed_at,
                i.quality_status, i.fetched_at
         FROM (SELECT DISTINCT stock_code, trade_date FROM daily_kline) d
         JOIN LATERAL (
@@ -317,23 +314,30 @@ def rebuild_financial_asof() -> int:
             WHERE i.ts_code = d.stock_code
               AND i.effective_announce_date IS NOT NULL
               AND i.effective_announce_date <= d.trade_date
-            ORDER BY i.effective_announce_date DESC, i.report_date DESC,
+              AND i.version_available_date IS NOT NULL
+              AND i.version_available_date <= d.trade_date
+            ORDER BY i.report_date DESC, i.version_available_date DESC,
+                     i.effective_announce_date DESC,
                      i.record_version DESC, i.fetched_at DESC
             LIMIT 1
         ) i ON TRUE
     ) f
     ON CONFLICT (decision_date, ts_code) DO UPDATE SET
       report_date=EXCLUDED.report_date, effective_announce_date=EXCLUDED.effective_announce_date,
+      version_available_date=EXCLUDED.version_available_date,
       ann_date=EXCLUDED.ann_date, f_ann_date=EXCLUDED.f_ann_date,
       report_type=EXCLUDED.report_type, comp_type=EXCLUDED.comp_type,
       record_version=EXCLUDED.record_version, source_record_key=EXCLUDED.source_record_key,
       roe=EXCLUDED.roe, roa=EXCLUDED.roa, debt_to_assets=EXCLUDED.debt_to_assets,
       revenue_yoy=EXCLUDED.revenue_yoy, netprofit_yoy=EXCLUDED.netprofit_yoy,
       or_yoy=EXCLUDED.or_yoy, tr_yoy=EXCLUDED.tr_yoy, q_sales_yoy=EXCLUDED.q_sales_yoy,
-      payload_hash=EXCLUDED.payload_hash, quality_status=EXCLUDED.quality_status,
+      payload_hash=EXCLUDED.payload_hash,
+      vintage_quality=EXCLUDED.vintage_quality,
+      source_observed_at=EXCLUDED.source_observed_at,
+      quality_status=EXCLUDED.quality_status,
       calculated_at=CURRENT_TIMESTAMP
     """
-    return _execute(sql)
+    return _execute("TRUNCATE TABLE pit.financial_asof;\n" + sql)
 
 
 def run(task: str = "all") -> dict[str, int]:

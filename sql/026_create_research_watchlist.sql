@@ -53,10 +53,12 @@ CREATE TABLE IF NOT EXISTS research.evidence_reference (
     published_at TIMESTAMP,
     effective_date DATE,
     claim_role VARCHAR(20) NOT NULL DEFAULT 'context',
+    authority_level VARCHAR(30) NOT NULL DEFAULT 'OTHER',
     locator JSONB NOT NULL DEFAULT '{}'::jsonb,
     note TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (claim_role IN ('supporting','contrary','context')),
+    CHECK (authority_level IN ('OFFICIAL','PROFESSIONAL','MEDIA','INTERNAL_FACT','OTHER')),
     CHECK (source_system IN ('opensearch','url','manual','postgres')),
     UNIQUE (snapshot_id, ts_code, source_system, source_locator, claim_role)
 );

@@ -193,13 +193,18 @@ def _resolve_invocation(
     - fn=run_verify：传 start_date/end_date，由 days_back 推算
     """
     fn_name = task_cfg.get("fn", "run")
+    configured_kwargs = dict(task_cfg.get("kwargs") or {})
+    duplicate = set(configured_kwargs) & set(base_kwargs)
+    if duplicate:
+        raise ValueError(f"任务配置 kwargs 与运行参数重复: {sorted(duplicate)}")
+    invocation_kwargs = {**configured_kwargs, **base_kwargs}
     if fn_name == "run_verify":
         days_back = int(task_cfg.get("days_back", 5))
         end_date = minus_one_market_day(datetime.datetime.now())
         start_date = add_mark_day(end_date, -(days_back - 1))
         # 透传 base_kwargs（如 CLI --limit-stocks），run_verify 接收 **kwargs
-        return fn_name, {"start_date": start_date, "end_date": end_date, **base_kwargs}
-    return fn_name, {"run_date": run_date, **base_kwargs}
+        return fn_name, {"start_date": start_date, "end_date": end_date, **invocation_kwargs}
+    return fn_name, {"run_date": run_date, **invocation_kwargs}
 
 
 def _notify_retry(task_name: str, attempt: int, total: int, exc: Exception) -> None:
