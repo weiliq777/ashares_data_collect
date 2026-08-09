@@ -17,7 +17,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from data_collect.backtest.validation import verify_pit_cutoff_consistency
-from data_collect.ops.market_coverage import assert_market_coverage_publishable
+from data_collect.ops.market_coverage import (
+    assert_market_coverage_publishable,
+    assert_market_coverage_range_publishable,
+)
 from data_collect.utils.db import get_connection, require_psycopg2
 
 
@@ -1362,6 +1365,163 @@ def freeze(snapshot_id: str, code_archive_path: str | None = None) -> None:
         if cur.rowcount != 1:
             raise RuntimeError("Research 快照状态在冻结期间发生变化，拒绝并发冻结")
         conn.commit()
+
+
+def _assert_pit_cutoff_dates_batch(
+    conn, cutoffs: list[date], snapshot_ids: list[str]
+) -> None:
+    """Run the PIT cutoff checks for a set of snapshots in bounded SQL scans."""
+    if not cutoffs:
+        return
+    with conn.cursor() as cur:
+        checks = (
+            (
+                "financial_asof_announcement",
+                """SELECT COUNT(*) FROM pit.financial_asof
+                    WHERE decision_date = ANY(%s::date[])
+                      AND effective_announce_date > decision_date""",
+                (cutoffs,),
+            ),
+            (
+                "price_feature_source_asof",
+                """SELECT COUNT(*) FROM feature.price_daily_v2
+                    WHERE trade_date = ANY(%s::date[])
+                      AND source_asof_date > trade_date""",
+                (cutoffs,),
+            ),
+            (
+                "valuation_feature_source_asof",
+                """SELECT COUNT(*) FROM feature.valuation_daily_v1
+                    WHERE trade_date = ANY(%s::date[])
+                      AND source_asof_date > trade_date""",
+                (cutoffs,),
+            ),
+            (
+                "tradeability_source_asof",
+                """SELECT COUNT(*) FROM pit.security_tradeability_daily
+                    WHERE trade_date = ANY(%s::date[])
+                      AND source_asof_date > trade_date""",
+                (cutoffs,),
+            ),
+            (
+                "research_snapshot_financial_visibility",
+                """SELECT COUNT(*) FROM research.stock_snapshot_daily
+                    WHERE snapshot_id = ANY(%s::uuid[])
+                      AND effective_announce_date > research_date""",
+                (snapshot_ids,),
+            ),
+        )
+        failures = []
+        for name, query, params in checks:
+            cur.execute(query, params)
+            count = int(cur.fetchone()[0] or 0)
+            if count:
+                failures.append({"name": name, "violations": count})
+    if failures:
+        raise RuntimeError(f"批量冻结 PIT 截止检查失败: {failures}")
+
+
+def freeze_snapshots_batch(
+    snapshot_ids: list[str], code_archive_path: str | None = None
+) -> None:
+    """Freeze validated snapshots sharing one baseline with bounded IO.
+
+    This is the production path for a historical series.  It keeps the
+    per-snapshot immutable rows and audit metadata, while avoiding one full
+    Raw-manifest/quality scan for every cutoff date.
+    """
+    ids = tuple(str(value) for value in snapshot_ids)
+    if not ids:
+        return
+    metadata = _git_metadata()
+    if metadata["dirty"] and not code_archive_path:
+        raise RuntimeError("批量正式冻结要求 Git 工作区干净")
+    if code_archive_path and not Path(code_archive_path).exists():
+        raise FileNotFoundError(f"代码归档不存在: {code_archive_path}")
+    archive_hash = archive_size = None
+    if code_archive_path:
+        archive_hash, archive_size = _sha256_file(code_archive_path)
+
+    from data_collect.jobs.tushare_release import _lock_release_inputs
+
+    conn = get_connection()
+    try:
+        conn.set_session(
+            isolation_level="REPEATABLE READ", readonly=False, autocommit=False
+        )
+        _lock_release_inputs(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT snapshot_id, research_cutoff_date, data_baseline_tag,
+                              schema_version, status, baseline_quality_report_hash,
+                              baseline_source_manifest_hash, quality_report_hash,
+                              input_manifest_hash
+                         FROM research.snapshot_manifest
+                        WHERE snapshot_id = ANY(%s::uuid[])
+                        ORDER BY research_cutoff_date
+                        FOR UPDATE""",
+                (list(ids),),
+            )
+            rows = cur.fetchall()
+        if len(rows) != len(ids):
+            raise ValueError("批量冻结包含不存在的 Snapshot")
+        if any(row[4] != "VALIDATED" for row in rows):
+            raise RuntimeError("批量冻结只允许 VALIDATED Snapshot")
+        baseline_tags = {row[2] for row in rows}
+        schema_versions = {row[3] for row in rows}
+        if len(baseline_tags) != 1 or len(schema_versions) != 1:
+            raise ValueError("批量冻结必须使用同一 baseline_tag/schema_version")
+        baseline_tag = next(iter(baseline_tags))
+        schema_version = next(iter(schema_versions))
+        cutoffs = [row[1] for row in rows]
+        baseline = _baseline(max(cutoffs), baseline_tag, conn)
+        for row in rows:
+            if baseline[3] != row[5] or baseline[4] != row[6]:
+                raise RuntimeError("Snapshot 绑定的基线哈希已变化，拒绝冻结")
+            if not row[7] or not row[8]:
+                raise RuntimeError("Snapshot 缺少质量哈希或输入哈希，拒绝冻结")
+        _assert_price_vintage_for_dates(conn, cutoffs, schema_version)
+        report, _ = _quality_report(max(cutoffs))
+        if report["failures"]:
+            raise RuntimeError(f"质量门禁未通过，拒绝批量冻结: {report['failures']}")
+        for row in rows:
+            current = dict(report)
+            current["cutoff_date"] = row[1].isoformat()
+            encoded = json.dumps(
+                _canonical(current), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            )
+            quality_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if quality_hash != row[7]:
+                raise RuntimeError(f"质量报告哈希已变化，拒绝冻结: {row[1]}")
+        assert_market_coverage_range_publishable(
+            min(cutoffs), max(cutoffs), connection=conn
+        )
+        _assert_pit_cutoff_dates_batch(conn, cutoffs, list(ids))
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE research.snapshot_manifest
+                      SET code_archive_path=COALESCE(%s, code_archive_path),
+                          code_archive_sha256=COALESCE(%s, code_archive_sha256),
+                          code_archive_size_bytes=COALESCE(%s, code_archive_size_bytes),
+                          code_version=%s, git_commit=%s, git_dirty=%s, diff_hash=%s,
+                          status='FROZEN'
+                    WHERE snapshot_id = ANY(%s::uuid[])
+                      AND status='VALIDATED'""",
+                (
+                    code_archive_path, archive_hash, archive_size,
+                    metadata["code_version"], metadata["commit"], metadata["dirty"],
+                    metadata["diff_hash"], list(ids),
+                ),
+            )
+            if cur.rowcount != len(ids):
+                raise RuntimeError("批量冻结期间 Snapshot 状态发生变化")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def status() -> list[tuple]:
