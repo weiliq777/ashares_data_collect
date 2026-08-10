@@ -21,7 +21,7 @@ from data_collect.jobs.research_snapshot import (
     _quality_report,
     validate_snapshots_batch,
     existing_snapshot,
-    freeze as freeze_snapshot,
+    freeze_snapshots_batch,
 )
 from data_collect.utils.db import get_connection
 
@@ -112,10 +112,9 @@ def create_snapshot_series(
         existing = existing_snapshot(cutoff.isoformat(), baseline_tag, schema_version)
         if existing:
             snapshot_id, status = existing
-            if status == "BUILDING":
-                raise RuntimeError(
-                    f"检测到同一截止日已有 BUILDING 快照，可能有并发任务: {snapshot_id}"
-                )
+            # BUILDING is resumable: a process can exit after the build
+            # transaction commits but before batch validation.  The next run
+            # must continue through pending_validate instead of failing here.
         else:
             snapshot_id = ""
             status = "DRAFT"
@@ -139,9 +138,14 @@ def create_snapshot_series(
         for cutoff in dates
         if build and statuses[cutoff.isoformat()] in {"DRAFT", "FAILED"}
     ]
+    pending_validate_existing = [
+        snapshots[cutoff.isoformat()]
+        for cutoff in dates
+        if validate and statuses[cutoff.isoformat()] == "BUILDING"
+    ]
     batch_baseline = None
     batch_quality_reports = None
-    if pending_build:
+    if pending_build or pending_validate_existing:
         with get_connection() as conn:
             batch_baseline = _baseline(max(dates), baseline_tag, conn)
         base_report, _ = _quality_report(max(dates))
@@ -157,12 +161,17 @@ def create_snapshot_series(
                 report, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             )
     for offset in range(0, len(pending_build), batch_size):
+        chunk = pending_build[offset:offset + batch_size]
         build_snapshots_batch(
-            pending_build[offset:offset + batch_size],
+            chunk,
             baseline=batch_baseline,
             quality_reports=batch_quality_reports,
         )
-        for snapshot_id in pending_build[offset:offset + batch_size]:
+        print(
+            f"snapshot build progress {min(offset + len(chunk), len(pending_build))}/{len(pending_build)}",
+            flush=True,
+        )
+        for snapshot_id in chunk:
             for cutoff_key, current_id in snapshots.items():
                 if current_id == snapshot_id:
                     statuses[cutoff_key] = "BUILDING"
@@ -177,25 +186,37 @@ def create_snapshot_series(
         validate_snapshots_batch(
             chunk, baseline=batch_baseline, quality_reports=batch_quality_reports,
         )
+        print(
+            f"snapshot validate progress {min(offset + len(chunk), len(pending_validate))}/{len(pending_validate)}",
+            flush=True,
+        )
         for snapshot_id in chunk:
             for cutoff_key, current_id in snapshots.items():
                 if current_id == snapshot_id:
                     statuses[cutoff_key] = "VALIDATED"
 
-    # Freeze remains per snapshot because the database status transition and
-    # optional code archive are independent audit events; no stock rows are
-    # inserted here.
+    # Freeze in bounded batches; no stock rows are written in this phase.
+    if freeze:
+        pending_freeze = [
+            snapshots[cutoff.isoformat()]
+            for cutoff in dates
+            if statuses[cutoff.isoformat()] == "VALIDATED"
+        ]
+        for offset in range(0, len(pending_freeze), batch_size):
+            chunk = pending_freeze[offset:offset + batch_size]
+            freeze_snapshots_batch(chunk, code_archive_path=code_archive_path)
+            print(
+                f"snapshot freeze progress {min(offset + len(chunk), len(pending_freeze))}/{len(pending_freeze)}",
+                flush=True,
+            )
+            for snapshot_id in chunk:
+                for cutoff_key, current_id in snapshots.items():
+                    if current_id == snapshot_id:
+                        statuses[cutoff_key] = "FROZEN"
+
     for cutoff in dates:
         cutoff_key = cutoff.isoformat()
-        snapshot_id = snapshots[cutoff_key]
-        status = statuses[cutoff_key]
-        if status == "FROZEN":
-            results.append({"snapshot_id": snapshot_id, "research_cutoff_date": cutoff_key})
-            continue
-        if freeze and status == "VALIDATED":
-            freeze_snapshot(snapshot_id, code_archive_path=code_archive_path)
-            statuses[cutoff_key] = "FROZEN"
-        results.append({"snapshot_id": snapshot_id, "research_cutoff_date": cutoff_key})
+        results.append({"snapshot_id": snapshots[cutoff_key], "research_cutoff_date": cutoff_key})
     return tuple(results)
 
 

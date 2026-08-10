@@ -32,6 +32,20 @@ REQUIRED_LINEAGE_GROUPS = (
     "fundamental_history",
 )
 
+_SNAPSHOT_BATCH_LOCK_NAME = "research_snapshot_batch_v1"
+
+
+def _acquire_snapshot_batch_lock(cur) -> None:
+    """Prevent concurrent builders/validators from touching the same series."""
+    cur.execute(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+        (_SNAPSHOT_BATCH_LOCK_NAME,),
+    )
+    if not cur.fetchone()[0]:
+        raise RuntimeError(
+            "已有另一个 Research Snapshot 批处理任务正在运行，当前任务安全退出"
+        )
+
 # 这些表名和字段均为代码内固定定义，不接受命令行直接拼接，避免把哈希范围变成隐式变化。
 INPUTS = (
     {
@@ -935,8 +949,12 @@ def build_snapshots_batch(
     from data_collect.jobs.tushare_release import _lock_release_inputs
 
     conn = get_connection()
+    lock_acquired = False
     try:
         conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
+        with conn.cursor() as cur:
+            _acquire_snapshot_batch_lock(cur)
+            lock_acquired = True
         _lock_release_inputs(conn)
         with conn.cursor() as cur:
             cur.execute(
@@ -1030,6 +1048,8 @@ def build_snapshots_batch(
         conn.commit()
     except Exception as exc:
         conn.rollback()
+        if not lock_acquired:
+            raise
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1037,7 +1057,7 @@ def build_snapshots_batch(
                           SET status='FAILED', failed_at=CURRENT_TIMESTAMP,
                               failure_reason=%s
                         WHERE snapshot_id = ANY(%s::uuid[])
-                          AND status IN ('DRAFT','BUILDING','FAILED')""",
+                          AND status IN ('DRAFT','FAILED')""",
                     (str(exc)[:2000], list(ids)),
                 )
             conn.commit()
@@ -1142,8 +1162,12 @@ def validate_snapshots_batch(
     from data_collect.jobs.tushare_release import _lock_release_inputs
 
     conn = get_connection()
+    lock_acquired = False
     try:
         conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
+        with conn.cursor() as cur:
+            _acquire_snapshot_batch_lock(cur)
+            lock_acquired = True
         _lock_release_inputs(conn)
         manifests = []
         for snapshot_id in ids:
@@ -1193,6 +1217,8 @@ def validate_snapshots_batch(
         conn.commit()
     except Exception as exc:
         conn.rollback()
+        if not lock_acquired:
+            raise
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1449,6 +1475,8 @@ def freeze_snapshots_batch(
         conn.set_session(
             isolation_level="REPEATABLE READ", readonly=False, autocommit=False
         )
+        with conn.cursor() as cur:
+            _acquire_snapshot_batch_lock(cur)
         _lock_release_inputs(conn)
         with conn.cursor() as cur:
             cur.execute(
