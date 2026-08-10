@@ -184,7 +184,7 @@ def rebuild_price_v2() -> int:
          quality_status, source_asof_date)
     SELECT ts_code, trade_date,
            asof_close / NULLIF(raw_close, 0), asof_close,
-           event_count, event_ex_date, 'point_in_time_total_return',
+           event_count, max_event_ex_date, 'point_in_time_total_return',
            CASE WHEN asof_close IS NULL THEN 'MISSING_SOURCE'
                 WHEN raw_close IS NULL OR raw_close <= 0 THEN 'WARNING'
                 ELSE 'VALID' END,
