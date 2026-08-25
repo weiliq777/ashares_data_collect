@@ -205,7 +205,7 @@ class FundamentalValueGrowthTrendStrategy:
     """正式 v2 策略：成熟样本 + 基本面双轨 + 趋势触发。
 
     旧 ``value_trend_v1`` 保持不可变，仅用于历史兼容。该策略只读取
-    research-v1.2 已冻结字段，不临时查询 PIT/Feature，也不代表投资建议。
+    research-v2.0 已冻结字段，不临时查询 PIT/Feature，也不代表投资建议。
     """
 
     strategy_id = "fundamental_value_growth_trend_v2"
@@ -228,7 +228,7 @@ class FundamentalValueGrowthTrendStrategy:
         if debt_to_assets_max <= 0 or volume_ratio_min < 0 or stop_loss_pct <= 0:
             raise ValueError("策略阈值无效")
         if not math.isclose(roe_min, 15.0) or not math.isclose(quarterly_growth_min, 30.0):
-            raise ValueError("research-v1.2 历史摘要固定为 ROE>15 与季度营收同比>30")
+            raise ValueError("research-v2.0 策略规则固定为 ROE>15 与季度营收同比>30")
         self.pe_percentile_max = pe_percentile_max
         self.roe_min = roe_min
         self.debt_to_assets_max = debt_to_assets_max

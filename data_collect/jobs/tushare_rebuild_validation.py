@@ -5,7 +5,9 @@ import argparse
 
 from data_collect.jobs.tushare_raw_to_standard import _payload_frames
 from data_collect.normalize.tushare_daily import normalize_daily
-from data_collect.utils.db import save_to_postgres
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 
 
 def rebuild_daily_validation(
@@ -18,7 +20,12 @@ def rebuild_daily_validation(
         frame = normalize_daily(raw)
         if frame.empty:
             continue
-        current, affected = save_to_postgres(frame, table_name=target_table)
+        kernel = DataAccessKernel(policy_registry=build_default_registry())
+        context = RunContext(run_id="tushare-rebuild-validation", job_name="tushare_rebuild_validation", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+        try:
+            current, affected = CollectorRepository(kernel).append(target_table, frame.to_dict("records"), context, partition="tushare-rebuild-validation")
+        finally:
+            kernel.close()
         attempted += current
         inserted += affected
         chunks += 1

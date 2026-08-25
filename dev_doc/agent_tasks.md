@@ -133,7 +133,7 @@
 ## T-017｜阶段三 Backtest 输入、撮合与账本契约
 
 - 时间：2026-08-05
-- 目标：吸收 `dev_doc/gemini-doc/` 的有效设计，建立基于多日期 FROZEN 快照的可复现 Backtest Dataset、Run Manifest、日线撮合和不可变账本契约。
+- 目标：吸收归档参考样例 `dev_doc/过时/gemini-doc/` 的有效设计，建立基于多日期 FROZEN 快照的可复现 Backtest Dataset、Run Manifest、日线撮合和不可变账本契约。
 - 状态：已由 T-018 接续完成（历史记录）
 - 当前结果：已确认 Research 快照研究链路基本完成，但正式回测仍缺少执行行情物料、公司行为冻结、warm-up/evaluation 区间、数据 vintage、市场规则/费用版本、撮合状态机和 Run Manifest。设计已保存至 `dev_doc/backtest_design.md`；Gemini 示例代码暂不直接接入生产。
 - 关键边界：Backtest 不读取实时 PIT/Feature，不使用当前 3 只观察股替代历史股票池，不在生产模式回退合成数据；复权价格只用于指标，原始价格用于成交。
@@ -428,7 +428,7 @@
 
 - Date: 2026-08-07
 - Status: completed
-- Updated: `current_implementation_state_20260807.md`, `development_plan_3_phases.md`, `current_data_model.md`, `backtest_design.md`, and `project_completion_runbook.md`.
+- Updated: `dev_doc/data_access_current_status_20260818.md`, `development_plan_3_phases.md`, `current_data_model.md`, `backtest_design.md`, and `project_completion_runbook.md`.
 - Synchronized: Raw append/checkpoint rules, Standard/PIT/Feature mapping, FROZEN Snapshot contract, Dataset materialization, effective market/fee rules, T+1 execution, actual share semantics, corporate actions, Run audit hashes, Baseline smoke result, and Portfolio manual Air-Gap.
 - Current boundary: three-day Baseline smoke passed; full historical Snapshot series and five-year Dataset/Run remain pending. No automatic trading.
 
@@ -469,3 +469,14 @@ Run 仍是唯一可引用的完成回测结果，Raw 不允许被 Dataset 流程
 - 边界：不对共享 Dataset 子表执行全局 `TRUNCATE` 或全表删除；不修改任何 Raw/Standard/PIT/Feature；小型日历、分红、规则、基准表在执行行情完成后单独重建；最终仍执行原有完整 Validate → Freeze 门禁。
 - 验证：新迁移已在 Docker PostgreSQL 幂等应用；2026-07-30~2026-08-03 三日真实 Dataset `afe4a191-be9d-4af6-b623-b46e7994ea18` 分两批完成，16,606 条执行行情、3 个成员、无缺失行情，`validate` 返回 `issues=[]`；相关专项测试 59 项通过。
 - 下一步：恢复 Docker 后使用同一个五年 Dataset ID `eaa310e5-e3b3-45b6-aba0-f973c3ea3f4f`，以 `--batch-days 5` 重新执行；完成后再 Validate/Freeze。旧 Dataset `7b138308-f397-4886-a255-5b5b5cdf42cb` 的已提交物化结果不删除，继续作为历史对照。
+
+## T-038｜A股通用研究数据底座完整建设
+
+- 时间：2026-08-12
+- 目标：按 `2016-08-01` 财务与行情预热、`2021-08-02` 正式研究输出的边界，完成显式 Standard 财务/估值字段、统一 as-of、TTM/ROE/现金流质量/Growth/Margin/估值 Feature、Snapshot 契约、五年历史回填和新数据基线发布。
+- 状态：进行中
+- 当前结果：`sql/045_research_data_foundation_v2.sql`、显式 Standard 投影、统一财务 V2 Feature、估值 V2 字段、质量门禁、Research V2 Snapshot、Release V2 门禁和可续跑流水线均已实现。真实 smoke 运行 `e67a5414-f359-427b-9e8f-9df73a7c551e` 覆盖 9 只跨类型股票，写入 15,277 行 Standard、149 行财务 Feature、8,025 行估值 Feature，强制异常项全部为 0。2026-08-13 完成全项目写入安全、增量恢复、PIT/Release/Snapshot 逻辑审计；`compileall`、高置信静态检查、72 项聚焦回归及全量 `766 passed, 1 skipped, 5 deselected` 全部通过。
+- 正式运行：`f8e34e0e-61ec-410f-b2fe-b8b135c312cd` 从已落地 Raw 回填至 `2026-08-06`；59 个财务 Standard 股票分区已完成，估值 Standard 继续按月 checkpoint、内部按单交易日集合式短事务提交并限速。任务使用隐藏后台进程、全局 advisory lock、Git/diff 身份和续跑历史。
+- 工程审查：已补齐 vendor ROE 的精确 `comp_type` 匹配、上海时区日期、完整 Feature 结果哈希、Standard no-op UPDATE 跳过、估值可见时间空值和分位范围硬门禁、Snapshot fail-closed 验证，以及 Release 质量/Manifest/状态切换的单事务原子性。所有高吞吐写者共享全局 session lock，高容量路径改为日/月/股票分区短事务；真实写入禁用 `limit_stocks`，财务派生检查点可独立恢复，代码身份变更时会废弃旧 checkpoint 重算。
+- 资源纪律：数据库正式回填期间禁止并发全量 pytest、迁移、全表质量聚合或第二个回填任务；只允许低频、带 `statement_timeout` 的 checkpoint/资源查询。Docker/PostgreSQL 重启后必须先等待 crash recovery 完成并确认 `pg_is_in_recovery=false`；续跑程序取得全局 advisory lock 后可自动接管无活动 worker 遗留的陈旧 `RUNNING`，无需人工改写运行状态。
+- 下一步：等待正式派生回填完成，单独执行 V2 全量质量门禁，发布 `feature-contract-v2.0` 数据基线，创建并验证 `research-v2.0` Snapshot，最后同步实测行数和发布证据。

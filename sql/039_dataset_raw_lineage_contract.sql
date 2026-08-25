@@ -38,9 +38,9 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_release_immutable ON tushare_data_release;
+DROP TRIGGER IF EXISTS trg_release_immutable ON ops.tushare_data_release;
 CREATE TRIGGER trg_release_immutable
-BEFORE UPDATE OR DELETE ON tushare_data_release
+BEFORE UPDATE OR DELETE ON ops.tushare_data_release
 FOR EACH ROW EXECUTE FUNCTION public.assert_release_immutable();
 
 CREATE OR REPLACE FUNCTION backtest.assert_dataset_extended_freeze_identity()
@@ -101,4 +101,3 @@ DROP TRIGGER IF EXISTS trg_dataset_raw_lineage_complete ON backtest.dataset_mani
 CREATE TRIGGER trg_dataset_raw_lineage_complete
 BEFORE INSERT OR UPDATE ON backtest.dataset_manifest
 FOR EACH ROW EXECUTE FUNCTION backtest.assert_dataset_raw_lineage_complete();
-

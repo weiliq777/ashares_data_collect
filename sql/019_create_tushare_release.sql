@@ -1,6 +1,8 @@
 -- Tushare 数据发布基线与增量控制。
 -- 该表只记录数据发布点，不修改任何 *_raw 历史事实。
-CREATE TABLE IF NOT EXISTS tushare_data_release (
+CREATE SCHEMA IF NOT EXISTS ops;
+
+CREATE TABLE IF NOT EXISTS ops.tushare_data_release (
     release_id BIGSERIAL PRIMARY KEY,
     release_tag VARCHAR(100) NOT NULL UNIQUE,
     baseline_cutoff_date DATE NOT NULL,
@@ -17,8 +19,8 @@ CREATE TABLE IF NOT EXISTS tushare_data_release (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tushare_validated_release
-    ON tushare_data_release (status)
+    ON ops.tushare_data_release (status)
     WHERE status = 'validated';
 
 CREATE INDEX IF NOT EXISTS idx_tushare_release_cutoff
-    ON tushare_data_release (baseline_cutoff_date, status);
+    ON ops.tushare_data_release (baseline_cutoff_date, status);

@@ -2,9 +2,22 @@ from __future__ import annotations
 
 from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.normalize.tushare_daily import normalize_daily
-from data_collect.utils.db import save_to_postgres
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.date_utils import is_market_day
 from data_collect.utils.df_utils import normalize_trade_date
+
+
+def _save(df):
+    if df is None or df.empty:
+        return 0, 0
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="a-share-daily", job_name="a_share_daily_tushare", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).append("daily_kline", df.to_dict("records"), context, partition="daily-kline")
+    finally:
+        kernel.close()
 
 
 def run(run_date: str, **kwargs) -> str:
@@ -13,7 +26,7 @@ def run(run_date: str, **kwargs) -> str:
         return f"{trade_date} 非交易日，Tushare日线跳过"
     df = call_api(get_pro().daily, trade_date=trade_date)
     out = normalize_daily(df)
-    tried, inserted = save_to_postgres(out, pre_aligned_df=out, table_name="daily_kline")
+    tried, inserted = _save(out)
     return f"Tushare日线完成：{inserted}/{tried}，日期={trade_date}"
 
 
@@ -25,6 +38,6 @@ def run_backfill(start_date: str, end_date: str, limit_stocks=None) -> str:
         out = normalize_daily(call_api(pro.daily, trade_date=str(day)))
         if limit_stocks and not out.empty:
             out = out.head(int(limit_stocks))
-        t, i = save_to_postgres(out, pre_aligned_df=out, table_name="daily_kline")
+        t, i = _save(out)
         total += 1; tried += t; inserted += i
     return f"Tushare日线补历史完成：{total}个交易日，{inserted}/{tried}"

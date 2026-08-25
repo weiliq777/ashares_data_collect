@@ -11,7 +11,9 @@ import logging
 import pandas as pd
 
 from data_collect.utils.date_utils import is_market_day, date_range, minus_one_market_day
-from data_collect.utils.db import save_to_postgres, get_dates_with_data
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.eastmoney import datacenter_query
 
@@ -44,7 +46,21 @@ def _save(df: pd.DataFrame) -> tuple[int, int]:
     if df.empty:
         return 0, 0
     df = df.astype(object).where(pd.notna(df), None)   # NaN→NULL（防 int 列 NaN 溢出坑）
-    return save_to_postgres(df, pre_aligned_df=None, table_name=TABLE_NAME)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="margin", job_name="a_share_margin", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).append(TABLE_NAME, df.to_dict("records"), context, partition="margin")
+    finally:
+        kernel.close()
+
+
+def _existing(start_date: str, end_date: str) -> set:
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="margin-dates", job_name="a_share_margin", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).dates_with_data(TABLE_NAME, pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context)
+    finally:
+        kernel.close()
 
 
 def _collect_date(date_str: str) -> tuple[int, int]:
@@ -64,7 +80,7 @@ def run(run_date: str, **kwargs) -> str:
 
 def run_backfill(start_date: str, end_date: str, **kwargs) -> str:
     days = date_range(start_date, end_date)
-    existing = get_dates_with_data(TABLE_NAME, "trade_date", start_date, end_date)
+    existing = _existing(start_date, end_date)
     tot_t = tot_i = 0
     for i, d in enumerate(days, 1):
         if pd.to_datetime(d).date() in existing:
@@ -77,7 +93,7 @@ def run_backfill(start_date: str, end_date: str, **kwargs) -> str:
 
 def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     days = date_range(start_date, end_date)
-    existing = get_dates_with_data(TABLE_NAME, "trade_date", start_date, end_date)
+    existing = _existing(start_date, end_date)
     missing = [d for d in days if pd.to_datetime(d).date() not in existing]
     if not missing:
         return f"两融检查完成，{len(days)} 交易日完整。"

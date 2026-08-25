@@ -9,7 +9,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.utils.db import save_to_postgres, get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.market_repository import MarketRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.etf_utils import to_bare_code
 from data_collect.utils.notify import send_dingtalk
@@ -53,15 +55,33 @@ def _download_save_batch(batch: List[str], trade_date: str) -> tuple[int, int]:
     if not chunks:
         return 0, 0
     merged = pd.concat(chunks, ignore_index=True)
-    return save_to_postgres(merged, pre_aligned_df=merged, table_name=TABLE_NAME)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"etf-daily-{trade_date}", job_name="etf_daily", code_version="unknown",
+        config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        written = MarketRepository(kernel).upsert_daily_bars(
+            TABLE_NAME, merged.to_dict("records"), "code", context,
+            pd.to_datetime(trade_date).date(), pd.to_datetime(trade_date).date(),
+        )
+    finally:
+        kernel.close()
+    return len(merged), written
 
 
 def _missing_codes(trade_date: str, codes: list) -> list:
-    with get_connection() as conn:
-        existing = pd.read_sql(
-            "SELECT DISTINCT code FROM etf_daily_kline WHERE trade_date = %s",
-            conn, params=[trade_date])
-    have = set(existing["code"])
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id="etf-daily-missing", job_name="etf_daily", code_version="unknown",
+        config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        have = MarketRepository(kernel).existing_codes(
+            TABLE_NAME, "code", normalize_trade_date(trade_date), context
+        )
+    finally:
+        kernel.close()
     return [c for c in codes if to_bare_code(c) not in have]
 
 

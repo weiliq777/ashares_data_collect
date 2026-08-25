@@ -6,7 +6,7 @@ CREATE SCHEMA IF NOT EXISTS research;
 CREATE TABLE IF NOT EXISTS research.snapshot_manifest (
     snapshot_id UUID PRIMARY KEY,
     research_cutoff_date DATE NOT NULL,
-    data_baseline_tag VARCHAR(100) NOT NULL REFERENCES tushare_data_release(release_tag),
+    data_baseline_tag VARCHAR(100) NOT NULL REFERENCES ops.tushare_data_release(release_tag),
     schema_version VARCHAR(40) NOT NULL,
     code_version VARCHAR(180) NOT NULL,
     git_commit CHAR(40),

@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS backtest.dataset_manifest (
     dataset_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     dataset_version VARCHAR(40) NOT NULL,
     dataset_name VARCHAR(160) NOT NULL,
-    data_baseline_tag VARCHAR(100) NOT NULL REFERENCES tushare_data_release(release_tag),
+    data_baseline_tag VARCHAR(100) NOT NULL REFERENCES ops.tushare_data_release(release_tag),
     baseline_quality_report_hash CHAR(64),
     baseline_source_manifest_hash CHAR(64),
     schema_version VARCHAR(40) NOT NULL,
@@ -634,7 +634,7 @@ DECLARE
 BEGIN
     SELECT status, quality_report_hash
       INTO release_status, release_quality_hash
-      FROM tushare_data_release
+      FROM ops.tushare_data_release
      WHERE release_tag = NEW.data_baseline_tag;
     IF NEW.baseline_quality_report_hash IS NULL
        OR (release_status = 'validated'

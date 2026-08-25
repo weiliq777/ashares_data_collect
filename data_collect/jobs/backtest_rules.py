@@ -15,7 +15,9 @@ from typing import Any, Iterable
 
 import yaml
 
-from data_collect.utils.db import get_connection, require_psycopg2
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.backtest_rules_repository import BacktestRulesRepository
 
 
 REQUIRED_FIELDS = {
@@ -193,75 +195,16 @@ def insert_rule_records(
     metadata = approval_metadata or {}
     assert_rule_document_approved(metadata)
     approval_hash = _approval_hash(metadata, rows)
-    psycopg2, _ = require_psycopg2()
-    with get_connection() as conn, conn.cursor() as cur:
-        for row in rows:
-            # normalize_rule_records 只能发现本次文件内的重叠；这里再检查数据库中
-            # 已导入的同一市场/规则版本区间，避免分批导入时跨文件形成歧义。
-            cur.execute(
-                """SELECT rule_version, effective_from, effective_to
-                     FROM backtest.market_rule_effective
-                    WHERE market=%s
-                      AND market_rule_version=%s
-                      AND fee_rule_version=%s
-                      AND NOT (rule_version=%s AND effective_from=%s)
-                      AND effective_from <= COALESCE(%s, DATE '9999-12-31')
-                      AND COALESCE(effective_to, DATE '9999-12-31') >= %s
-                    LIMIT 1""",
-                (
-                    row["market"], row["market_rule_version"], row["fee_rule_version"],
-                    row["rule_version"], row["effective_from"], row["effective_to"],
-                    row["effective_from"],
-                ),
-            )
-            overlap = cur.fetchone()
-            if overlap:
-                raise ValueError(
-                    "数据库中已有重叠市场规则区间，禁止追加歧义规则: "
-                    f"market={row['market']}, rule={row['rule_version']}, "
-                    f"existing={overlap[0]}/{overlap[1]}"
-                )
-            cur.execute(
-                """INSERT INTO backtest.market_rule_effective
-                     (rule_version, market_rule_version, fee_rule_version,
-                      effective_from, effective_to, market, min_buy_lot,
-                      allow_sell_odd_lot, t_plus_one, price_tick,
-                      cash_settlement_days, limit_pct, commission_rate,
-                      min_commission, stamp_duty_sell_rate, transfer_fee_rate,
-                      slippage_bps, parameters, approval_status, approved_by,
-                      approved_at, approval_hash)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (rule_version, effective_from, market) DO NOTHING""",
-                (
-                    row["rule_version"], row["market_rule_version"], row["fee_rule_version"],
-                    row["effective_from"], row["effective_to"], row["market"],
-                    row["min_buy_lot"], row["allow_sell_odd_lot"], row["t_plus_one"],
-                    row["price_tick"], row["cash_settlement_days"], row["limit_pct"],
-                    row["commission_rate"], row["min_commission"],
-                    row["stamp_duty_sell_rate"], row["transfer_fee_rate"],
-                    row["slippage_bps"], psycopg2.extras.Json(row["parameters"]),
-                    "APPROVED", str(metadata["approved_by"]).strip(),
-                    str(metadata["approved_at"]), approval_hash,
-                ),
-            )
-            cur.execute(
-                """SELECT market_rule_version, fee_rule_version, effective_to, min_buy_lot,
-                          allow_sell_odd_lot, t_plus_one, price_tick, cash_settlement_days,
-                          limit_pct, commission_rate, min_commission, stamp_duty_sell_rate,
-                          transfer_fee_rate, slippage_bps, parameters
-                     FROM backtest.market_rule_effective
-                    WHERE rule_version=%s AND effective_from=%s AND market=%s""",
-                (row["rule_version"], row["effective_from"], row["market"]),
-            )
-            existing = cur.fetchone()
-            existing_row = dict(zip(RULE_CONTENT_FIELDS, existing)) if existing else None
-            if existing_row and rule_content_fingerprint(existing_row) != rule_content_fingerprint(row):
-                raise ValueError(
-                    "规则主键已存在但内容不同，禁止静默覆盖；请新增 rule_version: "
-                    f"{row['rule_version']}/{row['effective_from']}/{row['market']}"
-                )
-        conn.commit()
-    return len(rows)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    repository = BacktestRulesRepository(kernel)
+    context = RunContext(
+        run_id=f"backtest-rules-{approval_hash[:12]}", job_name="backtest_rules",
+        code_version="unknown", config_hash=approval_hash, pipeline_version="data-access-v1",
+    )
+    try:
+        return repository.insert_approved(rows, approval_hash, metadata, RULE_CONTENT_FIELDS, rule_content_fingerprint, context)
+    finally:
+        kernel.close()
 
 
 def main() -> None:

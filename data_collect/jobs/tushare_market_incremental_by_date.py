@@ -16,22 +16,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_collect.jobs.tushare_daily_incremental import (
-    _assert_standard_count,
-    _codes,
-    _checkpoint,
-    _date,
-    _rebuild_market_date,
-    _trade_dates,
-    _version_and_snapshot,
-)
+import data_collect.jobs.tushare_daily_incremental as market_shared
+from data_collect.jobs.tushare_job_lock import warehouse_write_job
 from data_collect.normalize.tushare_daily import normalize_daily, normalize_daily_basic
 from data_collect.ops.market_coverage import (
     persist_market_coverage_blocked,
     persist_market_coverage_gate,
 )
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.utils.db import get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.market_repository import MarketRepository
 
 
 logger = logging.getLogger("tushare_market_incremental_by_date")
@@ -67,16 +62,16 @@ ROW_LIMITS = {
 def _validated_baseline_cutoff(explicit: str | None = None):
     """读取已验收历史基线，增量任务不跨越冻结点。"""
     if explicit:
-        return _date(explicit)
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT baseline_cutoff_date
-               FROM tushare_data_release
-               WHERE status='validated'
-               ORDER BY validated_at DESC NULLS LAST, release_id DESC
-               LIMIT 1"""
-        )
-        row = cur.fetchone()
+        return market_shared._date(explicit)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id="market-incremental-baseline", job_name="tushare_market_incremental_by_date",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        return MarketRepository(kernel).validated_baseline_cutoff(context)
+    finally:
+        kernel.close()
     if not row:
         raise RuntimeError(
             "未找到 validated 数据基线；请先建立历史发布点，或显式传入 baseline_cutoff"
@@ -115,7 +110,7 @@ def _request_market_frame(pro, dataset: str, day: str) -> pd.DataFrame:
         limit,
     )
     chunks = []
-    codes = _codes()
+    codes = market_shared._codes()
     for offset in range(0, len(codes), 1000):
         code_batch = ",".join(codes[offset : offset + 1000])
         if not code_batch:
@@ -148,10 +143,10 @@ def _sync_one_date(
         if not dry_run and not sample_codes:
             try:
                 blocked_batch = (
-                    f"{batch_id}-blocked-{dataset}-{_date(day).strftime('%Y%m%d')}"
+                    f"{batch_id}-blocked-{dataset}-{market_shared._date(day).strftime('%Y%m%d')}"
                 )
                 persist_market_coverage_blocked(
-                    dataset, _date(day), state["actual_rows"], blocked_batch, str(exc)
+                    dataset, market_shared._date(day), state["actual_rows"], blocked_batch, str(exc)
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -189,13 +184,13 @@ def _sync_one_date_impl(
         logger.warning("dataset=%s trade_date=%s rows=0: %s", dataset, day, message)
         if not dry_run:
             gate = persist_market_coverage_gate(
-                dataset, _date(day), 0, batch_id, sample_mode=bool(sample_codes)
+                dataset, market_shared._date(day), 0, batch_id, sample_mode=bool(sample_codes)
             )
             if not sample_codes and not gate.publishable:
                 raise RuntimeError(
                     f"{dataset} {day} 覆盖率门禁失败: {gate.status} {gate.reason}"
                 )
-            _checkpoint(
+            market_shared._checkpoint(
                 checkpoint_dataset, day,
                 "sample" if sample_codes else "failed",
                 0,
@@ -220,7 +215,7 @@ def _sync_one_date_impl(
 
     gate = persist_market_coverage_gate(
         dataset,
-        _date(day),
+        market_shared._date(day),
         int(frame["ts_code"].nunique()) if "ts_code" in frame.columns else rows,
         batch_id,
         sample_mode=bool(sample_codes),
@@ -230,10 +225,10 @@ def _sync_one_date_impl(
             f"{dataset} {day} 覆盖率门禁失败: {gate.status} {gate.reason}"
         )
 
-    versions, snapshots = _version_and_snapshot(dataset, frame, batch_id)
-    _rebuild_market_date(frame, dataset, _date(day))
-    actual = _assert_standard_count(dataset, _date(day), standard_table)
-    _checkpoint(checkpoint_dataset, day, "sample" if sample_codes else "done", versions)
+    versions, snapshots = market_shared._version_and_snapshot(dataset, frame, batch_id)
+    market_shared._rebuild_market_date(frame, dataset, market_shared._date(day))
+    actual = market_shared._assert_standard_count(dataset, market_shared._date(day), standard_table)
+    market_shared._checkpoint(checkpoint_dataset, day, "sample" if sample_codes else "done", versions)
     logger.info(
         "dataset=%s trade_date=%s api_rows=%s versions=%s raw_attempted=%s standard_rows=%s",
         dataset,
@@ -246,6 +241,7 @@ def _sync_one_date_impl(
     return versions
 
 
+@warehouse_write_job
 def run(
     end_date: str | None = None,
     lookback_days: int = 5,
@@ -254,7 +250,7 @@ def run(
     limit_stocks: int | None = None,
     dry_run: bool = False,
     baseline_cutoff: str | None = None,
-    rebuild_derived: bool = True,
+    rebuild_derived: bool = False,
     run_date: str | None = None,
 ) -> str:
     """同步最近交易日。
@@ -268,17 +264,21 @@ def run(
         raise ValueError(f"不支持的数据集: {dataset}")
     if limit_stocks is not None and int(limit_stocks) <= 0:
         raise ValueError("limit_stocks 必须大于 0")
+    if limit_stocks is not None and not dry_run:
+        raise ValueError(
+            "limit_stocks 仅允许与 dry_run 一起使用；小样本真实写入必须使用隔离 smoke 表"
+        )
 
     if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
         raise ValueError("end_date 与 run_date 不一致")
     end = (end_date or run_date or date.today().strftime("%Y%m%d")).replace("-", "")
     batch_id = uuid.uuid4().hex
     pro = get_pro()
-    calendar = _trade_dates(pro, end, int(lookback_days))
+    calendar = market_shared._trade_dates(pro, end, int(lookback_days))
     if calendar is None or calendar.empty:
         return "没有找到需要同步的交易日"
     if not dry_run:
-        _version_and_snapshot("trade_cal", calendar, batch_id)
+        market_shared._version_and_snapshot("trade_cal", calendar, batch_id)
 
     cutoff = _validated_baseline_cutoff(baseline_cutoff)
     calendar = calendar[pd.to_datetime(calendar["cal_date"]) > pd.Timestamp(cutoff)]
@@ -289,7 +289,7 @@ def run(
     selected = list(DATASETS) if dataset == "all" else [dataset]
     sample_codes = None
     if limit_stocks:
-        sample_codes = set(_codes()[: int(limit_stocks)])
+        sample_codes = set(market_shared._codes()[: int(limit_stocks)])
         logger.warning("sample mode enabled: only %s stocks", len(sample_codes))
 
     logger.info(
@@ -299,6 +299,7 @@ def run(
         selected,
     )
     total = 0
+    materialized_partitions = 0
     for day in days:
         for current in selected:
             try:
@@ -310,10 +311,11 @@ def run(
                     sample_codes=sample_codes,
                     dry_run=dry_run,
                 )
+                materialized_partitions += int(not dry_run)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("date-batch failed dataset=%s trade_date=%s", current, day)
                 if not dry_run:
-                    _checkpoint(
+                    market_shared._checkpoint(
                         f"{current}_incremental_by_date",
                         day,
                         "failed",
@@ -323,14 +325,18 @@ def run(
                 raise
             time.sleep(float(batch_pause))
 
-    if rebuild_derived and not dry_run and total:
+    # Re-run the bounded derived interval even when every Raw payload was an
+    # idempotent duplicate.  A previous attempt may have committed Raw and
+    # Standard before failing in Feature; using only newly inserted Raw rows
+    # as the trigger would make that failure impossible to resume.
+    if rebuild_derived and not dry_run and materialized_partitions:
         from data_collect.jobs.tushare_derived_rebuild import rebuild_after_market
         try:
-            rebuild_after_market()
+            rebuild_after_market(market_shared._date(days[0]), market_shared._date(days[-1]))
         except Exception as exc:
             # Per-date PASS 只证明接口覆盖率；全局派生重建失败时也必须
             # 追加一个最新 BLOCKED 事实，防止 Research freeze 误放行。
-            last_day = _date(days[-1])
+            last_day = market_shared._date(days[-1])
             try:
                 persist_market_coverage_blocked(
                     "phase2_derived",
@@ -342,7 +348,10 @@ def run(
             except Exception:  # noqa: BLE001
                 logger.exception("failed to persist derived rebuild BLOCKED gate")
             raise
-    return f"按交易日增量完成 batch_id={batch_id} dates={days} versions={total} derived_rebuilt={rebuild_derived and not dry_run and bool(total)}"
+    return (
+        f"按交易日增量完成 batch_id={batch_id} dates={days} versions={total} "
+        f"derived_rebuilt={rebuild_derived and not dry_run and bool(materialized_partitions)}"
+    )
 
 
 def main() -> None:
@@ -357,7 +366,12 @@ def main() -> None:
         "--baseline-cutoff",
         help="显式指定历史基线截止日 YYYYMMDD；未指定时读取数据库 validated 基线",
     )
-    parser.add_argument("--no-rebuild-derived", action="store_true")
+    parser.add_argument("--rebuild-derived", action="store_true")
+    parser.add_argument(
+        "--no-rebuild-derived", dest="rebuild_derived", action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(rebuild_derived=False)
     args = parser.parse_args()
     print(
         run(
@@ -368,7 +382,7 @@ def main() -> None:
             limit_stocks=args.limit_stocks,
             dry_run=args.dry_run,
             baseline_cutoff=args.baseline_cutoff,
-            rebuild_derived=not args.no_rebuild_derived,
+            rebuild_derived=args.rebuild_derived,
         )
     )
 

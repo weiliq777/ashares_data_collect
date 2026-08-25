@@ -16,9 +16,9 @@ import logging
 import pandas as pd
 
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.utils.db import (
-    save_to_postgres, get_dates_with_data, replace_day_then_insert,
-)
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.eastmoney import em_get, clist_query, beijing_now
 
@@ -29,6 +29,12 @@ TABLE_NAME = "fund_flow_daily"
 _FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
 _FIELDS = "f12,f14,f2,f3,f62,f66,f72,f78,f84,f184"
 _WINDOW = 120          # daykline 端点仅保留近 120 交易日
+
+
+def _repo(label: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id=f"fund-flow-{label}", job_name="a_share_fund_flow", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    return kernel, CollectorRepository(kernel), context
 
 
 def _f(x):
@@ -133,7 +139,11 @@ def _sweep_window(target_dates: set) -> tuple[int, int]:
             continue
         df = pd.DataFrame(rows).astype(object)
         df = df.where(pd.notna(df), None)
-        t, ins = save_to_postgres(df, pre_aligned_df=None, table_name=TABLE_NAME)
+        kernel, repository, context = _repo("append")
+        try:
+            t, ins = repository.append(TABLE_NAME, df.to_dict("records"), context, partition="fund-flow")
+        finally:
+            kernel.close()
         tot_t += t; tot_i += ins
         if i % 500 == 0:
             logger.info(f"资金流回补进度 {i}/{len(codes)}，累计写入 {tot_i}")
@@ -148,14 +158,22 @@ def run(run_date: str, **kwargs) -> str:
         return f"{trade_date} 非交易日，资金流跳过。"
     diff = clist_query(fs=_FS, fields=_FIELDS, fid="f62")
     df = normalize_clist(diff, trade_date)
-    tried, inserted = replace_day_then_insert(TABLE_NAME, trade_date, df)
+    kernel, repository, context = _repo("replace")
+    try:
+        tried, inserted = repository.replace_day(TABLE_NAME, pd.to_datetime(trade_date).date(), df.to_dict("records"), context)
+    finally:
+        kernel.close()
     return f"{trade_date} 资金流完成，{len(df)} 票，写入 {tried}/{inserted} 条。"
 
 
 def run_backfill(start_date: str, end_date: str, **kwargs) -> str:
     _assert_in_window(start_date)
     days = date_range(start_date, end_date)
-    existing = get_dates_with_data(TABLE_NAME, "trade_date", start_date, end_date)
+    kernel, repository, context = _repo("dates")
+    try:
+        existing = repository.dates_with_data(TABLE_NAME, pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context)
+    finally:
+        kernel.close()
     target = {pd.to_datetime(d).date() for d in days} - existing
     if not target:
         return f"资金流回补：{len(days)} 交易日已完整，无需回补。"
@@ -166,7 +184,11 @@ def run_backfill(start_date: str, end_date: str, **kwargs) -> str:
 
 def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     days = date_range(start_date, end_date)
-    existing = get_dates_with_data(TABLE_NAME, "trade_date", start_date, end_date)
+    kernel, repository, context = _repo("verify-dates")
+    try:
+        existing = repository.dates_with_data(TABLE_NAME, pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context)
+    finally:
+        kernel.close()
     target = {pd.to_datetime(d).date() for d in days} - existing
     if not target:
         return f"资金流检查完成，{len(days)} 交易日完整。"

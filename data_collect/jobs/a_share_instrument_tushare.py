@@ -7,38 +7,20 @@ import uuid
 import pandas as pd
 
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.utils.db import get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.instrument_repository import InstrumentRepository
 
 
-def run(run_date: str, **kwargs) -> str:
+def run(run_date: str, dry_run: bool = False, **kwargs) -> str:
     pro = get_pro()
     df = call_api(pro.stock_basic, exchange="", list_status="", fields="ts_code,symbol,name,area,industry,market,list_date,delist_date,list_status")
     if df is None or df.empty:
         return "Tushare stock_basic 无数据"
     raw_rows = df.astype(object).where(pd.notna(df), None).to_dict("records")
+    if dry_run:
+        return f"dry-run stock_basic rows={len(raw_rows)}"
     batch_id = f"stock-basic-{run_date}-{uuid.uuid4().hex}"
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            for row in raw_rows:
-                encoded = json.dumps(
-                    row, ensure_ascii=False, allow_nan=False,
-                    sort_keys=True, separators=(",", ":"),
-                )
-                payload_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-                business_key = str(row["ts_code"])
-                cur.execute(
-                    """INSERT INTO tushare_stock_basic_raw_version
-                       (ts_code,business_key,payload,payload_hash,batch_id)
-                       VALUES (%s,%s,%s,%s,%s)
-                       ON CONFLICT (business_key,payload_hash) DO NOTHING""",
-                    (row["ts_code"], business_key, encoded, payload_hash, batch_id),
-                )
-                cur.execute(
-                    """INSERT INTO tushare_stock_basic_raw (ts_code,payload)
-                       VALUES (%s,%s) ON CONFLICT (ts_code) DO NOTHING""",
-                    (row["ts_code"], encoded),
-                )
-        conn.commit()
     out = df.rename(columns={"ts_code": "stock_code"}).copy()
     for col in ["list_date", "delist_date"]:
         out[col] = pd.to_datetime(out[col], format="%Y%m%d", errors="coerce").dt.date
@@ -46,12 +28,10 @@ def run(run_date: str, **kwargs) -> str:
     out["fetched_at"] = datetime.now()
     out = out.astype(object).where(pd.notna(out), None)
     columns = ["stock_code", "symbol", "name", "area", "industry", "market", "list_date", "delist_date", "list_status", "source", "fetched_at"]
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            for row in out[columns].itertuples(index=False, name=None):
-                cur.execute(
-                    '''INSERT INTO stock_basic_info (stock_code,symbol,"name",area,industry,market,list_date,delist_date,list_status,source,fetched_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (stock_code) DO UPDATE SET symbol=EXCLUDED.symbol,"name"=EXCLUDED."name",area=EXCLUDED.area,industry=EXCLUDED.industry,market=EXCLUDED.market,list_date=EXCLUDED.list_date,delist_date=EXCLUDED.delist_date,list_status=EXCLUDED.list_status,source=EXCLUDED.source,fetched_at=EXCLUDED.fetched_at''', row)
-        conn.commit()
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id=f"stock-basic-{run_date}", job_name="a_share_instrument_tushare", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        InstrumentRepository(kernel).persist_stock_basic(raw_rows, batch_id, context)
+    finally:
+        kernel.close()
     return f"Tushare 股票基础信息完成：{len(out)}/{len(out)}"

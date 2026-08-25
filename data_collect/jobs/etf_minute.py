@@ -12,7 +12,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.utils.db import save_to_postgres, get_dates_with_data
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.etf_utils import to_bare_code
 from data_collect.utils.notify import send_dingtalk
@@ -71,7 +73,12 @@ def _collect_day(trade_date: str, codes: list) -> tuple[int, int]:
     if not chunks:
         return 0, 0
     merged = pd.concat(chunks, ignore_index=True)
-    return save_to_postgres(merged, pre_aligned_df=None, table_name=TABLE_NAME)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="etf-minute", job_name="etf_minute", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).append(TABLE_NAME, merged.to_dict("records"), context, partition="etf-minute")
+    finally:
+        kernel.close()
 
 
 def _get_codes(limit_stocks=None) -> list:
@@ -107,7 +114,12 @@ def run_backfill(start_date: str, end_date: str, limit_stocks=None) -> str:
 def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     days = date_range(start_date, end_date)
     codes = _get_codes(kwargs.get("limit_stocks"))
-    existing = get_dates_with_data("etf_minute", "日期", start_date, end_date)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="etf-minute-verify", job_name="etf_minute", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        existing = CollectorRepository(kernel).dates_with_data("etf_minute", pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context)
+    finally:
+        kernel.close()
     missing = [d for d in days if pd.to_datetime(d).date() not in existing]
     if not missing:
         return f"ETF分钟线检查完成，{len(days)} 交易日完整。"

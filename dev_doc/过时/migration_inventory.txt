@@ -1,0 +1,28 @@
+# Data Access migration inventory
+
+刷新时间：2026-08-17
+唯一检查器：tools/check_data_access_contract.py
+
+## 当前代码边界
+
+- 扫描范围：data_collect/jobs、backtest、decision、portfolio、features、ops，以及 data_collect/data_access/repository
+- 扫描文件：137
+- 代码契约违规：0
+- new-only 契约违规：0
+- legacy data_collect/utils/db.py：已删除
+- 全量测试：873 passed, 1 skipped, 8 deselected
+
+## 结论
+
+旧版本的“104 个文件、54 个违规文件、959 项违规”统计已经失效，不能作为当前迁移剩余量使用。当前代码边界扫描未发现仍需迁移的直接数据库访问点。
+
+## 尚未由代码扫描覆盖的生产验收
+
+1. 使用实际应用账号验证 PostgreSQL 角色隔离，而不是超级用户连接。
+2. 核对现有 public 表与 raw/std/pit/feature/contract/research/mart Schema 的映射。
+3. 验证绕过 Kernel 的读写、Raw UPDATE/DELETE、Research 写入会被数据库拒绝。
+4. 验证真实 PostgreSQL 上的超时回滚、重试边界、幂等、SCOPED_MERGE、PARTITION_REPLACE 和 FROZEN 保护。
+
+2026-08-18 更新：程序已切换到普通数据库账号 `ashares_app`；超级用户 `ashares` 保留给人工运维。`ashares_app` 的 Raw UPDATE/DELETE、DDL 和 TRUNCATE 负向验证已通过。
+
+该文件只记录代码迁移状态；生产数据库权限和数据回填状态必须以数据库验收记录为准。

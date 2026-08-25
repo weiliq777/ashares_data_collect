@@ -27,7 +27,7 @@ DECLARE
 BEGIN
     SELECT status, quality_report_hash
       INTO release_status, release_quality_hash
-      FROM tushare_data_release
+      FROM ops.tushare_data_release
      WHERE release_tag = NEW.data_baseline_tag;
     IF NEW.baseline_quality_report_hash IS NULL
        OR (release_status = 'validated'

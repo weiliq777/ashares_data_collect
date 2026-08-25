@@ -132,18 +132,42 @@ def test_default_tushare_pipeline_is_raw_first():
     config = Path("config.yaml").read_text(encoding="utf-8")
     assert "tushare_market_incremental_by_date" in config
     assert "tushare_phase2_incremental" in config
-    assert "tushare_financial_incremental" in config
+    assert "tushare_financial_vip_incremental" in config
     assert "data_collect.jobs.a_share_daily_tushare" not in config
     assert "data_collect.jobs.a_share_valuation_tushare" not in config
     assert "data_collect.jobs.a_share_financial_tushare" not in config
 
 
+def test_incremental_pipeline_has_one_bounded_derived_rebuild_owner():
+    config = Path("config.yaml").read_text(encoding="utf-8")
+    market_block = config.split("name: tushare_market_raw_first", 1)[1].split(
+        "name: tushare_phase2_raw_first", 1
+    )[0]
+    phase2_block = config.split("name: tushare_phase2_raw_first", 1)[1].split(
+        "tushare_financial:", 1
+    )[0]
+    assert "rebuild_derived: false" in market_block
+    assert "rebuild_derived: true" in phase2_block
+
+    source = Path(
+        "data_collect/jobs/tushare_phase2_incremental.py"
+    ).read_text(encoding="utf-8")
+    rebuild_block = source.split("if rebuild_standard and not dry_run", 1)[1]
+    assert "affected_days" in rebuild_block
+    assert "trade_days" in rebuild_block
+    assert "event_days" in rebuild_block
+    assert "dividend_ex_dates" in rebuild_block
+
+
 def test_stock_basic_raw_is_append_only_and_versioned():
-    source = Path("data_collect/jobs/a_share_instrument_tushare.py").read_text(encoding="utf-8")
+    source = Path(
+        "data_collect/data_access/repository/instrument_repository.py"
+    ).read_text(encoding="utf-8")
     assert "tushare_stock_basic_raw_version" in source
-    raw_insert = source.split("INSERT INTO tushare_stock_basic_raw (", 1)[1]
-    assert "ON CONFLICT (ts_code) DO NOTHING" in raw_insert
-    assert "DO UPDATE SET payload" not in source
+    assert "raw_versions" in source
+    assert "update_columns=()" in source
+    assert "bulk_insert_ignore" in source
+    assert '"tushare_stock_basic_raw", raw_current' in source
 
 
 def test_market_incremental_appends_blocked_gate_after_materialization_failure(monkeypatch):
@@ -163,7 +187,7 @@ def test_market_incremental_appends_blocked_gate_after_materialization_failure(m
     with pytest.raises(RuntimeError, match="synthetic materialization failure"):
         job._sync_one_date(None, "daily", "20260803", "batch-smoke")
     assert blocked_calls
-    assert blocked_calls[0][0][0:3] == ("daily", job._date("20260803"), 0)
+    assert blocked_calls[0][0][0:3] == ("daily", job.market_shared._date("20260803"), 0)
     assert "synthetic materialization failure" in blocked_calls[0][0][4]
 
 

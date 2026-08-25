@@ -271,36 +271,16 @@ def test_tag_stocks_empty_title():
 
 # ---------- load_name_dict ----------
 
-class _FakeCursor:
-    def __init__(self, rows):
-        self._rows = rows
-        self.executed_sql = None
+class _FakeInstrumentRepository:
+    def __init__(self, names=None, codes=None):
+        self._names = names or []
+        self._codes = codes or []
 
-    def execute(self, sql):
-        self.executed_sql = sql
+    def name_dict(self, context):
+        return [{"stock_code": code, "InstrumentName": name} for code, name in self._names]
 
-    def fetchall(self):
-        return self._rows
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-class _FakeConn:
-    def __init__(self, rows):
-        self.cursor_obj = _FakeCursor(rows)
-
-    def cursor(self):
-        return self.cursor_obj
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
+    def a_share_codes(self, context):
+        return [{"stock_code": code} for (code,) in self._codes]
 
 
 def test_load_name_dict(monkeypatch):
@@ -312,27 +292,20 @@ def test_load_name_dict(monkeypatch):
         ("430047.BJ", None),        # NULL 名称跳过
         ("601398.SH", "  "),        # 纯空白跳过
     ]
-    fake_conn = _FakeConn(rows)
-    monkeypatch.setattr(nn, "get_connection", lambda: fake_conn)
+    monkeypatch.setattr(nn, "InstrumentRepository", lambda _kernel: _FakeInstrumentRepository(names=rows))
 
     result = nn.load_name_dict()
     assert result == {"贵州茅台": "600519.SH", "万科A": "000002.SZ"}
-    # 查询须过滤 A 股代码空间并使用带引号的 InstrumentName 列
-    assert "instrument_info" in fake_conn.cursor_obj.executed_sql
-    assert '"InstrumentName"' in fake_conn.cursor_obj.executed_sql
-
 
 def test_load_name_dict_empty_table(monkeypatch):
-    monkeypatch.setattr(nn, "get_connection", lambda: _FakeConn([]))
+    monkeypatch.setattr(nn, "InstrumentRepository", lambda _kernel: _FakeInstrumentRepository())
     assert nn.load_name_dict() == {}
 
 
 def test_load_name_dict_t2s_aligned_with_clean_text(monkeypatch):
     """词典键须与 clean_text 同构做 t2s：简体专名"乾照光电"被 t2s 改写（乾→干），
     词典不同步改写则该票的标题命中永远失败（系统性漏标）。"""
-    monkeypatch.setattr(
-        nn, "get_connection", lambda: _FakeConn([("300102.SZ", "乾照光电")])
-    )
+    monkeypatch.setattr(nn, "InstrumentRepository", lambda _kernel: _FakeInstrumentRepository(names=[("300102.SZ", "乾照光电")]))
     name_dict = nn.load_name_dict()
     title = nn.clean_text("乾照光电发布业绩预告")
     assert nn.tag_stocks(title, name_dict) == ["300102.SZ"]
@@ -377,8 +350,6 @@ def test_load_a_share_codes(monkeypatch):
         ("600519.SH",), ("000001.SZ",), ("920019.BJ",),
         ("600519.SH",),          # 重复 → 去重
     ]
-    fake_conn = _FakeConn(rows)
-    monkeypatch.setattr(nn, "get_connection", lambda: fake_conn)
+    monkeypatch.setattr(nn, "InstrumentRepository", lambda _kernel: _FakeInstrumentRepository(codes=rows))
     codes = nn.load_a_share_codes()
     assert codes == ["600519", "000001", "920019"]         # 裸 6 位、保序、去重
-    assert "instrument_info" in fake_conn.cursor_obj.executed_sql

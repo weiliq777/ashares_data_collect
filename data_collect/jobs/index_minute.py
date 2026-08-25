@@ -20,7 +20,9 @@ from tqdm import tqdm
 
 from data_collect.jobs.a_share_minute import normalize_minute_df
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.utils.db import save_to_postgres, get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.xtquant_utils import require_xtdata, get_index_codes, download_history_with_retry
 
@@ -29,10 +31,16 @@ TABLE_NAME = "index_minute"
 _BATCH = 50
 
 
+def _service(label: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id=f"index-minute-{label}", job_name="index_minute", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    return kernel, CollectorRepository(kernel), context
+
+
 def build_index_minute_df(raw, index_code: str) -> pd.DataFrame:
     """xtquant 分钟 df -> index_minute 英文列 schema。
 
-    复用 normalize_minute_df 的时间解析；再把 bar_time/trade_date 转为 psycopg2 可原生适配的
+    复用 normalize_minute_df 的时间解析；再把 bar_time/trade_date 转为数据库可原生适配的
     time/date 类型——**列名对齐不做类型强转**，故此处必须显式转（否则 Timestamp 写不进 TIME 列）。
     """
     base = normalize_minute_df(raw, index_code)
@@ -51,23 +59,9 @@ def build_index_minute_df(raw, index_code: str) -> pd.DataFrame:
     })
 
 
-def _month_partition_ddl(trade_date: str) -> str:
-    """生成当月分区的 CREATE TABLE IF NOT EXISTS 语句（幂等）。"""
-    d = pd.to_datetime(trade_date)
-    start = d.replace(day=1)
-    nxt = start + pd.offsets.MonthBegin(1)
-    child = f"index_minute_{start.year}_{start.month:02d}"
-    return (
-        f"CREATE TABLE IF NOT EXISTS {child} PARTITION OF index_minute "
-        f"FOR VALUES FROM ('{start.strftime('%Y-%m-%d')}') TO ('{nxt.strftime('%Y-%m-%d')}');"
-    )
-
-
-def ensure_month_partition(conn, trade_date: str) -> None:
-    """写入前确保当月分区存在（O(1)、幂等）。"""
-    with conn.cursor() as cur:
-        cur.execute(_month_partition_ddl(trade_date))
-    conn.commit()
+def ensure_month_partition(trade_date: str) -> None:
+    """Partitions are provisioned by migrations, not by collection jobs."""
+    return None
 
 
 def _download_save_batch(batch: List[str], trade_date: str) -> tuple[int, int]:
@@ -91,16 +85,20 @@ def _download_save_batch(batch: List[str], trade_date: str) -> tuple[int, int]:
     if not chunks:
         return 0, 0
     merged = pd.concat(chunks, ignore_index=True)
-    return save_to_postgres(merged, pre_aligned_df=None, table_name=TABLE_NAME)
+    kernel, repository, context = _service("write")
+    try:
+        return repository.append(TABLE_NAME, merged.to_dict("records"), context, partition="index-minute")
+    finally:
+        kernel.close()
 
 
 def _missing_codes(trade_date: str, codes: list) -> list:
     """按日跳过已入库代码（幂等推进：重试/下轮只采未采到的，抗挂起收敛）。"""
-    with get_connection() as conn:
-        existing = pd.read_sql(
-            "SELECT DISTINCT index_code FROM index_minute WHERE trade_date = %s",
-            conn, params=[trade_date])
-    have = set(existing["index_code"])
+    kernel, repository, context = _service("missing")
+    try:
+        have = repository.existing_codes(TABLE_NAME, pd.to_datetime(trade_date).date(), "index_code", context)
+    finally:
+        kernel.close()
     return [c for c in codes if c not in have]
 
 
@@ -131,8 +129,7 @@ def run(run_date: str, **kwargs) -> str:
     if not is_market_day(trade_date):
         return f"{trade_date} 非交易日，指数分钟线跳过。"
     codes = _get_codes(kwargs.get("limit_stocks"))
-    with get_connection() as conn:
-        ensure_month_partition(conn, trade_date)
+    ensure_month_partition(trade_date)
     with tqdm(total=len(codes), desc=f"指数分钟({trade_date})", unit="个", file=sys.stdout) as pbar:
         tried, inserted = _collect_one_day(trade_date, codes, pbar)
     return f"{trade_date} 指数分钟线完成，写入 {tried}/{inserted} 条。"
@@ -150,8 +147,7 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     codes = _get_codes(kwargs.get("limit_stocks"))
     tot_t = tot_i = fixed = 0
     for i, d in enumerate(days, 1):
-        with get_connection() as conn:
-            ensure_month_partition(conn, d)
+        ensure_month_partition(d)
         missing = _missing_codes(d, codes)
         if not missing:
             continue

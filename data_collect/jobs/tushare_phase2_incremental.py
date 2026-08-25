@@ -13,6 +13,7 @@ import uuid
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 
@@ -21,9 +22,12 @@ from data_collect.jobs.tushare_phase2_raw_init import (
     _save_frame,
     _trade_dates,
 )
-from data_collect.jobs.tushare_history_init import _save_calendar
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.utils.db import get_connection
+from data_collect.jobs.tushare_job_lock import warehouse_write_job
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.history_repository import HistoryRepository
+from data_collect.data_access.repository.phase2_raw_repository import Phase2RawRepository
 
 
 logger = logging.getLogger("tushare_phase2_incremental")
@@ -51,35 +55,34 @@ ROW_LIMITS = {"stock_st": 1000, "stk_limit": 5800}
 INDEX_CODES = ("000300.SH", "000905.SH", "000852.SH", "000016.SH")
 
 
+def _service(label: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"phase2-incremental-{label}-{uuid4().hex}", job_name="tushare_phase2_incremental",
+        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
+    )
+    return kernel, Phase2RawRepository(kernel), HistoryRepository(kernel), context
+
+
 def _baseline_cutoff(explicit: str | None = None):
     if explicit:
         return _date(explicit)
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT baseline_cutoff_date
-               FROM tushare_data_release
-               WHERE status='validated'
-               ORDER BY validated_at DESC NULLS LAST, release_id DESC
-               LIMIT 1"""
-        )
-        row = cur.fetchone()
-    if not row:
+    kernel, repository, _, context = _service("baseline")
+    try:
+        value = repository.baseline_cutoff(context)
+    finally:
+        kernel.close()
+    if value is None:
         raise RuntimeError("未找到 validated 数据基线，请先建立历史发布点")
-    return row[0]
+    return value
 
 
 def _checkpoint(dataset: str, key: str, status: str, rows: int = 0, error: str | None = None):
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """INSERT INTO tushare_history_checkpoint
-               (dataset, checkpoint_key, status, rows_written, error_message, updated_at)
-               VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
-               ON CONFLICT (dataset, checkpoint_key) DO UPDATE SET
-                 status=EXCLUDED.status, rows_written=EXCLUDED.rows_written,
-                 error_message=EXCLUDED.error_message, updated_at=CURRENT_TIMESTAMP""",
-            (dataset, key, status, rows, error),
-        )
-        conn.commit()
+    kernel, _, history, context = _service("checkpoint")
+    try:
+        return history.save(dataset, key, status, rows, context, error)
+    finally:
+        kernel.close()
 
 
 def _calendar_days(start, end) -> list[str]:
@@ -117,18 +120,26 @@ def _refresh_trade_calendar(pro, start: str, end: str, dry_run: bool) -> int:
         logger.info("dry-run trade_cal window=%s:%s api_rows=%s", start, end, rows)
         return rows
     if rows:
-        _save_calendar(frame, normalize_standard=True)
+        from data_collect.jobs.tushare_daily_incremental import _version_and_snapshot
+        from data_collect.jobs.tushare_raw_to_standard import rebuild_calendar
+
+        _version_and_snapshot(
+            "trade_cal", frame, f"phase2-calendar-{uuid.uuid4().hex}"
+        )
+        # The calendar refresh is an incremental window. Rebuilding the
+        # entire historical calendar here turns every phase2 run into a full
+        # Raw->Standard scan and defeats the bounded-work contract.
+        rebuild_calendar(start_date=_date(start), end_date=_date(end))
     logger.info("trade_cal refreshed window=%s:%s api_rows=%s", start, end, rows)
     return rows
 
 
 def _stock_codes() -> list[str]:
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT stock_code FROM stock_basic_info
-               WHERE list_status IN ('L','D','P','G') ORDER BY stock_code"""
-        )
-        return [row[0] for row in cur.fetchall()]
+    kernel, _, history, context = _service("stock-codes")
+    try:
+        return history.active_stock_codes(context)
+    finally:
+        kernel.close()
 
 
 def _request_date_frame(pro, dataset: str, day: str) -> pd.DataFrame:
@@ -197,7 +208,14 @@ def _run_date_datasets(pro, days: list[str], batch_id: str, pause: float, dry_ru
     return total
 
 
-def _run_dividend(pro, days: list[str], batch_id: str, pause: float, dry_run: bool) -> int:
+def _run_dividend(
+    pro,
+    days: list[str],
+    batch_id: str,
+    pause: float,
+    dry_run: bool,
+    affected_ex_dates: list[date] | None = None,
+) -> int:
     """按公告/实施公告日期查询，不再逐只股票扫描。"""
     total = 0
     for field in ("ann_date", "imp_ann_date"):
@@ -211,6 +229,13 @@ def _run_dividend(pro, days: list[str], batch_id: str, pause: float, dry_run: bo
                 elif rows == 0:
                     _checkpoint("dividend_incremental", key, "empty", 0, "接口返回空数据")
                 else:
+                    if affected_ex_dates is not None and "ex_date" in frame.columns:
+                        affected_ex_dates.extend(
+                            value.date()
+                            for value in pd.to_datetime(
+                                frame["ex_date"], format="%Y%m%d", errors="coerce"
+                            ).dropna()
+                        )
                     inserted = _save_frame("tushare_dividend_raw", frame, batch_id)
                     total += inserted
                     _checkpoint("dividend_incremental", key, "done", inserted)
@@ -279,7 +304,11 @@ def _run_index(pro, start: str, end: str, batch_id: str, pause: float, dry_run: 
     return total
 
 
-def _rebuild_standard(datasets: set[str]):
+def _rebuild_standard(
+    datasets: set[str],
+    start_date: date | str | None = None,
+    end_date: date | str | None = None,
+):
     from data_collect.jobs.tushare_phase2_standard import run as rebuild
 
     tasks = set()
@@ -293,20 +322,25 @@ def _rebuild_standard(datasets: set[str]):
         tasks.add("index_daily")
     for task in sorted(tasks):
         logger.info("rebuilding phase2 standard task=%s", task)
-        rebuild(task)
+        rebuild(task, start_date, end_date)
     from data_collect.jobs.tushare_phase2_features import run as rebuild_features
 
     feature_tasks = set()
     if datasets & set(DATE_DATASETS):
-        feature_tasks.update({"price", "price_v2", "valuation"})
+        # price_daily_v1 is retained as a read-only legacy archive.  Do not
+        # refresh it during daily production increments; otherwise every
+        # market run performs the old final-adj-factor rebuild in addition to
+        # the point-in-time-safe v2 rebuild.
+        feature_tasks.update({"price_v2", "valuation"})
     if "dividend" in datasets:
         feature_tasks.update({"price_v2", "shareholder_return"})
     if feature_tasks:
         for task in sorted(feature_tasks):
             logger.info("rebuilding phase2 feature task=%s", task)
-            rebuild_features(task)
+            rebuild_features(task, start_date, end_date)
 
 
+@warehouse_write_job
 def run(
     end_date: str | None = None,
     lookback_days: int = 5,
@@ -315,7 +349,7 @@ def run(
     dataset: str = "all",
     baseline_cutoff: str | None = None,
     dry_run: bool = False,
-    rebuild_standard: bool = True,
+    rebuild_standard: bool = False,
     run_date: str | None = None,
 ) -> str:
     allowed = {"all", "date", "dividend", "namechange", "index_daily"}
@@ -327,6 +361,7 @@ def run(
     if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
         raise ValueError("end_date 与 run_date 不一致")
     end = (end_date or run_date or date.today().strftime("%Y%m%d")).replace("-", "")
+    end_dt = datetime.strptime(end, "%Y%m%d").date()
     cutoff = _baseline_cutoff(baseline_cutoff)
     calendar_start = (
         pd.to_datetime(end) - timedelta(days=max(lookback_days * 3, 10))
@@ -334,8 +369,11 @@ def run(
     pro = get_pro()
     _refresh_trade_calendar(pro, calendar_start, end, dry_run)
     trade_days = _trading_days(end, lookback_days, cutoff)
-    event_start = max(cutoff + timedelta(days=1), datetime.strptime(end, "%Y%m%d").date() - timedelta(days=event_lookback_days - 1))
-    event_days = _calendar_days(event_start, datetime.strptime(end, "%Y%m%d").date())
+    event_start = max(
+        cutoff + timedelta(days=1),
+        end_dt - timedelta(days=event_lookback_days - 1),
+    )
+    event_days = _calendar_days(event_start, end_dt)
     if not trade_days and dataset in {"all", "date", "index_daily"}:
         logger.warning("基线之后没有可用交易日，date/index 任务跳过")
     if not event_days and dataset in {"all", "dividend", "namechange"}:
@@ -350,14 +388,32 @@ def run(
     total = 0
     if selected & set(DATE_DATASETS) and trade_days:
         total += _run_date_datasets(pro, trade_days, batch_id, batch_pause, dry_run)
+    dividend_ex_dates: list[date] = []
     if "dividend" in selected and event_days:
-        total += _run_dividend(pro, event_days, batch_id, batch_pause, dry_run)
+        total += _run_dividend(
+            pro,
+            event_days,
+            batch_id,
+            batch_pause,
+            dry_run,
+            affected_ex_dates=dividend_ex_dates,
+        )
     if "namechange" in selected and event_days:
         total += _run_namechange(pro, event_days[0], event_days[-1], batch_id, batch_pause, dry_run)
     if "index_daily" in selected and trade_days:
         total += _run_index(pro, trade_days[0], trade_days[-1], batch_id, batch_pause, dry_run)
     if rebuild_standard and not dry_run:
-        _rebuild_standard(selected)
+        affected_days = [
+            datetime.strptime(value, "%Y%m%d").date()
+            for value in [*trade_days, *event_days]
+        ]
+        # A corrected historical dividend changes total-return coordinates and
+        # rolling shareholder-return features from its ex-date onward.
+        affected_days.extend(value for value in dividend_ex_dates if value <= end_dt)
+        derived_start = min(affected_days) if affected_days else None
+        derived_end = end_dt if affected_days else None
+        if affected_days:
+            _rebuild_standard(selected, derived_start, derived_end)
     return f"阶段二增量完成 batch_id={batch_id} cutoff={cutoff} total_inserted={total}"
 
 
@@ -370,11 +426,19 @@ def main():
     parser.add_argument("--dataset", choices=["all", "date", "dividend", "namechange", "index_daily"], default="all")
     parser.add_argument("--baseline-cutoff")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--rebuild-standard", action="store_true", help="兼容旧命令；默认已自动重建派生层")
-    parser.add_argument("--no-rebuild-derived", action="store_true", help="仅调试时跳过 Standard/PIT/Feature 重建")
+    parser.add_argument(
+        "--rebuild-derived", "--rebuild-standard", dest="rebuild_derived",
+        action="store_true",
+        help="显式重建 Standard/PIT/Feature；增量任务默认只写 Raw",
+    )
+    parser.add_argument(
+        "--no-rebuild-derived", dest="rebuild_derived", action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(rebuild_derived=False)
     args = parser.parse_args()
     values = vars(args)
-    values["rebuild_standard"] = not values.pop("no_rebuild_derived")
+    values["rebuild_standard"] = values.pop("rebuild_derived")
     print(run(**values))
 
 

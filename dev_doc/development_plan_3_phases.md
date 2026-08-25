@@ -275,7 +275,7 @@ Backtest/Portfolio 的第一版代码已落地，但正式历史回测仍受门�
 - Dataset 校验已升级为对账最终物化子表：全局日历/规则/执行行情/公司行为哈希，以及成员级按研究日哈希，都必须与 Manifest 一致；规则同时按 `market_rule_version`、`fee_rule_version` 和生效日期筛选，公司行为按业务键去重，Dataset 创建还要求 warmup 到 evaluation_end 的每个 SSE 开市日均有 FROZEN Snapshot，独立 validate 也会复核完整区间及成员角色；规则同主键内容冲突、审核元数据未批准、以及 build 后代码身份变化均会阻断正式发布；快照系列和 Dataset 截止日必须为开市日；Dataset 还保存基线 `baseline_quality_report_hash` 并将其纳入 `input_manifest_hash`，数据库触发器校验与 validated 发布点一致；47 项正式审计专项测试、迁移执行和数据库回滚烟测已通过。规则有效区间另由 PostgreSQL `EXCLUDE USING gist` 防止同一作用域重叠。执行行情缺少日线/状态/可交易性任一来源时标记 `MISSING_SOURCE` 并阻断正式 Dataset；行情物化或全局派生重建失败会追加最新 `BLOCKED` 门禁，不能让旧 PASS 放行；历史未建立 Raw version 的行允许版本号为空但必须有 payload 哈希。Dataset 选择版本 Raw 时只解析一个完整 payload，不跨版本按字段拼接；退市持仓无真实退出事件时 fail-closed；同日 BUY 按分数排序，T+1 开盘按实际价格重算股数，实际股数变化会记录 `resized_at_execution`；送转零碎股 v1 按整数股向下取整，不产生现金补偿；Monte Carlo 记录方法/参数/输入序列哈希；Run 触发器强制输入哈希和规则版本与 Dataset 一致。另在临时隔离数据库完成 Dataset→Run→Portfolio 全链路联调，结果已清理且未改生产库。新增 `ops.market_data_quality_gate` 按日覆盖率门禁和 `phase3_validation.py` PIT 只读校验；正式 Dataset/Run/Portfolio 仍受显式规则、多日期 `research-v1.1` FROZEN 快照和干净代码版本门禁。
 ## 2026-08-07 最新状态覆盖
 
-本节覆盖本文中早于 2026-08-07 的“尚无 Dataset/Run”历史描述，详细权威说明见 `dev_doc/current_implementation_state_20260807.md`。
+本节覆盖本文中早于 2026-08-07 的“尚无 Dataset/Run”历史描述；当前数据访问与基座状态见 `dev_doc/data_access_current_status_20260818.md`，旧回测状态记录已归档。
 
 阶段三当前不是“尚未创建 Dataset/Run”：三日 Baseline 已真实完成：
 

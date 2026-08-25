@@ -16,7 +16,11 @@ def derive_lifecycle_interval(start: date, end: date | None, next_start: date | 
 
 def dividend_business_key(ts_code: str, report_date, announce_date, status: str | None,
                           record_date, ex_date, implementation_announce_date) -> str:
-    values = (ts_code, report_date, announce_date, status, record_date, ex_date, implementation_announce_date)
+    # Event dates are mutable attributes during the plan-to-implementation
+    # lifecycle. The stable key identifies one status stage for one report;
+    # source version/hash preserves every correction without duplicating the
+    # current Standard fact when record/ex/announcement dates are revised.
+    values = (ts_code, report_date, status)
     return ":".join("" if value is None else str(value) for value in values)
 
 

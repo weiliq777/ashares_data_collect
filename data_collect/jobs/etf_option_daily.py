@@ -21,7 +21,9 @@ import pandas as pd
 import requests
 
 from data_collect.utils.date_utils import is_market_day
-from data_collect.utils.db import replace_day_then_insert
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.df_utils import normalize_trade_date
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,15 @@ _HDR = {"Referer": "https://stock.finance.sina.com.cn/",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 _BATCH = 50
 _LINE_RE = re.compile(r'hq_str_(?:CON_OP_|CON_SO_)(\w+)="([^"]*)"')
+
+
+def _replace(day, rows):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="etf-option", job_name="etf_option_daily", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).replace_day(TABLE_NAME, pd.to_datetime(day).date(), rows, context)
+    finally:
+        kernel.close()
 
 
 def _f(x):
@@ -144,7 +155,7 @@ def run(run_date: str, **kwargs) -> str:
     if not is_market_day(trade_date):
         return f"{trade_date} 非交易日，ETF期权跳过。"
     df = _collect_day(trade_date)
-    tried, inserted = replace_day_then_insert(TABLE_NAME, trade_date, df)
+    tried, inserted = _replace(trade_date, df.to_dict("records"))
     return f"{trade_date} ETF期权完成，{len(df)} 合约，写入 {tried}/{inserted} 条。"
 
 

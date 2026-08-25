@@ -30,20 +30,26 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-import talib
 from tqdm import tqdm
 
 from data_collect.config import _load_config
 from data_collect.utils.date_utils import is_market_day, date_range, add_mark_day
-from data_collect.utils.db import get_connection, require_psycopg2
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.wave3_repository import Wave3Repository
 from data_collect.utils.df_utils import normalize_trade_date
-from data_collect.utils.indicators import kd
 from data_collect.utils.notify import send_dingtalk
 
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "wave3_stocks"
 HISTORY_DAYS = 60  # 指标计算所需的历史天数缓冲
+
+
+def _service(label: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id=f"wave3-{label}", job_name="wave3", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    return kernel, Wave3Repository(kernel), context
 
 
 # ======== 配置 ========
@@ -55,173 +61,43 @@ def _get_wave3_config() -> dict:
 
 # ======== 数据读取 ========
 
-def _fetch_daily_kline(end_date: str, days: int = HISTORY_DAYS) -> pd.DataFrame:
-    """从 daily_kline 表读取日线数据。"""
+def _fetch_technical_features(end_date: str, days: int = HISTORY_DAYS) -> pd.DataFrame:
+    """Read precomputed foundation technical features through Wave3Repository."""
     start_date = add_mark_day(end_date, -days)
-
-    sql = """
-    SELECT trade_date, stock_code, open, high, low, close, volume, amount
-    FROM daily_kline
-    WHERE trade_date >= %s AND trade_date <= %s
-    ORDER BY stock_code, trade_date
-    """
-    with get_connection() as conn:
-        df = pd.read_sql(sql, conn, params=[start_date, end_date])
-    return df
-
-
-def _fetch_divid_factors(stock_codes: list) -> pd.DataFrame:
-    """读取除权因子数据（dr 字段），用于等比前复权。"""
-    if not stock_codes:
-        return pd.DataFrame()
-    placeholders = ",".join(["%s"] * len(stock_codes))
-    sql = f"""
-    SELECT stock_code, date, dr
-    FROM divid_factors
-    WHERE stock_code IN ({placeholders})
-    ORDER BY stock_code, date
-    """
-    with get_connection() as conn:
-        return pd.read_sql(sql, conn, params=stock_codes)
-
-
-def _apply_forward_ratio(df: pd.DataFrame, divid_df: pd.DataFrame) -> pd.DataFrame:
-    """对日线数据做等比前复权。
-
-    保留不复权的 close 为 close_raw（用于市值计算），
-    open/high/low/close 替换为前复权值。
-    """
-    if divid_df.empty:
-        df["close_raw"] = df["close"]
-        return df
-
-    price_cols = ["open", "high", "low", "close"]
-    results = []
-    divid_grouped = dict(list(divid_df.groupby("stock_code")))
-
-    for stock_code, group in df.groupby("stock_code"):
-        group = group.sort_values("trade_date").copy()
-        group["close_raw"] = group["close"].copy()
-
-        stk_divid = divid_grouped.get(stock_code)
-        if stk_divid is None or stk_divid.empty:
-            results.append(group)
-            continue
-
-        stk_divid = stk_divid.sort_values("date")
-        divid_dates = stk_divid["date"].values
-        divid_drs = stk_divid["dr"].values
-
-        # 对每根K线累乘 date <= trade_date 的所有 dr
-        trade_dates = group["trade_date"].values
-        cum_dr = np.empty(len(group), dtype=float)
-        di = 0
-        product = 1.0
-        for qi in range(len(group)):
-            while di < len(divid_dates) and divid_dates[di] <= trade_dates[qi]:
-                product *= divid_drs[di]
-                di += 1
-            cum_dr[qi] = product
-
-        # 等比前复权：ratio = cum_dr / 最后一根K线的 cum_dr
-        last_dr = cum_dr[-1]
-        ratio = cum_dr / last_dr
-
-        for col in price_cols:
-            group[col] = (group[col].astype(float) * ratio).round(2)
-
-        results.append(group)
-
-    return pd.concat(results, ignore_index=True)
-
-
-# ======== 指标计算 ========
-
-def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """基于等比前复权价格计算 WR、RSI、KDJ 技术指标。"""
-    results = []
-
-    for stock_code, group in df.groupby("stock_code"):
-        group = group.sort_values("trade_date").copy()
-
-        high_s = group["high"].astype(float)
-        low_s = group["low"].astype(float)
-        close_s = group["close"].astype(float)
-        high_np = high_s.values
-        low_np = low_s.values
-        close_np = close_s.values
-
-        # WR 威廉指标（talib 返回负值，取反）
-        group["wr1"] = -talib.WILLR(high_np, low_np, close_np, timeperiod=10)
-        group["wr2"] = -talib.WILLR(high_np, low_np, close_np, timeperiod=20)
-
-        # RSI
-        group["rsi9"] = talib.RSI(close_np, timeperiod=9)
-
-        # KDJ（通达信算法，复用 indicators.kd）
-        k_val, d_val = kd(close_s, high_s, low_s, 9)
-        group["k"] = k_val
-        group["d"] = d_val
-        group["j"] = 3 * k_val - 2 * d_val
-
-        results.append(group)
-
-    return pd.concat(results, ignore_index=True)
+    kernel, repository, context = _service("kline")
+    try:
+        return pd.DataFrame(repository.technical_features(pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context))
+    finally:
+        kernel.close()
 
 
 def _prepare_indicators(trade_date: str) -> pd.DataFrame:
-    """获取日线数据 → 等比前复权 → 计算技术指标。"""
-    df = _fetch_daily_kline(trade_date, HISTORY_DAYS)
-    if df.empty:
-        return df
-
-    # 等比前复权
-    stock_codes = df["stock_code"].unique().tolist()
-    divid_df = _fetch_divid_factors(stock_codes)
-    df = _apply_forward_ratio(df, divid_df)
-
-    # 基于前复权价格计算指标
-    df = _calculate_indicators(df)
-    df = df.sort_values(["stock_code", "trade_date"])
-    return df
+    """Read the foundation indicator output for the screening window."""
+    return _fetch_technical_features(trade_date, HISTORY_DAYS)
 
 
 def _fetch_stock_summary() -> pd.DataFrame:
-    """从 "股票全部信息汇总" 读取上市日期、总股本、股票名称、所属行业。"""
-    sql = """
-    SELECT "ts代码" AS stock_code,
-           "上市日期" AS list_date,
-           "总股本" AS total_capital_wan,
-           "股票名称" AS stock_name,
-           "所属行业" AS industry
-    FROM "股票全部信息汇总"
-    """
+    kernel, repository, context = _service("summary")
     try:
-        with get_connection() as conn:
-            return pd.read_sql(sql, conn)
+        return pd.DataFrame(repository.stock_summary(context))
     except Exception as exc:
         logger.warning(f"读取 股票全部信息汇总 失败: {exc}")
         return pd.DataFrame()
+    finally:
+        kernel.close()
 
 
 def _fetch_historical_capital() -> pd.DataFrame:
-    """从 fin_capital 表读取历史总股本（单位：股），用于 backfill 计算市值。
-
-    返回 DataFrame 包含 stock_code, report_date, total_capital，
-    按 stock_code + report_date 排序。
-    """
-    sql = """
-    SELECT stock_code, report_date, total_capital
-    FROM fin_capital
-    WHERE total_capital IS NOT NULL
-    ORDER BY stock_code, report_date
-    """
+    kernel, repository, context = _service("capital")
     try:
-        with get_connection() as conn:
-            return pd.read_sql(sql, conn)
+        return pd.DataFrame(repository.historical_capital(context))
     except Exception as exc:
         logger.warning(f"读取 fin_capital 失败（表可能不存在）: {exc}")
         return pd.DataFrame()
+    finally:
+        kernel.close()
+
+
 
 
 def _compute_for_date(
@@ -326,66 +202,26 @@ def _compute_for_date(
 # ======== 写入 ========
 
 def _ensure_table() -> None:
-    """确保 wave3_stocks 表存在，并包含 market_cap / list_days 列。"""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS "{TABLE_NAME}" (
-                    trade_date  DATE NOT NULL,
-                    stock_code  VARCHAR(20) NOT NULL,
-                    open        DOUBLE PRECISION,
-                    high        DOUBLE PRECISION,
-                    low         DOUBLE PRECISION,
-                    close       DOUBLE PRECISION,
-                    volume      DOUBLE PRECISION,
-                    amount      DOUBLE PRECISION,
-                    wr1_10      DOUBLE PRECISION,
-                    wr2_20      DOUBLE PRECISION,
-                    k           DOUBLE PRECISION,
-                    d           DOUBLE PRECISION,
-                    j           DOUBLE PRECISION,
-                    rsi9        DOUBLE PRECISION,
-                    market_cap  DOUBLE PRECISION,
-                    list_days   INTEGER,
-                    PRIMARY KEY (trade_date, stock_code)
-                );
-            """)
-        conn.commit()
+    """Schema is provisioned by migrations; jobs cannot create tables."""
+    return None
 
 
 def _insert_results(df_res: pd.DataFrame) -> int:
-    """写入选股结果，返回写入行数。"""
     if df_res.empty:
         return 0
+    def clean(value):
+        if pd.isna(value):
+            return None
+        return int(value) if isinstance(value, (np.integer, int)) else value
+    cols = ["trade_date", "stock_code", "open", "high", "low", "close", "volume", "amount", "wr1", "wr2", "k", "d", "j", "rsi9", "market_cap", "list_days"]
+    rows = [{col: clean(row.get(col)) for col in cols} for _, row in df_res.iterrows()]
+    kernel, repository, context = _service("write")
+    try:
+        return repository.insert_results(rows, context)
+    finally:
+        kernel.close()
 
-    _, execute_values = require_psycopg2()
 
-    # 逐列转换：NaN → None，list_days → int
-    def _col_values(col):
-        if col == "list_days":
-            return [int(v) if pd.notna(v) else None for v in df_res[col]]
-        return [None if pd.isna(v) else v for v in df_res[col]]
-
-    cols = ["trade_date", "stock_code",
-            "open", "high", "low", "close", "volume", "amount",
-            "wr1", "wr2", "k", "d", "j", "rsi9",
-            "market_cap", "list_days"]
-    rows = list(zip(*[_col_values(c) for c in cols]))
-
-    sql = f"""
-    INSERT INTO "{TABLE_NAME}" (
-        trade_date, stock_code, open, high, low, close, volume, amount,
-        wr1_10, wr2_20, k, d, j, rsi9, market_cap, list_days
-    ) VALUES %s ON CONFLICT (trade_date, stock_code) DO NOTHING
-    """
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, sql, rows, page_size=1000)
-            affected = cur.rowcount
-        conn.commit()
-
-    return affected
 
 
 # ======== 通知 ========

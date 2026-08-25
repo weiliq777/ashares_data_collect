@@ -9,7 +9,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from data_collect.utils.date_utils import is_market_day
-from data_collect.utils.db import save_to_postgres
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.etf_utils import to_bare_code
 from data_collect.utils.notify import send_dingtalk
@@ -75,7 +77,12 @@ def _fetch_all(start="", end="", limit_stocks=None) -> pd.DataFrame:
 def _save(df: pd.DataFrame) -> Tuple[int, int]:
     if df.empty:
         return 0, 0
-    return save_to_postgres(df, pre_aligned_df=df, table_name=TABLE_NAME)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="etf-divid-factors", job_name="etf_divid_factors", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).append(TABLE_NAME, df.to_dict("records"), context, partition="etf-divid-factors")
+    finally:
+        kernel.close()
 
 
 def run(run_date: str, **kwargs) -> str:

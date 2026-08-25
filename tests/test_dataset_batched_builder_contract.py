@@ -33,3 +33,19 @@ def test_handoff_defaults_to_batched_builder():
     assert "--batch-days" in source
     assert "force_rebuild=args.force_rebuild" in source
 
+
+def test_batched_builder_holds_warehouse_write_lock_at_public_boundary():
+    source = (ROOT / "data_collect" / "jobs" / "backtest_dataset_batched.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from data_collect.jobs.tushare_job_lock import warehouse_write_job" in source
+    assert "@warehouse_write_job\ndef build_dataset_batched" in source
+
+
+def test_handoff_holds_same_lock_across_build_validate_and_freeze():
+    source = (ROOT / "data_collect" / "jobs" / "backtest_dataset_handoff.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from data_collect.jobs.tushare_job_lock import warehouse_write_job" in source
+    assert "@warehouse_write_job\ndef main" in source
+    assert "_build_dataset_batched(" in source

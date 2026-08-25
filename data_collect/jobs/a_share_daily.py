@@ -16,7 +16,9 @@ import sys
 from tqdm import tqdm
 
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.utils.db import save_to_postgres, get_dates_with_data, get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.market_repository import MarketRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.notify import send_dingtalk
 from data_collect.utils.xtquant_utils import require_xtdata, get_a_share_codes, download_history_with_retry
@@ -80,17 +82,34 @@ def _download_and_save_batch(batch: List[str], trade_date: str) -> tuple[int, in
     if not chunks:
         return 0, 0
     merged = pd.concat(chunks, ignore_index=True)
-    return save_to_postgres(merged, pre_aligned_df=merged, table_name=TABLE_NAME)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"a-share-daily-{trade_date}", job_name="a_share_daily",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        written = MarketRepository(kernel).upsert_daily_bars(
+            TABLE_NAME, merged.to_dict("records"), "stock_code", context,
+            pd.to_datetime(trade_date).date(), pd.to_datetime(trade_date).date(),
+        )
+    finally:
+        kernel.close()
+    return len(merged), written
 
 
 def _get_missing_codes(trade_date: str, codes: list) -> list:
     """查 DB 找出当天缺失数据的股票代码。"""
-    with get_connection() as conn:
-        existing = pd.read_sql(
-            "SELECT DISTINCT stock_code FROM daily_kline WHERE trade_date = %s",
-            conn, params=[trade_date],
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"a-share-daily-missing-{trade_date}", job_name="a_share_daily",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        existing_set = MarketRepository(kernel).existing_codes(
+            TABLE_NAME, "stock_code", pd.to_datetime(trade_date).date(), context
         )
-    existing_set = set(existing["stock_code"])
+    finally:
+        kernel.close()
     return [c for c in codes if c not in existing_set]
 
 
@@ -213,22 +232,24 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
 
 def run_evaluate(start_date: str, end_date: str, **kwargs) -> str:
     """评估数据缺失：对比应有股票和实际数据，输出缺失明细 CSV。"""
-    from data_collect.utils.db import get_connection
+
 
     trading_days = date_range(start_date, end_date)
     codes = _get_codes()
 
     # 查询实际有数据的 (date, code) 组合
-    with get_connection() as conn:
-        df_existing = pd.read_sql(
-            "SELECT DISTINCT trade_date, stock_code FROM daily_kline "
-            "WHERE trade_date >= %s AND trade_date <= %s",
-            conn, params=[start_date, end_date],
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id="a-share-daily-evaluate", job_name="a_share_daily",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        existing_set = MarketRepository(kernel).existing_keys(
+            TABLE_NAME, "trade_date", "stock_code",
+            pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context,
         )
-
-    existing_set = set()
-    for _, row in df_existing.iterrows():
-        existing_set.add((str(row["trade_date"]), row["stock_code"]))
+    finally:
+        kernel.close()
 
     # 对比找缺失
     missing_rows = []

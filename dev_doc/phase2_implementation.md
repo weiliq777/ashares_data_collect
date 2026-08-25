@@ -139,7 +139,7 @@ payload_hash 和批次号追加保存；Standard/PIT 只允许重建，不得修
 覆盖率 PASS 只代表接口响应达到历史基准；Raw 写入、Standard/checkpoint 或全局派生
 重建失败时，任务会追加最新 `BLOCKED` 门禁，防止旧 PASS 让 Research freeze 放行。
 
-当前实现：行情增量完成后自动重建状态/PIT、价格和估值 Feature；分红增量完成后自动重建分红 Standard 和股东回报 Feature；财务增量完成后自动重建三张财务 Standard、指标 Standard、财务 PIT 和公司财务 Feature。财务报表按公告日期窗口增量；`fina_indicator` 只能按股票查询，单次最多 100 条，按季度报告期窗口拆分并使用 checkpoint、重试，达到上限时拒绝把截断结果标记为完成。`namechange` 的开放 `end_date` 通过下一条 `start_date - 1 天` 归并；`dividend` 区分预案/实施，按业务键保留最新版本，只有实施且 `ex_date <= decision_date` 的事件进入回报 Feature。发布命令会在替换 validated 基线前执行质量门禁。
+当前实现：行情增量完成后自动重建状态/PIT、价格和估值 Feature；分红增量完成后自动重建分红 Standard 和股东回报 Feature；财务增量只重建实际发生不可变版本变化的股票对应三张财务 Standard、指标 Standard 和 `company_financial_v2`，不再触发旧 `financial_asof/company_financial_v1` 全市场兼容链路。财务派生待办先以 `financial_derived_v2` checkpoint 持久化，成功后才完成，确保 Raw 已提交但 Feature 失败时仍可恢复。财务报表按公告日期窗口增量；`fina_indicator` 只能按股票查询，单次最多 100 条，按季度报告期窗口拆分并使用 checkpoint、重试，达到上限时拒绝把截断结果标记为完成。`namechange` 的开放 `end_date` 通过下一条 `start_date - 1 天` 归并；`dividend` 区分预案/实施，当前事实的稳定键不包含可更正的 record/ex/实施公告日期，只有实施且 `ex_date <= decision_date` 的事件进入回报 Feature。发布命令会在替换 validated 基线前执行质量门禁。
 `data_collect.jobs.tushare_release` 负责创建、验收和查询历史基线标签。
 
 ## 当前进度（2026-08-04）
@@ -175,3 +175,37 @@ tushare_fina_indicator_raw
 阶段二 Raw → Standard → PIT → Feature 主链路已完成历史基线和日增量实测。行情、估值、复权因子、交易日历及阶段二派生层当前最大日期为 2026-08-06；Raw failed checkpoint 当前为 0，PIT/Research 截面校验通过。
 
 财务链路仍按公告可见性运行：财务 Feature 最大日期不要求与行情日期一致；`fina_indicator` 的 `or_yoy → revenue_yoy` 映射和版本血缘已接入。所有增量先写 Raw/Raw version，再重建受影响 Standard/PIT/Feature，禁止回写 Raw。
+`financial_asof` 重建必须使用分批构建：按 `daily_kline` 日期窗口写入临时表，每个窗口独立提交；全部完成并建立约束/索引后，再用短事务切换到生产表。生产旧 PIT 在切换前保持可读，失败只删除临时构建表，不得对 Raw 做任何修改，也不得恢复全量 `TRUNCATE + INSERT` 长事务。
+
+## 通用研究数据底座 V2 实施补充（2026-08-12）
+
+V2 不替换上述 V1 链路。迁移 `sql/045_research_data_foundation_v2.sql` 追加明确的 Standard
+字段，新增 `feature.company_financial_v2`，并扩展现有估值 Feature。实现入口：
+
+```powershell
+# 小样本真实写入和独立 smoke Feature 表
+.venv\Scripts\python.exe -m data_collect.jobs.tushare_foundation_pipeline smoke --output-end 2026-08-06
+
+# 全量派生回填；股票批次可调，每个分区独立提交
+.venv\Scripts\python.exe -m data_collect.jobs.tushare_foundation_pipeline production-derived --output-end 2026-08-06 --batch-stocks 100
+
+# 失败后沿用同一运行和已完成 checkpoint
+.venv\Scripts\python.exe -m data_collect.jobs.tushare_foundation_pipeline production-derived --output-end 2026-08-06 --batch-stocks 100 --run-id <failed-run-id>
+```
+
+生产任务采用数据库 session advisory lock 防止同类任务并发；获取会话锁后立即提交隐式事务，
+运行期间必须保持 `idle in transaction=0`。同一 `run_id` 续跑只有在取得该锁后，才可自动
+接管异常终止遗留的陈旧 `RUNNING`。财务 Standard 按股票批次并跳过无字段变化的冲突更新、
+估值 Standard 按自然月 checkpoint 且内部按单个交易日集合式短事务提交并限速、公司财务
+Feature 按股票批次、估值 Feature 按股票提交；不存在
+对全市场历史表的单个覆盖事务。发布新基线时使用
+`--schema-version feature-contract-v2.0`，发布门禁将 V2 全量质量报告和同截止日正式
+`VALIDATED` 运行纳入检查；质量、来源 Manifest 和新旧基线状态切换必须在同一锁定事务内
+提交。当前接口令牌未注入进程，因此本轮只从已落地 Raw 重建至
+本地数据完整日 `2026-08-06`；后续接口增量仍必须先追加 Raw，再走同一派生链路。
+
+2026-08-13 审计后新增硬约束：所有高吞吐写者共享仓库级 session advisory lock；
+Raw→Standard 使用页级 upsert，不得以临时表全量复制回生产表；状态全量逻辑拆成自然月，
+价格/复权/估值按股票短事务；`limit_stocks` 只能 dry-run，真实 smoke 使用隔离表。
+涨停日禁止买入、跌停日禁止卖出。正式回填恢复时如果代码 commit/diff 已变化，同一 run 的
+旧 checkpoint 必须失效并重算，保证结果来自一套代码语义。

@@ -1,69 +1,90 @@
+"""Fetch Tushare financial reports and persist them through the access kernel."""
 from __future__ import annotations
 
 import json
 from datetime import datetime
+
 import pandas as pd
 
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.financial_repository import FinancialRepository
+from data_collect.data_access.repository.security_repository import SecurityRepository
+from data_collect.jobs.tushare_job_lock import warehouse_write_job
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.utils.db import get_connection, save_to_postgres
 
 
-def _date(v):
-    return pd.to_datetime(v, format="%Y%m%d", errors="coerce").date() if v else None
+def _date(value):
+    parsed = pd.to_datetime(value, format="%Y%m%d", errors="coerce")
+    return parsed.date() if value and not pd.isna(parsed) else None
 
 
-def _save_raw(table, rows, batch_id=None):
-    if not rows:
-        return 0
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            for row in rows:
-                clean = {k: (None if pd.isna(v) else v) for k, v in row.items()}
-                cur.execute(f'''INSERT INTO "{table}" (ts_code, ann_date, end_date, payload) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING''', (row["ts_code"], _date(row.get("ann_date")), _date(row.get("end_date")), json.dumps(clean, ensure_ascii=False, allow_nan=False)))
-        conn.commit()
-    if table == "tushare_fina_indicator_raw":
-        from data_collect.jobs.tushare_fina_indicator_version import save_indicator_versions
-
-        save_indicator_versions(rows, batch_id=batch_id)
-    else:
-        from data_collect.jobs.tushare_financial_raw_version_backfill import save_financial_versions
-
-        save_financial_versions(table.removeprefix("tushare_").removesuffix("_raw"), rows, batch_id=batch_id)
-    return len(rows)
+def _raw_rows(rows: list[dict]) -> list[dict]:
+    result = []
+    for row in rows:
+        clean = {key: (None if pd.isna(value) else value) for key, value in row.items()}
+        result.append({
+            "ts_code": clean.get("ts_code"),
+            "ann_date": _date(clean.get("ann_date")),
+            "end_date": _date(clean.get("end_date")),
+            "payload": json.dumps(clean, ensure_ascii=False, allow_nan=False, default=str),
+        })
+    return result
 
 
+@warehouse_write_job
 def run(run_date: str, **kwargs) -> str:
     pro = get_pro()
-    codes = kwargs.get("stock_codes")
-    if not codes:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT stock_code FROM stock_basic_info ORDER BY stock_code")
-                codes = [row[0] for row in cur.fetchall()]
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"a-share-financial-{run_date}",
+        job_name="a_share_financial_tushare",
+        code_version="unknown",
+        config_hash="unknown",
+        pipeline_version="v1",
+    )
+    try:
+        codes = kwargs.get("stock_codes")
         if not codes:
-            codes = ["000001.SZ"]
-    if isinstance(codes, str):
-        codes = [x.strip() for x in codes.split(",") if x.strip()]
-    total = 0
-    for code in codes[: int(kwargs.get("limit_stocks") or len(codes))]:
-        # Raw-first contract: preserve the complete interface payload.  Field
-        # projection belongs in Raw -> Standard, never in the paid API request.
-        indicator = call_api(pro.fina_indicator, ts_code=code)
-        if indicator is None or indicator.empty:
-            continue
-        rows = indicator.to_dict("records")
-        _save_raw("tushare_fina_indicator_raw", rows)
-        for api, table in [(pro.income, "tushare_income_raw"), (pro.balancesheet, "tushare_balancesheet_raw"), (pro.cashflow, "tushare_cashflow_raw")]:
-            raw_df = call_api(api, ts_code=code)
-            if raw_df is not None and not raw_df.empty:
-                _save_raw(table, raw_df.to_dict("records"))
-        out = indicator.rename(columns={"ts_code": "stock_code", "end_date": "report_date", "ann_date": "announce_date"}).copy()
-        out["report_date"] = out["report_date"].map(_date)
-        out["announce_date"] = out["announce_date"].map(_date)
-        out["source"] = "tushare"
-        out["fetched_at"] = datetime.now()
-        keep = ["stock_code", "report_date", "announce_date", "roe", "roa", "debt_to_assets", "grossprofit_margin", "netprofit_margin", "ocf_to_or", "eps", "bps", "source", "fetched_at"]
-        out = out[[c for c in keep if c in out.columns]]
-        t, i = save_to_postgres(out, pre_aligned_df=out, table_name="stock_financial_indicator")
-        total += i
-    return f"Tushare财务指标完成：写入{total}条，股票数={len(codes)}"
+            codes = SecurityRepository(kernel).stock_codes(context)
+        if isinstance(codes, str):
+            codes = [code.strip() for code in codes.split(",") if code.strip()]
+        codes = list(codes or ["000001.SZ"])
+        codes = codes[: int(kwargs.get("limit_stocks") or len(codes))]
+        repository = FinancialRepository(kernel)
+        total = 0
+        for code in codes:
+            indicator = call_api(pro.fina_indicator, ts_code=code)
+            if indicator is None or indicator.empty:
+                continue
+            rows = indicator.to_dict("records")
+            repository.append_legacy_raw_reports(
+                "tushare_fina_indicator_raw", _raw_rows(rows), [code], context
+            )
+            for api, target in (
+                (pro.income, "tushare_income_raw"),
+                (pro.balancesheet, "tushare_balancesheet_raw"),
+                (pro.cashflow, "tushare_cashflow_raw"),
+            ):
+                frame = call_api(api, ts_code=code)
+                if frame is not None and not frame.empty:
+                    repository.append_legacy_raw_reports(
+                        target, _raw_rows(frame.to_dict("records")), [code], context
+                    )
+            out = indicator.rename(
+                columns={"ts_code": "stock_code", "end_date": "report_date", "ann_date": "announce_date"}
+            ).copy()
+            out["report_date"] = out["report_date"].map(_date)
+            out["announce_date"] = out["announce_date"].map(_date)
+            out["source"] = "tushare"
+            out["fetched_at"] = datetime.now()
+            keep = [
+                "stock_code", "report_date", "announce_date", "roe", "roa", "debt_to_assets",
+                "grossprofit_margin", "netprofit_margin", "ocf_to_or", "eps", "bps", "source", "fetched_at",
+            ]
+            rows_out = out[[column for column in keep if column in out]].astype(object)
+            rows_out = rows_out.where(pd.notna(rows_out), None)
+            total += repository.upsert_legacy_indicator(rows_out.to_dict("records"), [code], context)
+        return f"Tushare financial complete: {total} rows, stocks={len(codes)}"
+    finally:
+        kernel.close()

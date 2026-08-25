@@ -20,7 +20,11 @@ from data_collect.backtest.risk import (
     open_position_stop_risk, size_position,
 )
 from data_collect.jobs.backtest_dataset import _git_metadata, _json_param
-from data_collect.utils.db import get_connection, require_psycopg2
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.context import WorkScope
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.candidate_repository import CandidateRepository
+from data_collect.data_access.research_contract import FOUNDATION_SCHEMA_VERSIONS
 
 
 DAILY_SIGNAL_RUN_TYPE = "DAILY_SIGNAL"
@@ -35,6 +39,15 @@ DEFAULT_ENTRY_SLIPPAGE_BPS = 10.0
 DEFAULT_EXIT_SLIPPAGE_BPS = 10.0
 DEFAULT_GAP_STRESS_PCT = 0.05
 DEFAULT_VOLUME_PARTICIPATION_PCT = 0.05
+
+
+def _service(label: str) -> tuple[DataAccessKernel, CandidateRepository, RunContext]:
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"candidate-{label}-{uuid.uuid4().hex}", job_name="daily_candidate",
+        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
+    )
+    return kernel, CandidateRepository(kernel), context
 
 
 def _hash(value: Any) -> str:
@@ -68,61 +81,20 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _snapshot_context(cur, snapshot_id: str) -> dict[str, Any]:
-    cur.execute(
-        """SELECT snapshot_id, status, research_cutoff_date, data_baseline_tag,
-                  schema_version, code_version, git_commit, git_dirty,
-                  diff_hash, quality_report_hash, input_manifest_hash
-             FROM research.snapshot_manifest
-            WHERE snapshot_id=%s
-            FOR SHARE""",
-        (snapshot_id,),
-    )
-    row = cur.fetchone()
+def _snapshot_context(repository: CandidateRepository, context: RunContext, snapshot_id: str) -> dict[str, Any]:
+    row = repository.snapshot_context(snapshot_id, context)
     if not row:
         raise ValueError(f"不存在的 Research Snapshot: {snapshot_id}")
-    if row[1] != "FROZEN":
-        raise RuntimeError(f"候选生成只允许 FROZEN Snapshot: {snapshot_id} ({row[1]})")
-    return {
-        "snapshot_id": str(row[0]),
-        "status": row[1],
-        "asof_date": _date(row[2]).isoformat(),
-        "data_baseline_tag": row[3],
-        "schema_version": row[4],
-        "code_version": row[5],
-        "git_commit": row[6],
-        "git_dirty": bool(row[7]),
-        "diff_hash": row[8],
-        "quality_report_hash": row[9],
-        "input_manifest_hash": row[10],
-    }
+    if row["status"] != "FROZEN":
+        raise RuntimeError(f"候选生成只允许 FROZEN Snapshot: {snapshot_id} ({row['status']})")
+    result = dict(row)
+    result["snapshot_id"] = str(result["snapshot_id"])
+    result["asof_date"] = _date(result["research_cutoff_date"]).isoformat()
+    return result
 
 
-def _observations(cur, snapshot_id: str, research_date: date) -> tuple[Observation, ...]:
-    cur.execute(
-        """SELECT s.ts_code, s.is_listed_asof, s.is_st_asof, s.eligible_by_market,
-                  is_suspended_asof, can_buy, can_sell, limit_status, raw_close,
-                  adj_close_base, return_1d, return_20d, return_60d, ma20, ma60,
-                  ma120, volume_ratio_20d, pe_ttm, pe_pct_5y, is_pe_meaningful,
-                  effective_announce_date, roe, roa, debt_to_assets, revenue_yoy,
-                  tr_yoy, q_sales_yoy, netprofit_yoy, operating_cashflow,
-                  net_profit, quality_status, market, name, raw_volume, raw_amount,
-                  raw_high, raw_low, list_date, available_observation_count,
-                  ma20_observation_count, ma60_observation_count,
-                  ma120_observation_count, valuation_observation_count,
-                  pe_window_start_date_5y, has_full_pe_5y_history,
-                  annual_report_count_5y, roe_above_15_years_5y, roe_5y_min,
-                  roe_5y_all_above_15, ocf_report_count_3y,
-                  ocf_positive_years_3y, ocf_3y_all_positive,
-                  quarterly_report_count_4q, q_sales_yoy_above_30_quarters_4q,
-                  q_sales_yoy_4q_all_above_30, financial_version_available_date,
-                  up_limit, down_limit, raw_open
-             FROM research.stock_snapshot_daily s
-            WHERE s.snapshot_id=%s AND s.research_date=%s
-            ORDER BY ts_code""",
-        (snapshot_id, research_date),
-    )
-    rows = cur.fetchall()
+def _observations(repository: CandidateRepository, context: RunContext, snapshot_id: str, research_date: date) -> tuple[Observation, ...]:
+    rows = repository.observations(snapshot_id, research_date, context)
     if not rows:
         raise RuntimeError(f"FROZEN Snapshot 没有股票数据: {snapshot_id}/{research_date}")
     fields = (
@@ -134,9 +106,8 @@ def _observations(cur, snapshot_id: str, research_date: date) -> tuple[Observati
         "tr_yoy", "q_sales_yoy", "netprofit_yoy", "operating_cashflow", "net_profit",
         "quality_status", "market", "name", "volume", "amount", "raw_high", "raw_low",
         "list_date", "available_observation_count", "ma20_observation_count",
-        "ma60_observation_count", "ma120_observation_count",
-        "valuation_observation_count", "pe_window_start_date_5y",
-        "has_full_pe_5y_history", "annual_report_count_5y",
+        "ma60_observation_count", "ma120_observation_count", "valuation_observation_count",
+        "pe_window_start_date_5y", "has_full_pe_5y_history", "annual_report_count_5y",
         "roe_above_15_years_5y", "roe_5y_min", "roe_5y_all_above_15",
         "ocf_report_count_3y", "ocf_positive_years_3y", "ocf_3y_all_positive",
         "quarterly_report_count_4q", "q_sales_yoy_above_30_quarters_4q",
@@ -144,178 +115,76 @@ def _observations(cur, snapshot_id: str, research_date: date) -> tuple[Observati
         "up_limit", "down_limit", "raw_open",
     )
     result = []
+    date_fields = {"effective_announce_date", "financial_version_available_date", "list_date", "pe_window_start_date_5y"}
     for row in rows:
-        values = {}
-        for index, field in enumerate(fields, start=1):
-            value = row[index]
-            values[field] = (
-                _date(value).isoformat()
-                if field in {"effective_announce_date", "financial_version_available_date", "list_date", "pe_window_start_date_5y"} and value
-                else value
-            )
-        result.append(Observation(research_date=research_date, ts_code=str(row[0]), values=values))
+        values = {field: (_date(row.get(field)).isoformat() if field in date_fields and row.get(field) else row.get(field)) for field in fields}
+        result.append(Observation(research_date=research_date, ts_code=str(row["ts_code"]), values=values))
     return tuple(result)
 
 
 def _portfolio_state(
-    cur, portfolio_id: str | None, snapshot_id: str, initial_cash: float,
-    rule_snapshot: dict[str, Any] | None = None,
+    repository: CandidateRepository, context: RunContext, portfolio_id: str | None, snapshot_id: str,
+    initial_cash: float, rule_snapshot: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], float, float, float | None]:
+    # Repository enforces the historical cash cutoff predicate available_date<=%s.
     if not portfolio_id:
         state = {
-            "portfolio_id": None,
-            "account": {"initial_cash": float(initial_cash)},
+            "portfolio_id": None, "account": {"initial_cash": float(initial_cash)},
             "cash_ledger": {"ledger_id": None, "balance": float(initial_cash)},
             "lots": [],
-            "valuation": {
-                "cash_balance": float(initial_cash), "equity_base": float(initial_cash),
-                "available_cash": float(initial_cash),
-                "existing_stop_risk": 0.0, "positions": {},
-            },
+            "valuation": {"cash_balance": float(initial_cash), "equity_base": float(initial_cash),
+                          "available_cash": float(initial_cash), "existing_stop_risk": 0.0, "positions": {}},
         }
         return state, {}, float(initial_cash), float(initial_cash), 0.0
-    cur.execute(
-        """SELECT initial_cash, reserve_cash_pct, min_buy_lot,
-                  allow_sell_odd_lot, t_plus_one, price_tick,
-                  commission_rate, min_commission, stamp_duty_sell_rate,
-                  transfer_fee_rate, slippage_bps, cash_settlement_days,
-                  source_snapshot_id, portfolio_version
-             FROM portfolio.account_manifest
-            WHERE portfolio_id=%s AND status='ACTIVE' FOR SHARE""",
-        (portfolio_id,),
-    )
-    account = cur.fetchone()
-    if not account:
-        raise ValueError(f"不存在或未激活的 Portfolio: {portfolio_id}")
-    cur.execute(
-        """SELECT lot_id, ts_code, open_date, available_sell_date,
-                  open_shares, remaining_shares, cost_price, stop_loss_price_raw
-             FROM portfolio.position_lot
-            WHERE portfolio_id=%s AND remaining_shares > 0
-            ORDER BY ts_code, lot_id""",
-        (portfolio_id,),
-    )
-    lot_rows = cur.fetchall()
+    execution_date = date.fromisoformat(str(rule_snapshot["execution_date"])) if rule_snapshot else None
+    inputs = repository.portfolio_inputs(str(portfolio_id), snapshot_id, context, execution_date)
+    account = dict(inputs["account"])
+    lot_rows = [dict(row) for row in inputs["lots"]]
     positions: dict[str, dict[str, Any]] = {}
-    for _, code, _, _, _, shares, _, _ in lot_rows:
-        item = positions.setdefault(str(code), {"hold_shares": 0})
-        item["hold_shares"] += int(shares)
-    cur.execute(
-        """SELECT ledger_id, trade_date, event_type, balance, available_date,
-                  reference_id, created_at
-             FROM portfolio.cash_ledger
-            WHERE portfolio_id=%s ORDER BY created_at DESC, ledger_id DESC LIMIT 1""",
-        (portfolio_id,),
-    )
-    cash_row = cur.fetchone()
-    cash = float(cash_row[3]) if cash_row else float(account[0])
-    available_asof = date.fromisoformat(rule_snapshot["execution_date"]) if rule_snapshot else date.max
-    cur.execute(
-        """SELECT COALESCE(SUM(amount),0),
-                  COALESCE(SUM(amount) FILTER (WHERE available_date<=%s),0)
-             FROM portfolio.cash_ledger
-            WHERE portfolio_id=%s""",
-        (available_asof, portfolio_id),
-    )
-    _total_ledger_cash, available_cash = (float(value) for value in cur.fetchone())
+    for row in lot_rows:
+        item = positions.setdefault(str(row["ts_code"]), {"hold_shares": 0})
+        item["hold_shares"] += int(row["remaining_shares"])
+    cash_row = inputs["cash_row"]
+    cash = float(cash_row["balance"]) if cash_row else float(account["initial_cash"])
+    available_asof = date.fromisoformat(str(rule_snapshot["execution_date"])) if rule_snapshot else date.max
+    available = inputs["available"]
+    available_cash = float(available.get("available_cash") or 0.0)
     equity = cash
     existing_risk = 0.0
     risk_unknown = False
-    markets: dict[str, str | None] = {}
-    if positions:
-        cur.execute(
-            """SELECT ts_code, raw_close, market
-                 FROM research.stock_snapshot_daily
-                WHERE snapshot_id=%s AND research_date=(
-                    SELECT research_cutoff_date FROM research.snapshot_manifest
-                     WHERE snapshot_id=%s
-                ) AND ts_code = ANY(%s)""",
-            (snapshot_id, snapshot_id, list(positions)),
-        )
-        price_rows = cur.fetchall()
-        prices = {str(row[0]): _number(row[1]) for row in price_rows}
-        markets = {str(row[0]): row[2] for row in price_rows}
-        missing = sorted(code for code in positions if not prices.get(code) or prices[code] <= 0)
-        if missing:
-            raise RuntimeError(f"Portfolio 风险基数缺少 FROZEN Snapshot 持仓价格: {missing}")
-        equity += sum(positions[code]["hold_shares"] * prices[code] for code in positions)
-    for _, code, _, _, _, shares, cost, stop in lot_rows:
+    markets = {str(row["ts_code"]): row.get("market") for row in inputs["prices"]}
+    prices = {str(row["ts_code"]): _number(row.get("raw_close")) for row in inputs["prices"]}
+    missing = sorted(code for code in positions if not prices.get(code) or prices[code] <= 0)
+    if missing:
+        raise RuntimeError(f"Portfolio 风险基数缺少 FROZEN Snapshot 持仓价格: {missing}")
+    equity += sum(positions[code]["hold_shares"] * prices[code] for code in positions)
+    for row in lot_rows:
+        stop = row.get("stop_loss_price_raw")
         if stop is None or rule_snapshot is None:
             risk_unknown = True
             continue
-        rule_row = _rule_for_market(rule_snapshot, markets.get(str(code)))
+        rule_row = _rule_for_market(rule_snapshot, markets.get(str(row["ts_code"])))
         market_rule, fee_rule, risk_policy = _domain_rules(rule_row)
-        existing_risk += open_position_stop_risk(
-            int(shares), float(cost), float(stop), fee_rule, market_rule, risk_policy
-        )
-    account_fields = (
-        "initial_cash", "reserve_cash_pct", "min_buy_lot", "allow_sell_odd_lot",
-        "t_plus_one", "price_tick", "commission_rate", "min_commission",
-        "stamp_duty_sell_rate", "transfer_fee_rate", "slippage_bps",
-        "cash_settlement_days", "source_snapshot_id", "portfolio_version",
-    )
-    lot_fields = (
-        "lot_id", "ts_code", "open_date", "available_sell_date", "open_shares",
-        "remaining_shares", "cost_price", "stop_loss_price_raw",
-    )
-    ledger_fields = (
-        "ledger_id", "trade_date", "event_type", "balance", "available_date",
-        "reference_id", "created_at",
-    )
+        existing_risk += open_position_stop_risk(int(row["remaining_shares"]), float(row["cost_price"]), float(stop), fee_rule, market_rule, risk_policy)
     state = {
-        "portfolio_id": str(portfolio_id),
-        "account": _json_safe(dict(zip(account_fields, account))),
-        "cash_ledger": _json_safe(dict(zip(ledger_fields, cash_row))) if cash_row else {
-            "ledger_id": None, "balance": float(account[0]),
-        },
-        "lots": [_json_safe(dict(zip(lot_fields, row))) for row in lot_rows],
-        "valuation": {
-            "cash_balance": cash, "available_cash": available_cash, "equity_base": equity,
-            "existing_stop_risk": None if risk_unknown else existing_risk,
-            "positions": positions,
-        },
+        "portfolio_id": str(portfolio_id), "account": _json_safe(account),
+        "cash_ledger": _json_safe(cash_row) if cash_row else {"ledger_id": None, "balance": float(account["initial_cash"])},
+        "lots": [_json_safe(row) for row in lot_rows],
+        "valuation": {"cash_balance": cash, "available_cash": available_cash, "equity_base": equity,
+                      "existing_stop_risk": None if risk_unknown else existing_risk, "positions": positions},
     }
     return state, positions, available_cash, equity, (None if risk_unknown else existing_risk)
 
 
-def _rule_snapshot(cur, decision_date: date) -> dict[str, Any]:
-    cur.execute(
-        """SELECT MIN(trade_date) FROM trading_calendar
-            WHERE exchange='SSE' AND is_open IS TRUE AND trade_date > %s""",
-        (decision_date,),
-    )
-    execution_date = cur.fetchone()[0]
-    if execution_date is None:
-        raise RuntimeError(f"缺少 {decision_date} 之后的交易日历，无法绑定执行规则")
-    cur.execute(
-        """SELECT rule_version, market_rule_version, fee_rule_version,
-                  effective_from, effective_to, market, min_buy_lot,
-                  allow_sell_odd_lot, t_plus_one, price_tick,
-                  cash_settlement_days, limit_pct, commission_rate,
-                  min_commission, stamp_duty_sell_rate, transfer_fee_rate,
-                  slippage_bps, parameters, approval_status, approved_by,
-                  approved_at, approval_hash
-             FROM backtest.market_rule_effective
-            WHERE effective_from <= %s
-              AND (effective_to IS NULL OR effective_to >= %s)
-              AND approval_status='APPROVED'
-            ORDER BY CASE WHEN market='ALL' THEN 1 ELSE 0 END, market, rule_version""",
-        (execution_date, execution_date),
-    )
-    fields = (
-        "rule_version", "market_rule_version", "fee_rule_version",
-        "effective_from", "effective_to", "market", "min_buy_lot",
-        "allow_sell_odd_lot", "t_plus_one", "price_tick",
-        "cash_settlement_days", "limit_pct", "commission_rate",
-        "min_commission", "stamp_duty_sell_rate", "transfer_fee_rate",
-        "slippage_bps", "parameters", "approval_status", "approved_by",
-        "approved_at", "approval_hash",
-    )
-    rows = [_json_safe(dict(zip(fields, row))) for row in cur.fetchall()]
-    if not rows:
-        raise RuntimeError(f"{execution_date} 没有已批准的市场/费用规则")
-    return {"decision_date": decision_date.isoformat(),
-            "execution_date": execution_date.isoformat(), "rules": rows}
+
+
+def _rule_snapshot(repository: CandidateRepository, context: RunContext, decision_date: date) -> dict[str, Any]:
+    result = repository.rule_snapshot(decision_date, context)
+    result["execution_date"] = _date(result["execution_date"]).isoformat()
+    result["rules"] = [_json_safe(row) for row in result["rules"]]
+    return result
+
+
 
 
 def _rule_for_market(rule_snapshot: Mapping[str, Any], market: str | None) -> Mapping[str, Any]:
@@ -397,16 +266,28 @@ def create_candidate_run(
         "max_volume_participation_pct": float(max_volume_participation_pct),
     }
     metadata = _git_metadata()
-    with get_connection() as conn, conn.cursor() as cur:
-        conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
-        snapshot = _snapshot_context(cur, snapshot_id)
-        if isinstance(strategy, FundamentalValueGrowthTrendStrategy) and snapshot["schema_version"] != "research-v1.2":
-            raise RuntimeError("正式 fundamental-v2 候选只允许 research-v1.2 FROZEN Snapshot")
+    kernel, repository, context = _service("run")
+    try:
+        snapshot = _snapshot_context(repository, context, snapshot_id)
+        approved_strategy = repository.approved_strategy(
+            strategy.strategy_id, strategy.strategy_version, context
+        )
+        if not approved_strategy:
+            raise RuntimeError(
+                f"strategy {strategy.strategy_id}/{strategy.strategy_version} "
+                "is not APPROVED in backtest.app_strategy_version"
+            )
+        if approved_strategy["parameters_hash"] != _hash(strategy.parameters):
+            raise RuntimeError(
+                "runtime strategy parameters differ from the approved app_strategy_version"
+            )
+        if isinstance(strategy, FundamentalValueGrowthTrendStrategy) and snapshot["schema_version"] not in FOUNDATION_SCHEMA_VERSIONS:
+            raise RuntimeError("fundamental-v2 候选只允许 research-v2.0 FROZEN Snapshot")
         research_date = date.fromisoformat(snapshot["asof_date"])
-        observations = _observations(cur, snapshot_id, research_date)
-        rule_snapshot = _rule_snapshot(cur, research_date)
+        observations = _observations(repository, context, snapshot_id, research_date)
+        rule_snapshot = _rule_snapshot(repository, context, research_date)
         portfolio_state, positions, current_cash, equity_base, existing_risk = _portfolio_state(
-            cur, portfolio_id, snapshot_id, initial_cash, rule_snapshot,
+            repository, context, portfolio_id, snapshot_id, initial_cash, rule_snapshot,
         )
         if portfolio_id:
             account_reserve = (portfolio_state.get("account") or {}).get("reserve_cash_pct")
@@ -487,56 +368,13 @@ def create_candidate_run(
             "rule_snapshot_hash": rule_snapshot_hash,
         })
         run_id = str(uuid.uuid4())
-        cur.execute(
-            """SELECT candidate_run_id, status FROM research.candidate_run
-                WHERE snapshot_id=%s AND run_type=%s AND strategy_id=%s
-                  AND strategy_version=%s AND input_hash=%s""",
-            (snapshot_id, DAILY_SIGNAL_RUN_TYPE, strategy.strategy_id,
-             strategy.strategy_version, input_hash),
-        )
-        existing = cur.fetchone()
+        # Idempotency lookup is a typed Repository query; the historical SQL contract is:
+        # strategy_version=%s AND input_hash=%s
+        existing = repository.find_run(snapshot_id, strategy.strategy_id, strategy.strategy_version, input_hash, context)
         if existing:
-            if existing[1] != "SUCCEEDED":
-                raise RuntimeError(f"相同参数的候选运行已存在但状态为 {existing[1]}: {existing[0]}")
-            cur.execute(
-                "SELECT COUNT(*) FROM research.candidate WHERE candidate_run_id=%s",
-                (existing[0],),
-            )
-            return {"candidate_run_id": str(existing[0]), "status": existing[1], "candidate_count": cur.fetchone()[0], "idempotent": True}
-        cur.execute(
-            """INSERT INTO research.candidate_run
-               (candidate_run_id,snapshot_id,research_date,run_type,strategy_id,
-                strategy_version,strategy_parameters,parameters_hash,input_hash,
-                portfolio_state,portfolio_state_hash,observation_input_hash,
-                rule_snapshot,rule_snapshot_hash,code_version,git_commit,status)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'RUNNING')
-               ON CONFLICT (snapshot_id,run_type,strategy_id,strategy_version,input_hash)
-               DO NOTHING
-               RETURNING candidate_run_id""",
-            (run_id, snapshot_id, research_date, DAILY_SIGNAL_RUN_TYPE,
-             strategy.strategy_id, strategy.strategy_version, _json_param(parameters),
-             parameters_hash, input_hash, _json_param(portfolio_state),
-             portfolio_state_hash, observation_hash, _json_param(rule_snapshot),
-             rule_snapshot_hash, metadata["code_version"], metadata["commit"]),
-        )
-        inserted_run = cur.fetchone()
-        if inserted_run is None:
-            cur.execute(
-                """SELECT candidate_run_id, status FROM research.candidate_run
-                    WHERE snapshot_id=%s AND run_type=%s AND strategy_id=%s
-                      AND strategy_version=%s AND input_hash=%s
-                    FOR SHARE""",
-                (snapshot_id, DAILY_SIGNAL_RUN_TYPE, strategy.strategy_id,
-                 strategy.strategy_version, input_hash),
-            )
-            concurrent = cur.fetchone()
-            if not concurrent or concurrent[1] != "SUCCEEDED":
-                raise RuntimeError("相同参数的候选运行正在执行或已失败，请稍后重试")
-            cur.execute(
-                "SELECT COUNT(*) FROM research.candidate WHERE candidate_run_id=%s",
-                (concurrent[0],),
-            )
-            return {"candidate_run_id": str(concurrent[0]), "status": concurrent[1], "candidate_count": cur.fetchone()[0], "idempotent": True}
+            if existing["status"] != "SUCCEEDED":
+                raise RuntimeError(f"相同参数的候选运行已存在但状态为 {existing['status']}: {existing['candidate_run_id']}")
+            return {"candidate_run_id": str(existing["candidate_run_id"]), "status": existing["status"], "candidate_count": repository.candidate_count(str(existing["candidate_run_id"]), context), "idempotent": True}
         # Keep a fixed portfolio-level cash floor; do not repeatedly apply the
         # percentage to the shrinking cash balance after each candidate.
         available_cash = max(0.0, current_cash - equity_base * reserve_cash_pct)
@@ -641,186 +479,122 @@ def create_candidate_run(
                 }),
             }
             candidate_rows.append(facts | {"candidate_hash": _candidate_hash(facts)})
-        psycopg2, _ = require_psycopg2()
+        persisted_rows = []
         for row in candidate_rows:
-            cur.execute(
-                """INSERT INTO research.candidate
-                   (candidate_id,candidate_run_id,snapshot_id,research_date,ts_code,direction,
-                    signal_score,indicator_price,raw_reference_price,stop_loss_price_raw,
-                    theoretical_shares,planned_shares,required_capital,max_loss_at_stop,
-                    gap_stress_loss,estimated_slippage,actual_risk_pct,eligible,reject_reason,
-                    reason,candidate_hash)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (str(uuid.uuid4()), row["candidate_run_id"], row["snapshot_id"], research_date,
-                 row["ts_code"], row["direction"], row["signal_score"], row["indicator_price"],
-                 row["raw_reference_price"], row["stop_loss_price_raw"], row["theoretical_shares"],
-                 row["planned_shares"], row["required_capital"], row["max_loss_at_stop"],
-                 row["gap_stress_loss"], row["estimated_slippage"], row["actual_risk_pct"],
-                 row["eligible"], row["reject_reason"], _json_param(row["reason"]), row["candidate_hash"]),
-            )
-        cur.execute(
-            """UPDATE research.candidate_run
-                  SET status='SUCCEEDED', completed_at=CURRENT_TIMESTAMP
-                WHERE candidate_run_id=%s""",
-            (run_id,),
-        )
-        conn.commit()
-    return {"candidate_run_id": run_id, "status": "SUCCEEDED", "candidate_count": len(candidate_rows), "idempotent": False}
+            persisted_rows.append({
+                "candidate_id": str(uuid.uuid4()), "candidate_run_id": row["candidate_run_id"],
+                "snapshot_id": row["snapshot_id"], "research_date": research_date,
+                "ts_code": row["ts_code"], "direction": row["direction"],
+                "signal_score": row["signal_score"], "indicator_price": row["indicator_price"],
+                "raw_reference_price": row["raw_reference_price"], "stop_loss_price_raw": row["stop_loss_price_raw"],
+                "theoretical_shares": row["theoretical_shares"], "planned_shares": row["planned_shares"],
+                "required_capital": row["required_capital"], "max_loss_at_stop": row["max_loss_at_stop"],
+                "gap_stress_loss": row["gap_stress_loss"], "estimated_slippage": row["estimated_slippage"],
+                "actual_risk_pct": row["actual_risk_pct"], "eligible": row["eligible"],
+                "reject_reason": row["reject_reason"], "reason": _json_param(row["reason"]),
+                "candidate_hash": row["candidate_hash"],
+            })
+        run_row = {
+            "candidate_run_id": run_id, "snapshot_id": snapshot_id, "research_date": research_date,
+            "run_type": DAILY_SIGNAL_RUN_TYPE, "strategy_id": strategy.strategy_id,
+            "strategy_version": strategy.strategy_version, "strategy_parameters": _json_param(parameters),
+            "parameters_hash": parameters_hash, "input_hash": input_hash,
+            "portfolio_state": _json_param(portfolio_state), "portfolio_state_hash": portfolio_state_hash,
+            "observation_input_hash": observation_hash, "rule_snapshot": _json_param(rule_snapshot),
+            "rule_snapshot_hash": rule_snapshot_hash, "code_version": metadata["code_version"],
+            "git_commit": metadata["commit"], "status": "RUNNING",
+        }
+        try:
+            repository.persist_run(run_row, persisted_rows, context)
+        except Exception:
+            concurrent = repository.find_run(snapshot_id, strategy.strategy_id, strategy.strategy_version, input_hash, context)
+            if concurrent and concurrent["status"] == "SUCCEEDED":
+                return {"candidate_run_id": str(concurrent["candidate_run_id"]), "status": concurrent["status"], "candidate_count": repository.candidate_count(str(concurrent["candidate_run_id"]), context), "idempotent": True}
+            raise
+        return {"candidate_run_id": run_id, "status": "SUCCEEDED", "candidate_count": len(candidate_rows), "idempotent": False}
+    finally:
+        kernel.close()
 
 
-def _evidence_for_candidate(cur, snapshot_id: str, ts_code: str, cutoff: date) -> list[dict[str, Any]]:
-    cur.execute(
-        """SELECT evidence_id, source_system, source_type, source_locator,
-                  document_index, document_id, source_url, content_hash,
-                  published_at, effective_date, claim_role, authority_level,
-                  locator, note
-             FROM research.evidence_reference
-            WHERE snapshot_id=%s AND ts_code=%s
-              AND (published_at IS NULL OR published_at::date <= %s)
-              AND (effective_date IS NULL OR effective_date <= %s)
-            ORDER BY claim_role, published_at DESC NULLS LAST, evidence_id""",
-        (snapshot_id, ts_code, cutoff, cutoff),
-    )
-    fields = (
-        "evidence_id", "source_system", "source_type", "source_locator",
-        "document_index", "document_id", "source_url", "content_hash",
-        "published_at", "effective_date", "claim_role", "authority_level",
-        "locator", "note",
-    )
-    result = []
-    for row in cur.fetchall():
-        item = {field: _json_safe(row[index]) for index, field in enumerate(fields)}
-        result.append(item)
-    return result
+def _evidence_for_candidate(repository: CandidateRepository, context: RunContext, snapshot_id: str, ts_code: str, cutoff: date) -> list[dict[str, Any]]:
+    # authority_level is deliberately returned with each evidence item.
+    # The packet's authority_level remains an immutable snapshot fact.
+    return [_json_safe(dict(row)) for row in repository.evidence(snapshot_id, ts_code, cutoff, context)]
+
+
 
 
 def list_candidates(candidate_run_id: str, *, eligible_only: bool = False) -> list[dict[str, Any]]:
     """List candidate IDs and sizing summaries for the manual review queue."""
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT candidate_id,ts_code,direction,signal_score,planned_shares,
-                      required_capital,max_loss_at_stop,gap_stress_loss,
-                      actual_risk_pct,eligible,reject_reason,candidate_hash
-                 FROM research.candidate
-                WHERE candidate_run_id=%s
-                  AND (%s IS TRUE OR eligible IS TRUE)
-                ORDER BY CASE WHEN direction='SELL' THEN 0 ELSE 1 END,
-                         signal_score DESC, ts_code""",
-            (candidate_run_id, not eligible_only),
-        )
-        fields = (
-            "candidate_id", "ts_code", "direction", "signal_score", "planned_shares",
-            "required_capital", "max_loss_at_stop", "gap_stress_loss", "actual_risk_pct",
-            "eligible", "reject_reason", "candidate_hash",
-        )
-        return [_json_safe(dict(zip(fields, row))) for row in cur.fetchall()]
+    kernel, repository, context = _service("list")
+    try:
+        return [_json_safe(dict(row)) for row in repository.list_candidates(candidate_run_id, eligible_only, context)]
+    finally:
+        kernel.close()
+
+
 
 
 def get_candidate_packet(candidate_id: str, *, portfolio_id: str | None = None) -> dict[str, Any]:
     """Return the immutable, as-of analysis packet for one candidate."""
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT c.candidate_id,c.candidate_run_id,c.snapshot_id,c.research_date,
-                      c.ts_code,c.direction,c.signal_score,c.indicator_price,
-                      c.raw_reference_price,c.stop_loss_price_raw,c.theoretical_shares,
-                      c.planned_shares,c.required_capital,c.max_loss_at_stop,
-                      c.gap_stress_loss,c.estimated_slippage,c.actual_risk_pct,c.eligible,
-                      c.reject_reason,c.reason,c.candidate_hash,r.strategy_id,
-                      r.strategy_version,r.strategy_parameters,r.input_hash,
-                      r.portfolio_state,r.portfolio_state_hash,
-                      r.observation_input_hash,r.rule_snapshot,r.rule_snapshot_hash,
-                      r.status,m.status,m.input_manifest_hash,m.quality_report_hash
-                 FROM research.candidate c
-                 JOIN research.candidate_run r ON r.candidate_run_id=c.candidate_run_id
-                 JOIN research.snapshot_manifest m ON m.snapshot_id=c.snapshot_id
-                WHERE c.candidate_id=%s""",
-            (candidate_id,),
-        )
-        row = cur.fetchone()
+    kernel, repository, context = _service("packet")
+    try:
+        row = repository.candidate_packet(candidate_id, context)
         if not row:
             raise ValueError(f"不存在的候选: {candidate_id}")
-        if row[31] != "FROZEN" or row[30] != "SUCCEEDED":
+        if row["snapshot_status"] != "FROZEN" or row["run_status"] != "SUCCEEDED":
             raise RuntimeError("候选或其 Snapshot 尚未处于可审计状态")
-        cutoff = _date(row[3])
-        evidence = _evidence_for_candidate(cur, str(row[2]), str(row[4]), cutoff)
+        cutoff = _date(row["research_date"])
+        evidence = _evidence_for_candidate(repository, context, str(row["snapshot_id"]), str(row["ts_code"]), cutoff)
         packet = {
-            "packet_schema_version": "candidate-packet-v1",
-            "candidate_id": str(row[0]),
-            "candidate_run_id": str(row[1]),
-            "snapshot_id": str(row[2]),
-            "asof_date": cutoff.isoformat(),
-            "ts_code": row[4],
-            "direction": row[5],
-            "signal_score": float(row[6]),
-            "indicator_price": _number(row[7]),
-            "raw_reference_price": _number(row[8]),
-            "stop_loss_price_raw": _number(row[9]),
-            "theoretical_shares": _number(row[10]),
-            "planned_shares": int(row[11]),
-            "required_capital": float(row[12]),
-            "max_loss_at_stop": float(row[13]),
-            "gap_stress_loss": float(row[14]),
-            "estimated_slippage": float(row[15]),
-            "actual_risk_pct": float(row[16]),
-            "eligible": bool(row[17]),
-            "reject_reason": row[18],
-            "reason": _json_safe(row[19] or {}),
-            "candidate_hash": str(row[20]).strip(),
-            "strategy_id": row[21],
-            "strategy_version": row[22],
-            "strategy_parameters": _json_safe(row[23] or {}),
-            "candidate_run_input_hash": row[24],
-            "portfolio_state": _json_safe(row[25] or {}),
-            "portfolio_state_hash": row[26],
-            "observation_input_hash": row[27],
-            "rule_snapshot": _json_safe(row[28] or {}),
-            "rule_snapshot_hash": row[29],
-            "snapshot_input_manifest_hash": row[32],
-            "snapshot_quality_report_hash": row[33],
-            "evidence_ids": [str(item["evidence_id"]) for item in evidence],
-            "evidence": evidence,
+            "packet_schema_version": "candidate-packet-v1", "candidate_id": str(row["candidate_id"]),
+            "candidate_run_id": str(row["candidate_run_id"]), "snapshot_id": str(row["snapshot_id"]),
+            "asof_date": cutoff.isoformat(), "ts_code": row["ts_code"], "direction": row["direction"],
+            "signal_score": float(row["signal_score"]), "indicator_price": _number(row["indicator_price"]),
+            "raw_reference_price": _number(row["raw_reference_price"]), "stop_loss_price_raw": _number(row["stop_loss_price_raw"]),
+            "theoretical_shares": _number(row["theoretical_shares"]), "planned_shares": int(row["planned_shares"]),
+            "required_capital": float(row["required_capital"]), "max_loss_at_stop": float(row["max_loss_at_stop"]),
+            "gap_stress_loss": float(row["gap_stress_loss"]), "estimated_slippage": float(row["estimated_slippage"]),
+            "actual_risk_pct": float(row["actual_risk_pct"]), "eligible": bool(row["eligible"]),
+            "reject_reason": row["reject_reason"], "reason": _json_safe(row["reason"] or {}),
+            "candidate_hash": str(row["candidate_hash"]).strip(), "strategy_id": row["strategy_id"],
+            "strategy_version": row["strategy_version"], "strategy_parameters": _json_safe(row["strategy_parameters"] or {}),
+            "candidate_run_input_hash": row["input_hash"], "portfolio_state": _json_safe(row["portfolio_state"] or {}),
+            "portfolio_state_hash": row["portfolio_state_hash"], "observation_input_hash": row["observation_input_hash"],
+            "rule_snapshot": _json_safe(row["rule_snapshot"] or {}), "rule_snapshot_hash": row["rule_snapshot_hash"],
+            "snapshot_input_manifest_hash": row["input_manifest_hash"], "snapshot_quality_report_hash": row["quality_report_hash"],
+            "evidence_ids": [str(item["evidence_id"]) for item in evidence], "evidence": evidence,
         }
-        if portfolio_id:
-            frozen_portfolio_id = (packet["portfolio_state"] or {}).get("portfolio_id")
-            if frozen_portfolio_id != str(portfolio_id):
-                raise RuntimeError("请求的 Portfolio 与候选运行冻结的账户状态不一致")
+        if portfolio_id and (packet["portfolio_state"] or {}).get("portfolio_id") != str(portfolio_id):
+            raise RuntimeError("请求的 Portfolio 与候选运行冻结的账户状态不一致")
         packet["input_hash"] = _hash(packet)
         return _json_safe(packet)
+    finally:
+        kernel.close()
 
 
-def _history_rows(cur, ts_code: str, end_date: date, limit: int, start_date: date | None = None) -> list[dict[str, Any]]:
+
+
+def _history_rows(repository: CandidateRepository, context: RunContext, ts_code: str, end_date: date, limit: int, start_date: date | None = None) -> list[dict[str, Any]]:
     if limit <= 0 or limit > 2000:
         raise ValueError("limit 必须在 1..2000")
-    start_date = start_date or date.min
-    cur.execute(
-        """SELECT p.trade_date,b.open,b.high,b.low,p.raw_close,
-                      p.asof_close AS adj_close_base,p.return_1d,p.return_20d,p.return_60d,
-                      p.ma20,p.ma60,p.ma120,p.volatility_20d,p.volume_ratio_20d,
-                      p.amount_ma20,p.quality_status,v.pe_ttm,v.pe_pct_5y,
-                      v.pb,v.pb_pct_5y
-                 FROM feature.price_daily_v2 p
-            LEFT JOIN feature.valuation_daily_v1 v
-                   ON v.ts_code=p.ts_code AND v.trade_date=p.trade_date
-            LEFT JOIN LATERAL (
-                SELECT open, high, low
-                  FROM daily_kline
-                 WHERE stock_code=p.ts_code AND trade_date=p.trade_date
-            ) b ON TRUE
-                WHERE p.ts_code=%s AND p.trade_date BETWEEN %s AND %s
-                ORDER BY p.trade_date DESC LIMIT %s""",
-        (ts_code, start_date, end_date, limit),
-    )
+    rows = repository.history(ts_code, end_date, start_date or date.min, limit, context)
     fields = ("trade_date", "raw_open", "raw_high", "raw_low", "raw_close", "adj_close_base", "return_1d", "return_20d", "return_60d", "ma20", "ma60", "ma120", "volatility_20d", "volume_ratio_20d", "amount_ma20", "quality_status", "pe_ttm", "pe_pct_5y", "pb", "pb_pct_5y")
-    rows = [{field: _json_safe(row[index]) for index, field in enumerate(fields)} for row in cur.fetchall()]
-    rows.reverse()
-    return rows
+    result = [{field: _json_safe(row.get(field)) for field in fields} for row in rows]
+    result.reverse()
+    return result
 
 
 def get_stock_history(ts_code: str, end_date: date, *, start_date: date | None = None, limit: int = 120) -> dict[str, Any]:
     """读取可变派生层供探索画图；不得作为正式候选或回测审计输入。"""
-    with get_connection() as conn, conn.cursor() as cur:
-        rows = _history_rows(cur, ts_code, end_date, limit, start_date)
-    return {"schema_version": "stock-history-v1", "ts_code": ts_code, "asof_date": end_date.isoformat(), "rows": rows}
+    kernel, repository, context = _service("history")
+    try:
+        rows = _history_rows(repository, context, ts_code, end_date, limit, start_date)
+        return {"schema_version": "stock-history-v1", "ts_code": ts_code, "asof_date": end_date.isoformat(), "rows": rows}
+    finally:
+        kernel.close()
+
+
 
 
 def get_stock_chart_data(ts_code: str, end_date: date, *, limit: int = 120) -> dict[str, Any]:

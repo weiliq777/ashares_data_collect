@@ -1,5 +1,23 @@
 # Finance_cn Agent Notes
 
+## 专业名词中文说明规则
+
+以后在对话、任务记录、日志说明和交付报告中，首次提到表名、字段名、模块名、接口名、类名、任务名或其他专业标识符时，必须同时补充对应的中文业务含义。例如：`research.candidate_run`（研究候选运行记录表）、`snapshot_id`（研究快照标识）、`Quality Gate`（质量门禁）。后续重复使用时可只写英文标识符，但不得只给出无法理解业务含义的英文名称。
+
+## 策略层读取规则
+
+- ROE、PE 分位、趋势等指标由 Feature 层提前计算；策略层只读取指定 `snapshot_id` 的当日结果，不重新扫描五年历史。
+- 策略必须按 `snapshot_id` 批量读取股票数据，禁止逐股票 N+1 查询；Raw 只用于数据转换、审计和重建，不作为策略实时查询入口。
+- 日常研究只处理最新交易日增量；数据质量门禁失败时不生成正式候选，不自动下单。
+
+## 2026-08-11 大数据任务资源约束
+
+- 本次 Research Snapshot 基线统计对 16GB `tushare_market_raw_version` 进行了重型统计查询，造成 Docker/WSL 高负载并失去响应；快照任务已停止，Raw 未被修改。
+- 后续所有大表任务必须单并发、分表/分日期分批、每批独立提交，并保留 checkpoint、日志和失败重试；禁止多个任务同时扫描同一大表。
+- 禁止一次性全表 `COUNT/MAX/GROUP BY` 作为启动前置检查；优先使用已保存的基线 Manifest、索引范围查询、近似统计或预聚合统计，必要时离线分批计算。
+- 启动后台任务前必须确认同类进程只有一个；发现 Docker/WSL 内存或 IO 持续升高时立即暂停任务，先检查进程、数据库活动查询和错误日志。
+- 任务完成后必须同时核对：进程是否退出、数据库 checkpoint/状态、错误日志、目标行数/日期范围和主键约束；不能只依据本地进度日志判断成功。
+
 ## 2026-08-08 production data audit follow-up
 
 The code audit is green (`693 passed, 1 skipped, 5 deselected`; `compileall` and `git diff --check` pass). The active code contract is `research-v1.2` → `backtest-dataset-v2` → `research-to-backtest-v2` → `daily-next-open-v2`.
@@ -159,7 +177,7 @@ Windows 后台启动 Tushare 任务时，必须显式保证子进程继承 `TUSH
 
 每日增量规则：最近 5 个交易日允许重复回补；正式任务使用 `data_collect.jobs.tushare_market_incremental_by_date` 按交易日获取全市场数据，不得逐股票请求；每次抓取完整响应写入不可变 `tushare_market_raw_version`，现有 `*_raw` 只做首次业务记录的幂等追加；Standard 按交易日重建。历史初始化仍可按股票断点续传。不得用 checkpoint=done 永久跳过需要修复的回补日期。
 
-历史基线规则：历史 Raw/Standard 验收后在 `tushare_data_release` 建立发布标签；只有 `status='validated'` 的基线可被增量任务默认读取。阶段二日常任务使用 `tushare_phase2_incremental`，不再启动历史 `tushare_phase2_raw_init` 编排；`dividend` 使用公告日期/实施公告日期窗口，`namechange` 使用低频日期窗口。
+历史基线规则：历史 Raw/Standard 验收后在 `ops.tushare_data_release`（运维数据发布基线表）建立发布标签；只有 `status='validated'` 的基线可被增量任务默认读取。阶段二日常任务使用 `tushare_phase2_incremental`，不再启动历史 `tushare_phase2_raw_init` 编排；`dividend` 使用公告日期/实施公告日期窗口，`namechange` 使用低频日期窗口。
 
 阶段三快照规则：`research_snapshot` 生成器可读取已通过质量门禁的 PIT/Feature；Research 和 Backtest 只能读取 `FROZEN` 快照。一个 `snapshot_id` 只对应一个截止日；生成使用 REPEATABLE READ 和输入切片哈希；FROZEN 后由数据库触发器禁止更新/删除。`research-v1.1` 额外保存并哈希 PIT 的 `eligible_by_market`；旧版本 FROZEN 快照只读保留，正式 Backtest Dataset 不得静默升级或使用。新增版本血缘必须有来源版本和 SHA-256；历史 `tushare_daily_raw` 行可能尚无 `tushare_market_raw_version`，此时允许 `source_record_version=NULL`，但必须以选中 Raw payload 计算确定性 SHA-256，并在 Dataset 中标明这是 legacy 限制，不得伪造版本或回退到无哈希数据。正式冻结只接受干净 Git 或存在的代码归档，`diff_hash` 不能替代可复现代码。快照系列按 `(截止日, 基线, Schema)` 幂等续跑，不重复创建或重写 FROZEN 快照。正式快照前不得进入正式回测或自动交易。
 
@@ -185,3 +203,53 @@ Research 审计规则：`ACTIVE` 观察池只能归档；ACTIVE 成员和证据�
 - Raw 表始终只读，不因性能优化而修改、覆盖或删除原始数据。
 
 本次对应实现：`sql/043_backtest_dataset_batch_checkpoint.sql`、`data_collect/jobs/backtest_dataset_batched.py` 和 `backtest_dataset_handoff.py` 的 `--batch-days`。
+本次财务暖身任务补充：`pit.financial_asof` 原先的全量 `TRUNCATE + INSERT` 会形成大事务，已改为按日期窗口写入完整构建表、每窗口独立提交，最后以短事务切换表；失败只清理构建表，不影响 Raw 或旧 PIT。后续新建派生重建任务不得恢复全量长事务。
+
+## 低频 Tushare 源数据抽样对账
+
+偶尔需要核对真实 API 时使用 `tools/audit_tushare_sample.py`；它只读 Tushare 和数据库 Raw，不写入生产表。默认抽样 10 条，也可用 `--sample-size 50`，结果可保存为 JSON；不纳入日常主流程。
+
+示例：`.venv\Scripts\python.exe tools\audit_tushare_sample.py --trade-date 2026-08-21 --sample-size 10 --dataset all --output logs\tushare_source_audit_20260821.json`
+
+## 日常增量执行方式
+
+完整生产增量统一运行 DAG，不逐个手动触发任务：
+
+```powershell
+uv run python tools/run_pipeline_once.py `
+  --pipeline tushare_production_daily `
+  --run-date YYYYMMDD `
+  --no-dag
+```
+
+## 日线行情表迁移记录
+
+`public.daily_kline`（旧公共日线行情表）已完成 524 个日期窗口校验，源/目标均为 10,672,777 行且分块哈希一致；正式消费者统一使用 `std.daily_kline`（标准分区日线行情表）。旧表保留为 `public._legacy_daily_kline_95cc209be402`（旧表备份），应用账号已撤销其读写权限，不删除，供回滚和审计使用。
+
+`public.adj_factor_daily`（旧公共复权因子表）同样完成 524 个日期窗口校验，源/目标均为 11,028,658 行且分块哈希一致；正式消费者统一使用 `std.adj_factor_daily`（标准分区复权因子表）。旧表保留为 `public._legacy_adj_factor_daily_2f5af8e6142b`（旧表备份），应用账号无权读取。
+
+`public.valuation_daily`（旧公共估值表）完成 524 个日期窗口校验，源/目标均为 10,594,158 行且分块哈希一致；正式消费者统一使用 `std.valuation_daily`（标准分区估值表）。旧表保留为 `public._legacy_valuation_daily_88f539fe61ed`（旧表备份），应用账号无权读取。
+
+流程按依赖顺序执行 Raw、Standard/PIT/Feature、Financial Derived、Market Derived 和 Quality Gate；失败按配置重试，上游失败时下游停止。`--only-task` 仅用于排障，不用于正常增量。
+
+## 财务标准表迁移记录
+
+`public.financial_income_standard`（旧公共财务利润表）、`public.financial_balance_sheet_standard`（旧公共财务资产负债表）、`public.financial_cash_flow_standard`（旧公共财务现金流量表）和 `public.fina_indicator_standard`（旧公共财务指标表）已按主键窗口完成复制、分块哈希校验和正式切换；正式消费者统一使用 `std.financial_income_standard`、`std.financial_balance_sheet_standard`、`std.financial_cash_flow_standard` 和 `std.fina_indicator_standard`（标准层财务表）。四张旧表保留为 `public._legacy_*`（旧表备份），程序账号无权读取；目标序列已对齐到最大主键，后续增量可直接写入。
+
+以后提及技术表名、Schema（模式）或其他专业名词时，同时给出对应中文名称；Raw（原始层）仍保留在 `public`（公共模式），Standard（标准层）正式表使用 `std`（标准模式）。
+
+`public.stock_financial_indicator`（旧公共财务指标兼容表）已完成 444 个 7 日窗口校验，共 115,646 行，正式消费者和旧适配器统一使用 `std.stock_financial_indicator`（标准层财务指标兼容表）；旧表保留为 `public._legacy_stock_financial_indicator_beafb40fec91`（旧表备份），程序账号无权读取。核心财务 v2 不依赖该兼容表，后续可在确认旧适配器完全退役后再按保留周期清理备份。
+
+`public.trading_calendar`（旧公共交易日历表）和 `public.stock_basic_info`（旧公共股票基础信息表）已完成标准层切换，正式写入统一使用 `std.trading_calendar`（标准交易日历表）和 `std.stock_basic_info`（标准股票基础信息表）；程序账号已撤销旧公共表权限，旧表仅由超级用户保留作回滚/审计源。
+
+`financial_change_queue`（财务变更队列）、`financial_ingest_anomaly`（财务采集异常）和 `financial_version_cutover_watermark`（财务版本切换水位）属于运维控制表，已通过目录级 `SET SCHEMA`（模式迁移）从 `public`（公共模式）移动到 `ops`（运维模式），数据与索引未复制；VIP 财务链路已统一使用 `ops.*`（运维表）。
+
+`public.tushare_history_checkpoint`（旧公共历史检查点表，约 8 万行）和 `public.tushare_data_release`（旧公共数据发布基线表）已通过 `sql/076_operational_baselines_to_ops.sql` 使用目录级 `SET SCHEMA` 移动为 `ops.tushare_history_checkpoint`（运维历史检查点表）和 `ops.tushare_data_release`（运维数据发布基线表）。这不是历史数据重采，也不复制行；研究/回测外键、发布序列、`ashares_app`（程序账号）权限和所有 Repository（仓储）查询均已切换到 `ops`。`contract.dataset_release`（契约数据集发布表）仍是独立的 FROZEN（冻结）数据产品，不与运维基线表混用。
+
+权限收口：`sql/077_revoke_legacy_public_app_privileges.sql` 已撤销 `ashares_app` 对旧空业务表（旧财务/行业/ETF/指数辅助表）和损坏 Raw 备份表的全部权限；程序账号在 `public`（公共模式）仅保留 Raw（原始层）正式表的 SELECT/INSERT，不具备 UPDATE/DELETE。超级用户权限保留，用于人工数据库运维。
+
+财务写入契约修复：`std.financial_income_standard`（标准利润表）、`std.financial_balance_sheet_standard`（标准资产负债表）和 `std.financial_cash_flow_standard`（标准现金流量表）的 Upsert（幂等写入）键是 `(source, source_record_key, record_version)`，不能使用自增 `financial_id`；`std.fina_indicator_standard`（标准财务指标表）实际冲突键为上述三列加 `payload_hash`；`std.stock_financial_indicator`（兼容财务指标表）必须包含 `source`。Policy（策略）必须与 PostgreSQL（数据库）唯一索引和 Repository（仓储）实际冲突键一致。
+
+同日财务修订规则：同一业务键和同一公告日出现不同 payload 时，Standard（标准层）写入 `quality_status='WARNING'`；`version_available_date`/`data_available_timestamp` 保留业务可见边界，PIT（时点层）使用 `record_version DESC` 二级仲裁，不能用 `fetched_at`（仓库抓取时间）伪造官方公告时刻。
+
+并发规则：财务 Standard/PIT/Feature（标准层/时点层/特征层）转换、财务增量、财务迁移和基础重建统一持有 `warehouse-write/foundation-rebuild`（仓库写入排他锁）；新增财务写任务不得自建互不相交的锁名。

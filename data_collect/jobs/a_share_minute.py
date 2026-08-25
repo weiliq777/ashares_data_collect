@@ -18,11 +18,37 @@ from tqdm import tqdm
 
 from data_collect.utils.date_utils import is_market_day, date_range
 from data_collect.utils.df_utils import normalize_trade_date
-from data_collect.utils.db import prepare_db_aligned_data, save_to_postgres
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.export import export_stock_csvs
 from data_collect.utils.notify import send_dingtalk
 from data_collect.utils.retry import retry_xtquant
 from data_collect.utils.xtquant_utils import require_xtdata, get_a_share_codes, download_history_with_retry
+
+
+def _aligned(data: pd.DataFrame) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+    return pd.DataFrame({
+        "交易日期": pd.to_datetime(data["trade_date"]).dt.date,
+        "时间": pd.to_datetime(data["bar_time"]).dt.time,
+        "代码": data["stock_code"].map(lambda value: f"{str(value).split('.')[1].lower()}{str(value).split('.')[0]}" if "." in str(value) else str(value)),
+        "开盘": data["open"], "收盘": data["close"], "最高": data["high"], "最低": data["low"],
+        "成交量": data["volume"], "成交额": data["amount"], "最新价": data["close"],
+    }).astype(object).where(pd.notna(aligned), None)
+
+
+def _save(data: pd.DataFrame, label: str):
+    aligned = _aligned(data)
+    if aligned.empty:
+        return 0, 0
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id=f"a-share-minute-{label}", job_name="a_share_minute", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).append("minutedata_tdx", aligned.to_dict("records"), context, partition="a-share-minute")
+    finally:
+        kernel.close()
 
 
 # ======== 数据获取 ========
@@ -170,9 +196,9 @@ def run(run_date: str, **kwargs) -> str:
         return f"{trade_date} 非交易日，分钟线任务跳过。"
 
     data = fetch_all_stocks_minute(trade_date, limit_stocks=limit_stocks)
-    aligned = prepare_db_aligned_data(data)
+    aligned = _aligned(data)
     export_dir, file_count = export_stock_csvs(aligned, trade_date)
-    tried, inserted = save_to_postgres(data, pre_aligned_df=aligned)
+    tried, inserted = _save(data, "run")
     msg = f"{trade_date} 分钟线任务完成，写入 {tried}/{inserted} 条"
     if export_dir:
         msg += f"，导出 {file_count} 个CSV到 {export_dir.resolve()}"
@@ -189,9 +215,9 @@ def run_backfill(start_date: str, end_date: str, limit_stocks: int | None = None
     with DualProgress(trading_days) as dp:
         for trade_date in dp.iter_days():
             data = fetch_all_stocks_minute(trade_date, limit_stocks=limit_stocks)
-            aligned = prepare_db_aligned_data(data)
+            aligned = _aligned(data)
             export_stock_csvs(aligned, trade_date)
-            tried, inserted = save_to_postgres(data, pre_aligned_df=aligned)
+            tried, inserted = _save(data, "backfill")
             total_tried += tried
             total_inserted += inserted
             dp.log(f"写入 {tried}/{inserted}")
@@ -207,13 +233,17 @@ def run_backfill(start_date: str, end_date: str, limit_stocks: int | None = None
 
 def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     """查漏补缺：检查日期范围内分钟线数据完整性，自动补缺。"""
-    from data_collect.utils.db import get_dates_with_data
     from data_collect.utils.progress import DualProgress
     import pandas as pd_
 
     limit_stocks = kwargs.get("limit_stocks")
     trading_days = date_range(start_date, end_date)
-    existing = get_dates_with_data("minutedata_tdx", "交易日期", start_date, end_date)
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="a-share-minute-verify", job_name="a_share_minute", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        existing = {pd_.to_datetime(day).date() for day, _ in CollectorRepository(kernel).existing_code_dates(context, pd_.to_datetime(start_date).date(), pd_.to_datetime(end_date).date())}
+    finally:
+        kernel.close()
     missing = [d for d in trading_days if pd_.to_datetime(d).date() not in existing]
 
     if not missing:
@@ -223,8 +253,7 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     with DualProgress(missing) as dp:
         for d in dp.iter_days():
             data = fetch_all_stocks_minute(d, limit_stocks=limit_stocks)
-            aligned = prepare_db_aligned_data(data)
-            tried, inserted = save_to_postgres(data, pre_aligned_df=aligned)
+            tried, inserted = _save(data, "verify")
             total_tried += tried
             total_inserted += inserted
             dp.log(f"写入 {tried}/{inserted}")
@@ -238,22 +267,17 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
 def run_evaluate(start_date: str, end_date: str, **kwargs) -> str:
     """评估数据缺失：对比应有股票和实际数据，输出缺失明细 CSV。"""
     import pandas as pd_eval
-    from data_collect.utils.db import get_connection
     from data_collect.utils.xtquant_utils import get_a_share_codes
 
     trading_days = date_range(start_date, end_date)
     codes = get_a_share_codes()
 
-    with get_connection() as conn:
-        df_existing = pd_eval.read_sql(
-            'SELECT DISTINCT "交易日期", "代码" FROM minutedata_tdx '
-            'WHERE "交易日期" >= %s AND "交易日期" <= %s',
-            conn, params=[start_date, end_date],
-        )
-
-    existing_set = set()
-    for _, row in df_existing.iterrows():
-        existing_set.add((str(row["交易日期"]), row["代码"].strip()))
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="a-share-minute-evaluate", job_name="a_share_minute", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        existing_set = CollectorRepository(kernel).existing_code_dates(context, pd_eval.to_datetime(start_date).date(), pd_eval.to_datetime(end_date).date())
+    finally:
+        kernel.close()
 
     # 代码格式转换：xtquant 的 000001.SZ → DB 的 sz000001
     def to_db_code(xt_code):

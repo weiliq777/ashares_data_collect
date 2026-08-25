@@ -4,7 +4,7 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-ALTER TABLE tushare_data_release
+ALTER TABLE ops.tushare_data_release
     ADD COLUMN IF NOT EXISTS source_manifest JSONB,
     ADD COLUMN IF NOT EXISTS source_manifest_hash CHAR(64);
 
@@ -64,7 +64,7 @@ SELECT r.ts_code, r.ts_code, r.payload,
 ON CONFLICT (business_key,payload_hash) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_release_source_manifest_hash
-    ON tushare_data_release(source_manifest_hash);
+    ON ops.tushare_data_release(source_manifest_hash);
 CREATE INDEX IF NOT EXISTS idx_fina_indicator_vintage_available
     ON fina_indicator_standard(ts_code, version_available_date, source_observed_at);
 CREATE INDEX IF NOT EXISTS idx_financial_income_vintage_available
@@ -84,9 +84,9 @@ BEGIN
     RETURN NEW;
 END;
 $$;
-DROP TRIGGER IF EXISTS trg_release_source_manifest ON tushare_data_release;
+DROP TRIGGER IF EXISTS trg_release_source_manifest ON ops.tushare_data_release;
 CREATE TRIGGER trg_release_source_manifest
-BEFORE INSERT OR UPDATE ON tushare_data_release
+BEFORE INSERT OR UPDATE ON ops.tushare_data_release
 FOR EACH ROW EXECUTE FUNCTION public.assert_release_source_manifest();
 
 CREATE OR REPLACE FUNCTION research.assert_snapshot_source_boundary()
@@ -95,7 +95,7 @@ DECLARE release_hash CHAR(64);
 BEGIN
     IF NEW.status='FROZEN' AND NEW.schema_version='research-v1.2' THEN
         SELECT source_manifest_hash INTO release_hash
-          FROM tushare_data_release WHERE release_tag=NEW.data_baseline_tag;
+          FROM ops.tushare_data_release WHERE release_tag=NEW.data_baseline_tag;
         IF NEW.baseline_source_manifest_hash IS NULL
            OR release_hash IS NULL
            OR btrim(NEW.baseline_source_manifest_hash) <> btrim(release_hash) THEN
@@ -116,7 +116,7 @@ DECLARE release_hash CHAR(64); bad_members BIGINT;
 BEGIN
     IF NEW.status='FROZEN' THEN
         SELECT source_manifest_hash INTO release_hash
-          FROM tushare_data_release WHERE release_tag=NEW.data_baseline_tag;
+          FROM ops.tushare_data_release WHERE release_tag=NEW.data_baseline_tag;
         IF NEW.baseline_source_manifest_hash IS NULL
            OR release_hash IS NULL
            OR btrim(NEW.baseline_source_manifest_hash) <> btrim(release_hash) THEN

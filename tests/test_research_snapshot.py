@@ -1,5 +1,8 @@
 from datetime import date
 
+import pytest
+
+from data_collect.jobs import research_snapshot
 from data_collect.jobs.research_snapshot import (
     INPUTS,
     REQUIRED_LINEAGE_GROUPS,
@@ -8,14 +11,106 @@ from data_collect.jobs.research_snapshot import (
     _lineage_sql,
     _stock_snapshot_sql,
 )
+from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
 
 
 def test_snapshot_freeze_rechecks_baseline_and_quality_gate():
     source = __import__("pathlib").Path("data_collect/jobs/research_snapshot.py").read_text(encoding="utf-8")
-    assert '_baseline(manifest["cutoff"], manifest["baseline"], conn)' in source
+    repository = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    assert "def baseline" in repository
     assert 'quality_hash != manifest["quality_hash"]' in source
-    assert "def _manifest(conn, snapshot_id: str, *, for_update: bool = False)" in source
-    assert "_manifest(conn, snapshot_id, for_update=True)" in source
+    assert "def manifest(" in repository
+    assert "for_update" in repository
+
+
+def test_snapshot_input_manifest_precompute_preserves_order_and_hash():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    calls = []
+
+    def fake_input_stats(definition, cutoff, source_manifest, context, row_bytes):
+        calls.append(definition)
+        return {"table_name": definition, "row_count": 1}
+
+    repository.input_stats = fake_input_stats
+    stats, digest = repository._precompute_input_manifest(
+        ["first", "second"], date(2026, 8, 18), {"manifest": True}, "ctx", "row-bytes",
+        lambda items: "hash:" + ",".join(item["table_name"] for item in items),
+    )
+
+    assert calls == ["first", "second"]
+    assert [item["table_name"] for item in stats] == ["first", "second"]
+    assert digest == "hash:first,second"
+
+
+def test_foundation_snapshot_rejects_legacy_release_contract():
+    baseline = (
+        "legacy", date(2026, 8, 6), "validated", "quality", "source",
+        {}, "feature-contract-v1.0",
+    )
+    with pytest.raises(RuntimeError, match="feature-contract-v2.0"):
+        research_snapshot._assert_baseline_schema(
+            baseline, research_snapshot.FOUNDATION_SCHEMA_VERSION
+        )
+
+
+def test_series_quality_evidence_keeps_its_real_coverage_cutoff():
+    stored = {"cutoff_date": "2026-08-06", "failures": {}}
+    assert research_snapshot._stored_quality_cutoff(
+        date(2026, 7, 31), stored
+    ) == date(2026, 8, 6)
+    with pytest.raises(RuntimeError, match="质量证据截止日早于研究截止日"):
+        research_snapshot._stored_quality_cutoff(date(2026, 8, 7), stored)
+
+
+def test_foundation_historical_snapshot_uses_release_quality_boundary():
+    baseline = (
+        "foundation", date(2026, 8, 6), "validated", "quality", "source",
+        {}, research_snapshot.FOUNDATION_FEATURE_CONTRACT,
+    )
+
+
+    assert research_snapshot._quality_evidence_cutoff(
+        baseline,
+        date(2026, 8, 3),
+        research_snapshot.FOUNDATION_SCHEMA_VERSION,
+    ) == date(2026, 8, 6)
+    assert research_snapshot._quality_evidence_cutoff(
+        baseline,
+        date(2026, 8, 3),
+        research_snapshot.SCHEMA_VERSION,
+    ) == date(2026, 8, 3)
+
+
+def test_single_snapshot_build_reuses_manifest_quality_evidence_boundary():
+    source = __import__("pathlib").Path(
+        "data_collect/jobs/research_snapshot.py"
+    ).read_text(encoding="utf-8")
+    build_section = source.split("def build", 1)[1].split("def validate", 1)[0]
+    assert "_current_quality_for_manifest(manifest)" in build_section
+    assert "_quality_report(\n            manifest[\"cutoff\"]" not in build_section
+
+
+def test_series_freeze_reuses_one_precomputed_quality_report():
+    source = __import__("pathlib").Path(
+        "data_collect/jobs/research_snapshot_series.py"
+    ).read_text(encoding="utf-8")
+    assert "quality_report=base_report" in source
+
+
+def test_foundation_snapshot_missing_lineage_is_jsonb():
+    source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    assert "to_jsonb(s.ts_code || ':' || s.research_date::text || ':missing')" in source
+
+
+def test_pit_validation_allows_building_before_validate_transition():
+    source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/pit_validation_repository.py"
+    ).read_text(encoding="utf-8")
+    assert '{"BUILDING", "VALIDATED", "FROZEN"}' in source
 
 
 def test_row_hash_is_deterministic_for_same_values():
@@ -80,7 +175,9 @@ def test_snapshot_uses_asof_lifecycle_and_not_current_status_for_history():
 
 
 def test_snapshot_code_contains_adjusted_factor_vintage_gate():
-    source = __import__("pathlib").Path("data_collect/jobs/research_snapshot.py").read_text(encoding="utf-8")
-    assert "def _assert_adj_factor_vintage" in source
+    source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    assert "def price_vintage" in source
     assert "a.fetched_at::date > %s" in source
-    assert "_assert_price_vintage_for_schema" in source
+    assert "price_vintage_dates" in source

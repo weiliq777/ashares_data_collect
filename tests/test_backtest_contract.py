@@ -1,7 +1,14 @@
 from datetime import date
 from pathlib import Path
 
-from data_collect.jobs.backtest_dataset import _assert_build_code_current, missing_snapshot_dates
+from data_collect.jobs.backtest_dataset import (
+    FEATURE_VERSION,
+    SUPPORTED_RESEARCH_SCHEMA_VERSIONS,
+    _assert_build_code_current,
+    missing_snapshot_dates,
+)
+from data_collect.jobs.research_snapshot import FOUNDATION_SCHEMA_VERSION, SCHEMA_VERSION
+from data_collect.data_access.research_contract import STRATEGY_NEUTRAL_SCHEMA_VERSION
 
 
 def test_backtest_migration_has_frozen_dataset_and_run_contract():
@@ -123,6 +130,28 @@ def test_dataset_requires_a_snapshot_for_each_open_day():
         [date(2026, 8, 3), date(2026, 8, 4)],
         [date(2026, 8, 3), date(2026, 8, 4)],
     ) == ()
+
+
+def test_dataset_accepts_current_and_foundation_research_contracts():
+    assert SUPPORTED_RESEARCH_SCHEMA_VERSIONS == {
+        SCHEMA_VERSION,
+        FOUNDATION_SCHEMA_VERSION,
+        STRATEGY_NEUTRAL_SCHEMA_VERSION,
+    }
+    source = Path("data_collect/jobs/backtest_dataset.py").read_text(encoding="utf-8")
+    assert "financial_data_available_timestamp" in source
+    assert "net_profit_consolidated_ttm" in source
+    assert "ocf_to_net_profit_consolidated_ttm" in source
+    assert "financial_source_fingerprint" in source
+    assert len(FEATURE_VERSION) <= 80
+
+
+def test_dataset_handoff_selects_only_requested_snapshot_range():
+    source = Path(
+        "data_collect/jobs/backtest_dataset_handoff.py"
+    ).read_text(encoding="utf-8")
+    assert "research_cutoff_date BETWEEN %s AND %s" in source
+    assert "warmup_start, evaluation_end" in source
 
 
 def test_dataset_validation_mentions_full_warmup_and_evaluation_coverage():

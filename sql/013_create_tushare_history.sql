@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS adj_factor_daily (
     PRIMARY KEY (stock_code, trade_date, source)
 );
 
-CREATE TABLE IF NOT EXISTS tushare_history_checkpoint (
+CREATE SCHEMA IF NOT EXISTS ops;
+
+CREATE TABLE IF NOT EXISTS ops.tushare_history_checkpoint (
     dataset VARCHAR(50) NOT NULL,
     checkpoint_key VARCHAR(100) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'running',

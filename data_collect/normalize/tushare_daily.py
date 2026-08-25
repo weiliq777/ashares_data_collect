@@ -20,4 +20,9 @@ def normalize_daily_basic(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = df.rename(columns={"ts_code": "stock_code"}).copy()
     out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d", errors="coerce").dt.date
-    return out
+    # Tushare returns missing numeric fields as pandas NaN.  Passing those
+    # values through to psycopg can persist PostgreSQL's special NaN float
+    # value, which is not the same as SQL NULL and breaks downstream quality
+    # predicates.  Convert every pandas missing marker after date parsing so
+    # all optional vendor fields are written as SQL NULL.
+    return out.astype(object).where(pd.notna(out), None)

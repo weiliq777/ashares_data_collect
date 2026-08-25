@@ -51,7 +51,7 @@ against already imported rows, not only rows in the current file.
 更新时间：2026-08-06  
 状态：阶段三核心代码完成；三日 Baseline Dataset/Run 已完成烟测；完整五年 Dataset/Run 待生成
 
-本文件吸收 `dev_doc/gemini-doc/` 的阶段三建议，但以当前项目的
+本文件吸收归档参考样例 `dev_doc/过时/gemini-doc/` 的阶段三建议，但以当前项目的
 `Raw → Standard → PIT → Feature → FROZEN Research Snapshot` 模型为准。
 Gemini 示例代码只作为算法参考，不能直接作为生产回测引擎。
 
@@ -522,7 +522,7 @@ observation.
 当前生产库已经存在三日 FROZEN Dataset 和 SUCCEEDED Baseline Run；完整五年 Dataset/Run 仍待按每个 SSE 开市日生成 FROZEN Snapshot 后执行。自动实盘交易仍被 `BACKTEST/PENDING_APPROVAL` 与人工 `PAPER_MANUAL` Air-Gap 阻断。
 ## 2026-08-07 最新实现状态覆盖
 
-本文早期“尚未生成正式 Dataset/Run”描述为历史记录。当前代码和数据库已经完成并验证三日 Baseline 烟测；权威完整说明见 `dev_doc/current_implementation_state_20260807.md`。
+本文早期“尚未生成正式 Dataset/Run”描述为历史记录。当前代码和数据库已经完成并验证三日 Baseline 烟测；当前数据访问与基座状态见 `dev_doc/data_access_current_status_20260818.md`。
 
 实测对象：
 

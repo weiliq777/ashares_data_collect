@@ -1,0 +1,23 @@
+name: data-access-contract
+
+on:
+  pull_request:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Block newly introduced data access violations
+        run: python tools/check_data_access_contract.py --ci --new-only --base "origin/${{ github.event.pull_request.base.ref }}"
+      - name: Verify the complete data access boundary
+        run: python tools/check_data_access_contract.py --ci
+      - name: Run data access contract tests
+        run: python -m pytest -q tests/test_data_access_contract_scanner.py tests/test_data_access_core.py tests/test_data_access_gateway.py tests/test_data_access_repository.py tests/test_data_write_safety.py

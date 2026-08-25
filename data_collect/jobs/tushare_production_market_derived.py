@@ -1,0 +1,54 @@
+"""Bounded market/PIT/Feature derivation for the unified production pipeline."""
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+from uuid import uuid4
+
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.phase2_raw_repository import Phase2RawRepository
+from data_collect.jobs.tushare_derived_rebuild import rebuild_after_market
+from data_collect.jobs.tushare_job_lock import warehouse_write_job
+
+
+def _parse_date(value: date | str | None) -> date:
+    if value is None:
+        return date.today()
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(str(value).replace("-", ""), "%Y%m%d").date()
+
+
+@warehouse_write_job
+def run(run_date=None, lookback_days: int = 5, dry_run: bool = False, **_kwargs) -> dict:
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0")
+    end_date = _parse_date(run_date)
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "end_date": end_date.isoformat(),
+            "lookback_days": lookback_days,
+        }
+    start_date = end_date - timedelta(days=max(lookback_days * 3, 10))
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"production-market-derived-{uuid4().hex}",
+        job_name="tushare_production_market_derived",
+        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
+    )
+    try:
+        repository = Phase2RawRepository(kernel)
+        trade_days = repository.trade_dates(start_date, end_date, context, lookback_days)
+    finally:
+        kernel.close()
+    if not trade_days:
+        return {"status": "no_trading_days", "start_date": None, "end_date": None}
+    first = datetime.strptime(trade_days[0], "%Y%m%d").date()
+    last = datetime.strptime(trade_days[-1], "%Y%m%d").date()
+    result = rebuild_after_market(first, last)
+    return {"status": "rebuilt", "start_date": first.isoformat(), "end_date": last.isoformat(), **result}
+
+
+if __name__ == "__main__":
+    print(run())

@@ -170,7 +170,7 @@ END;
 $$;
 
 -- Baseline hashes must be generated from the actual quality report.
-ALTER TABLE tushare_data_release
+ALTER TABLE ops.tushare_data_release
     ADD COLUMN IF NOT EXISTS quality_report JSONB;
 
 -- New rule records carry their approval evidence in the database.  Existing

@@ -7,23 +7,33 @@ Raw/Standard/PIT/Feature，也不绕过单日 Snapshot 的质量门禁和 Git �
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 from datetime import date
 from typing import Iterable
+from uuid import uuid4
 
 from data_collect.jobs.research_snapshot import (
+    FOUNDATION_SCHEMA_VERSION,
     SCHEMA_VERSION,
     build_snapshots_batch,
     create_snapshots_batch,
     _baseline,
-    _canonical,
     _quality_report,
     validate_snapshots_batch,
-    existing_snapshot,
     freeze_snapshots_batch,
 )
-from data_collect.utils.db import get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
+from data_collect.data_access.research_contract import is_foundation_schema
+
+
+def _service(label: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"snapshot-series-{label}-{uuid4().hex}", job_name="research_snapshot_series",
+        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
+    )
+    return kernel, SnapshotSeriesRepository(kernel), context
 
 
 def normalize_cutoff_dates(cutoff_dates: Iterable[date | str]) -> tuple[date, ...]:
@@ -44,16 +54,11 @@ def open_trade_dates(start: date, end: date, exchange: str = "SSE") -> tuple[dat
     """从已标准化交易日历读取开市日，不自行推算周末或节假日。"""
     if start > end:
         raise ValueError("交易日历起止日期无效")
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT trade_date
-                 FROM trading_calendar
-                WHERE exchange=%s AND is_open IS TRUE
-                  AND trade_date BETWEEN %s AND %s
-                ORDER BY trade_date""",
-            (exchange, start, end),
-        )
-        return tuple(row[0] for row in cur.fetchall())
+    kernel, repository, context = _service("calendar")
+    try:
+        return repository.open_trade_dates(start, end, exchange, context)
+    finally:
+        kernel.close()
 
 
 def validate_cutoff_dates_are_open(cutoff_dates: Iterable[date | str], exchange: str = "SSE") -> tuple[date, ...]:
@@ -68,6 +73,59 @@ def validate_cutoff_dates_are_open(cutoff_dates: Iterable[date | str], exchange:
     return dates
 
 
+def assert_financial_pit_warmup(
+    cutoff_dates: Iterable[date],
+    schema_version: str = SCHEMA_VERSION,
+) -> None:
+    """Fail fast when the first research date has no PIT financial history."""
+    first_date = min(cutoff_dates)
+    kernel, repository, context = _service("warmup")
+    try:
+        visible_rows = repository.financial_warmup_count(first_date, schema_version, context)
+    finally:
+        kernel.close()
+    if visible_rows == 0:
+        raise RuntimeError(
+            "PIT 财务 warm-up 缺失："
+            f"{first_date.isoformat()} 没有可见财务记录。"
+            "请先将财务 Raw 初始化起点提前到评估区间之前，"
+            "再重建 fina_indicator_standard、pit.financial_asof 和 Feature。"
+        )
+
+
+def existing_snapshots_batch(
+    cutoff_dates: Iterable[date],
+    baseline_tag: str,
+    schema_version: str,
+) -> dict[date, tuple[str, str]]:
+    """Read the whole series status in one query instead of N+1 connections."""
+    dates = tuple(cutoff_dates)
+    if not dates:
+        return {}
+    kernel, repository, context = _service("existing")
+    try:
+        return repository.existing_snapshots(dates, baseline_tag, schema_version, context)
+    finally:
+        kernel.close()
+
+
+def reset_building_snapshots(snapshot_ids: Iterable[str], reason: str) -> None:
+    """Move stale BUILDING snapshots to FAILED so their children are rebuilt."""
+    ids = tuple(str(value) for value in snapshot_ids)
+    if not ids:
+        return
+    kernel, repository, context = _service("reset")
+    try:
+        with kernel.lock_manager.session_exclusive("research-snapshot", "batch"):
+            changed_rows = repository.reset_building(ids, reason, context)
+    finally:
+        kernel.close()
+    if changed_rows != len(ids):
+        raise RuntimeError(
+            f"重建 BUILDING Snapshot 数量不一致：期望 {len(ids)}，实际更新 {changed_rows}"
+        )
+
+
 def create_snapshot_series(
     cutoff_dates: Iterable[date | str],
     baseline_tag: str,
@@ -80,6 +138,8 @@ def create_snapshot_series(
     max_snapshots: int | None = 50,
     batch_size: int = 10,
     exchange: str = "SSE",
+    rebuild_building: bool = False,
+    verify_source_manifest: bool = False,
 ) -> tuple[dict[str, str], ...]:
     """按日期创建一组 Snapshot，并返回每个阶段的确定结果。
 
@@ -104,12 +164,14 @@ def create_snapshot_series(
 
     # 范围模式本身来自开市日查询；显式日期也必须经过同一门禁。
     dates = validate_cutoff_dates_are_open(dates, exchange=exchange)
+    assert_financial_pit_warmup(dates, schema_version)
 
     results: list[dict[str, str]] = []
     statuses: dict[str, str] = {}
     snapshots: dict[str, str] = {}
+    existing_by_date = existing_snapshots_batch(dates, baseline_tag, schema_version)
     for cutoff in dates:
-        existing = existing_snapshot(cutoff.isoformat(), baseline_tag, schema_version)
+        existing = existing_by_date.get(cutoff)
         if existing:
             snapshot_id, status = existing
             # BUILDING is resumable: a process can exit after the build
@@ -128,10 +190,25 @@ def create_snapshot_series(
         created = create_snapshots_batch(
             missing_dates, baseline_tag, schema_version=schema_version,
             notes_prefix=notes_prefix,
+            verify_source_manifest=verify_source_manifest,
         )
         for item in created:
             snapshots[item["research_cutoff_date"]] = item["snapshot_id"]
             statuses[item["research_cutoff_date"]] = "DRAFT"
+
+    if rebuild_building:
+        stale = [
+            snapshots[cutoff.isoformat()]
+            for cutoff in dates
+            if statuses[cutoff.isoformat()] == "BUILDING"
+        ]
+        reset_building_snapshots(
+            stale,
+            "显式重建：上游 Raw/Standard/PIT/Feature 已更新，旧 BUILDING Snapshot 不再复用",
+        )
+        for cutoff in dates:
+            if statuses[cutoff.isoformat()] == "BUILDING":
+                statuses[cutoff.isoformat()] = "FAILED"
 
     pending_build = [
         snapshots[cutoff.isoformat()]
@@ -145,20 +222,30 @@ def create_snapshot_series(
     ]
     batch_baseline = None
     batch_quality_reports = None
+    base_report = None
     if pending_build or pending_validate_existing:
-        with get_connection() as conn:
-            batch_baseline = _baseline(max(dates), baseline_tag, conn)
-        base_report, _ = _quality_report(max(dates))
+        batch_baseline = _baseline(
+            max(dates), baseline_tag,
+            verify_source_manifest=verify_source_manifest,
+        )
+        if not verify_source_manifest:
+            print(
+                "baseline source manifest reused from validated release "
+                "(use --verify-source-manifest for a full rescan)",
+                flush=True,
+            )
+        quality_cutoff = (
+            batch_baseline[1]
+            if is_foundation_schema(schema_version)
+            else max(dates)
+        )
+        base_report, base_quality_hash = _quality_report(
+            quality_cutoff, schema_version, batch_baseline,
+        )
         batch_quality_reports = {}
         for cutoff in dates:
-            report = dict(base_report)
-            report["cutoff_date"] = cutoff.isoformat()
-            encoded = json.dumps(
-                _canonical(report), ensure_ascii=False, sort_keys=True,
-                separators=(",", ":"), allow_nan=False,
-            )
             batch_quality_reports[snapshots[cutoff.isoformat()]] = (
-                report, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                base_report, base_quality_hash
             )
     for offset in range(0, len(pending_build), batch_size):
         chunk = pending_build[offset:offset + batch_size]
@@ -197,6 +284,20 @@ def create_snapshot_series(
 
     # Freeze in bounded batches; no stock rows are written in this phase.
     if freeze:
+        if batch_baseline is None:
+            batch_baseline = _baseline(
+                max(dates), baseline_tag,
+                verify_source_manifest=verify_source_manifest,
+            )
+        if base_report is None:
+            quality_cutoff = (
+                batch_baseline[1]
+                if is_foundation_schema(schema_version)
+                else max(dates)
+            )
+            base_report, _ = _quality_report(
+                quality_cutoff, schema_version, batch_baseline,
+            )
         pending_freeze = [
             snapshots[cutoff.isoformat()]
             for cutoff in dates
@@ -204,7 +305,13 @@ def create_snapshot_series(
         ]
         for offset in range(0, len(pending_freeze), batch_size):
             chunk = pending_freeze[offset:offset + batch_size]
-            freeze_snapshots_batch(chunk, code_archive_path=code_archive_path)
+            freeze_snapshots_batch(
+                chunk,
+                code_archive_path=code_archive_path,
+                baseline=batch_baseline,
+                quality_report=base_report,
+                verify_source_manifest=verify_source_manifest,
+            )
             print(
                 f"snapshot freeze progress {min(offset + len(chunk), len(pending_freeze))}/{len(pending_freeze)}",
                 flush=True,
@@ -235,6 +342,14 @@ def main(argv=None):
     parser.add_argument("--code-archive-path")
     parser.add_argument("--max-snapshots", type=int, default=50,
                         help="单次安全上限；传 0 表示取消上限（需自行确认容量）")
+    parser.add_argument(
+        "--rebuild-building", action="store_true",
+        help="显式重建已有 BUILDING Snapshot；仅在上游输入发生重建后使用",
+    )
+    parser.add_argument(
+        "--verify-source-manifest", action="store_true",
+        help="对 validated 基线执行完整 Raw/Version 源清单复核；会扫描大表，默认关闭",
+    )
     parser.add_argument("--batch-size", type=int, default=10,
                         help="每批集合写入的 Snapshot 数量，默认 10")
     args = parser.parse_args(argv)
@@ -262,6 +377,8 @@ def main(argv=None):
         max_snapshots=None if args.max_snapshots == 0 else args.max_snapshots,
         batch_size=args.batch_size,
         exchange=args.exchange,
+        rebuild_building=args.rebuild_building,
+        verify_source_manifest=args.verify_source_manifest,
     )
     for result in results:
         print(result)

@@ -15,13 +15,14 @@ from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from data_collect.jobs.tushare_daily_incremental import (
-    _checkpoint,
-    _version_and_snapshot,
-)
+import pandas as pd
+
+import data_collect.jobs.tushare_daily_incremental as market_shared
 from data_collect.jobs.tushare_market_incremental_by_date import _request_market_frame
 from data_collect.providers.tushare_client import get_pro
-from data_collect.utils.db import get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.market_repository import MarketRepository
 
 
 DATASETS = {
@@ -54,28 +55,30 @@ if not logger.handlers:
 def _missing_dates(dataset: str, start_date: str, end_date: str) -> list[str]:
     """Return open SSE dates absent from the selected Raw table."""
     raw_table = DATASETS[dataset]["raw_table"]
-    sql = f"""
-        SELECT c.cal_date
-        FROM tushare_trade_cal_raw c
-        WHERE c.exchange = 'SSE'
-          AND c.cal_date BETWEEN %s AND %s
-          AND (c.payload->>'is_open')::int = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM {raw_table} r
-              WHERE r.trade_date = c.cal_date
-          )
-        ORDER BY c.cal_date
-    """
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(sql, (start_date, end_date))
-        return [row[0].strftime("%Y%m%d") for row in cur.fetchall()]
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"market-gap-{dataset}", job_name="tushare_market_gap_repair",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        return MarketRepository(kernel).missing_open_dates(
+            raw_table, pd.to_datetime(start_date).date(), pd.to_datetime(end_date).date(), context
+        )
+    finally:
+        kernel.close()
 
 
 def _raw_count(dataset: str, day: str) -> int:
     raw_table = DATASETS[dataset]["raw_table"]
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM {raw_table} WHERE trade_date=%s", (day,))
-        return int(cur.fetchone()[0])
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"market-gap-count-{dataset}", job_name="tushare_market_gap_repair",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        return MarketRepository(kernel).raw_count(raw_table, pd.to_datetime(day).date(), context)
+    finally:
+        kernel.close()
 
 
 def _repair_dataset(
@@ -110,7 +113,7 @@ def _repair_dataset(
             if frame is None or frame.empty:
                 failures += 1
                 message = "Tushare returned no rows; date remains unresolved"
-                _checkpoint(checkpoint_dataset, day, "empty", 0, message)
+                market_shared._checkpoint(checkpoint_dataset, day, "empty", 0, message)
                 logger.error("dataset=%s date=%s api_rows=0", dataset, day)
                 continue
 
@@ -120,7 +123,7 @@ def _repair_dataset(
 
             # This writes the immutable market version and the first-seen
             # snapshot. Existing Raw records are never updated or deleted.
-            _version_and_snapshot(dataset, frame, batch_id)
+            market_shared._version_and_snapshot(dataset, frame, batch_id)
             stored_rows = _raw_count(dataset, day)
             if stored_rows <= 0:
                 raise RuntimeError(
@@ -128,7 +131,7 @@ def _repair_dataset(
                     f"still has no rows for {day}"
                 )
             repaired += 1
-            _checkpoint(checkpoint_dataset, day, "done", stored_rows, None)
+            market_shared._checkpoint(checkpoint_dataset, day, "done", stored_rows, None)
             logger.info(
                 "dataset=%s date=%s api_rows=%s raw_rows=%s progress=%s/%s",
                 dataset,
@@ -141,7 +144,7 @@ def _repair_dataset(
         except Exception as exc:  # noqa: BLE001
             failures += 1
             logger.exception("dataset=%s date=%s repair failed", dataset, day)
-            _checkpoint(checkpoint_dataset, day, "failed", 0, str(exc)[:500])
+            market_shared._checkpoint(checkpoint_dataset, day, "failed", 0, str(exc)[:500])
         if index % max(int(batch_size), 1) == 0:
             time.sleep(float(pause))
 

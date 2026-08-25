@@ -20,7 +20,9 @@ from typing import Dict, List
 
 import pandas as pd
 
-from data_collect.utils.db import get_connection
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.instrument_repository import InstrumentRepository
 
 logger = logging.getLogger(__name__)
 
@@ -273,16 +275,6 @@ def normalize_stock_code(code) -> str | None:
 
 # ---------- load_name_dict ----------
 
-# instrument_info 快照表（jobs/a_share_instrument.py 自动建表）：
-# stock_code VARCHAR(20) PK（形如 000001.SZ），"InstrumentName" TEXT 证券名称。
-# 列名建表时带引号保留大小写，查询必须同样引号；正则过滤只取 A 股代码空间。
-_NAME_DICT_SQL = r"""
-    SELECT "stock_code", "InstrumentName"
-    FROM "instrument_info"
-    WHERE "stock_code" ~ '^\d{6}\.(SH|SZ|BJ)$'
-"""
-
-
 def load_name_dict() -> Dict[str, str]:
     """从 instrument_info 加载 {简称: 代码}（tag_stocks 词典用）。
 
@@ -291,13 +283,19 @@ def load_name_dict() -> Dict[str, str]:
     的 t2s 改写（乾→干），词典键不同步改写则这些票永远打不中；空名称跳过；
     含 "ST" 保留（ST 股也是股）。
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(_NAME_DICT_SQL)
-            rows = cur.fetchall()
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id="news-name-dict", job_name="news_normalize",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        rows = InstrumentRepository(kernel).name_dict(context)
+    finally:
+        kernel.close()
 
     name_dict: Dict[str, str] = {}
-    for code, name in rows:
+    for row in rows:
+        code, name = row["stock_code"], row["InstrumentName"]
         if not name:
             continue
         name = _get_opencc().convert(unicodedata.normalize("NFKC", str(name)))
@@ -308,14 +306,6 @@ def load_name_dict() -> Dict[str, str]:
     return name_dict
 
 
-# instrument_info 的 A 股代码集（个股新闻全市场扫描用），同 _NAME_DICT_SQL 表/过滤
-_A_SHARE_CODES_SQL = r"""
-    SELECT "stock_code"
-    FROM "instrument_info"
-    WHERE "stock_code" ~ '^\d{6}\.(SH|SZ|BJ)$'
-"""
-
-
 def load_a_share_codes() -> List[str]:
     """从 instrument_info 取在市 A 股**裸 6 位**码（stock_news_em 的 symbol 形态）。
 
@@ -323,14 +313,20 @@ def load_a_share_codes() -> List[str]:
     不依赖 xtquant/Windows）。注意与 xtquant_utils.get_a_share_codes（走 QMT、仅
     Windows）区分——本函数命名 load_a_share_codes 避免混淆。
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(_A_SHARE_CODES_SQL)
-            rows = cur.fetchall()
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id="news-a-share-codes", job_name="news_normalize",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        rows = InstrumentRepository(kernel).a_share_codes(context)
+    finally:
+        kernel.close()
 
     codes: List[str] = []
     seen: set = set()
-    for (stock_code,) in rows:
+    for row in rows:
+        stock_code = row["stock_code"]
         bare = str(stock_code).split(".")[0]
         if len(bare) == 6 and bare.isdigit() and bare not in seen:
             seen.add(bare)

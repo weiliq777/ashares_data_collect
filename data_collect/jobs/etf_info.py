@@ -10,7 +10,9 @@ from tqdm import tqdm
 
 from data_collect.utils.akshare_utils import get_etf_spot, get_fund_name_map
 from data_collect.utils.date_utils import is_market_day
-from data_collect.utils.db import get_connection, require_psycopg2
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.etf_info_repository import EtfInfoRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.etf_utils import to_bare_code, with_suffix
 from data_collect.utils.notify import send_dingtalk
@@ -38,15 +40,7 @@ def _ensure_tables() -> None:
     global _tables_ready
     if _tables_ready:
         return
-    col_defs = ['"code" VARCHAR(6) PRIMARY KEY'] + [f'"{k}" {v}' for k, v in _COLUMNS.items()]
-    col_defs.append('"updated_at" TIMESTAMP DEFAULT NOW()')
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(f'CREATE TABLE IF NOT EXISTS "{INFO_TABLE}" (\n' + ",\n".join(col_defs) + "\n);")
-        cur.execute(
-            f'CREATE TABLE IF NOT EXISTS "{CHANGELOG_TABLE}" ('
-            '"code" VARCHAR(6) NOT NULL, "changed_at" DATE NOT NULL, "field_name" VARCHAR(40) NOT NULL,'
-            '"old_value" TEXT, "new_value" TEXT, PRIMARY KEY ("code","changed_at","field_name"));')
-        conn.commit()
+    # Tables are provisioned by migrations; business jobs cannot create them.
     _tables_ready = True
 
 
@@ -93,17 +87,12 @@ def _collect(limit_stocks=None) -> Dict[str, dict]:
 def _load_existing(codes: List[str]) -> Dict[str, dict]:
     if not codes:
         return {}
-    with get_connection() as conn, conn.cursor() as cur:
-        ph = ",".join(["%s"] * len(codes))
-        cur.execute(f'SELECT * FROM "{INFO_TABLE}" WHERE code IN ({ph})', codes)
-        columns = [d[0] for d in cur.description]
-        rows = cur.fetchall()
-    res = {}
-    for row in rows:
-        rec = dict(zip(columns, row))
-        c = rec.pop("code"); rec.pop("updated_at", None)
-        res[c] = rec
-    return res
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="etf-info-read", job_name="etf_info", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return EtfInfoRepository(kernel).existing(codes, context)
+    finally:
+        kernel.close()
 
 
 def _upsert_and_log(details: Dict[str, dict], run_date: str) -> Tuple[int, int, int]:
@@ -123,19 +112,14 @@ def _upsert_and_log(details: Dict[str, dict], run_date: str) -> Tuple[int, int, 
             for f, (o, n) in changed.items():
                 if f not in _DYNAMIC_FIELDS:   # 市值/份额每日波动，只入快照不记 changelog
                     changelogs.append((code, today, f, o, n))
-    _, execute_values = require_psycopg2()
-    new_cnt = sum(1 for c, _ in upserts if c not in existing)
-    with get_connection() as conn, conn.cursor() as cur:
-        if upserts:
-            cols = '"code", ' + ", ".join(f'"{f}"' for f in fields)
-            setc = ", ".join(f'"{f}" = EXCLUDED."{f}"' for f in fields)
-            rows = [(c, *[d.get(f) for f in fields]) for c, d in upserts]
-            execute_values(cur, f'INSERT INTO "{INFO_TABLE}" ({cols}) VALUES %s '
-                                f'ON CONFLICT (code) DO UPDATE SET {setc}, "updated_at"=NOW()', rows, page_size=1000)
-        if changelogs:
-            execute_values(cur, f'INSERT INTO "{CHANGELOG_TABLE}" ("code","changed_at","field_name","old_value","new_value") '
-                                f'VALUES %s ON CONFLICT DO NOTHING', changelogs, page_size=1000)
-        conn.commit()
+    upsert_rows = [{"code": code, **new} for code, new in upserts]
+    changelog_rows = [{"code": code, "changed_at": changed, "field_name": field, "old_value": old, "new_value": new} for code, changed, field, old, new in changelogs]
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id=f"etf-info-{run_date}", job_name="etf_info", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        EtfInfoRepository(kernel).persist(upsert_rows, changelog_rows, context)
+    finally:
+        kernel.close()
     return new_cnt, len(upserts) - new_cnt, len(changelogs)
 
 

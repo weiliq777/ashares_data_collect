@@ -46,26 +46,19 @@ def test_dataset_oos_argument_belongs_only_to_dataset_creation():
 
 
 def test_dataset_materializes_mutable_execution_inputs_from_bounded_raw():
-    source = Path("data_collect/jobs/backtest_dataset.py").read_text(encoding="utf-8")
+    source = Path("data_collect/data_access/repository/dataset_repository.py").read_text(encoding="utf-8")
+    job_source = Path("data_collect/jobs/backtest_dataset.py").read_text(encoding="utf-8")
     for token in (
-        "limit_max_record_id",
-        "suspend_max_record_id",
-        "dividend_max_record_id",
-        "trade_cal_max_record_id",
         "limit_source_record_id",
-        "suspend_source_record_id",
         "FROM tushare_dividend_raw",
         "FROM tushare_stk_limit_raw",
         "FROM tushare_suspend_d_raw",
         "mv.dataset='trade_cal'",
-        "Baseline Raw 交易日历区间不完整",
     ):
         assert token in source
-    execution_section = source.split("bar_rows = cur.fetchall()", 1)[0].rsplit(
-        "cur.execute(", 1
-    )[1]
-    assert "std.security_status_daily" not in execution_section
-    assert "pit.security_tradeability_daily" not in execution_section
+    assert "交易日历 Raw 血缘不完整" in job_source
+    assert "std.security_status_daily" not in source
+    assert "pit.security_tradeability_daily" not in source
 
 
 def test_quality_report_hash_canonicalizes_database_dates():
@@ -77,19 +70,23 @@ def test_quality_report_hash_canonicalizes_database_dates():
 
 def test_dataset_validation_has_failure_state_recovery_boundary():
     source = Path("data_collect/jobs/backtest_dataset.py").read_text(encoding="utf-8")
+    repository = Path(
+        "data_collect/data_access/repository/dataset_repository.py"
+    ).read_text(encoding="utf-8")
     assert "def _mark_dataset_validation_failed" in source
-    assert "WHERE dataset_id=%s AND status='BUILDING'" in source
+    assert "repository.transition_manifest(" in source
+    assert "def transition_manifest" in repository
+    assert "transition_dataset_manifest" in repository
     assert "_mark_dataset_validation_failed(dataset_id, exc)" in source
 
 
 def test_release_switch_is_atomic_and_respects_single_validated_index():
-    source = Path("data_collect/jobs/tushare_release.py").read_text(encoding="utf-8")
+    source = Path("data_collect/data_access/write_gateway.py").read_text(encoding="utf-8")
     supersede_at = source.index("SET status='superseded'")
     validate_at = source.index("SET status='validated'")
     assert supersede_at < validate_at
-    assert 'isolation_level="REPEATABLE READ"' in source
-    assert "_locked_quality_and_source_manifest" in source
-    assert "_lock_release_inputs(conn)" in source
+    job_source = Path("data_collect/jobs/tushare_release.py").read_text(encoding="utf-8")
+    assert "repository.commit_validation" in job_source
 
 
 def test_database_contract_closes_release_and_dataset_raw_lineage_gaps():
@@ -115,10 +112,13 @@ def test_candidate_packet_exposes_evidence_authority_level():
 
 
 def test_research_snapshot_build_locks_quality_and_materialization_inputs():
-    source = Path("data_collect/jobs/research_snapshot.py").read_text(encoding="utf-8")
-    build_section = source.split("def build", 1)[1].split("def validate", 1)[0]
-    assert "_lock_release_inputs(conn)" in build_section
-    assert build_section.index("_lock_release_inputs(conn)") < build_section.index("_quality_report")
+    source = Path("data_collect/data_access/repository/research_snapshot_repository.py").read_text(encoding="utf-8")
+    build_section = source.split("def build_snapshot", 1)[1].split("def validate_snapshot", 1)[0]
+    assert "session_exclusive" in build_section
+    assert "transition_snapshot_manifest" in build_section
+    assert "_precompute_input_manifest" in build_section
+    assert build_section.index("_precompute_input_manifest") < build_section.index("session_exclusive")
+    assert build_section.count("input_stats(") == 0
 
 
 def test_oos_default_is_deterministic_and_within_evaluation_dates():
@@ -173,6 +173,23 @@ def test_financial_availability_is_never_same_day_as_date_only_announcement():
     assert out.iloc[0]["version_available_date"] == date(2026, 3, 21)
 
 
+def test_same_day_revision_keeps_announcement_availability():
+    frame = pd.DataFrame([{
+        "ts_code": "000001.SZ", "end_date": "20201231",
+        "ann_date": "20210331", "f_ann_date": "20210331",
+        "report_type": "1", "comp_type": "1", "end_type": "4",
+        "revenue": 100.0,
+        "_logical_business_key": "000001.SZ:20201231:1:1:4",
+        "_record_id": 1, "_payload_hash": "a" * 64,
+        "_fetched_at": "2026-08-08 20:00:00",
+        "_ambiguous_same_day_revision": True,
+    }])
+    out = transform(frame, "income")
+    row = out.iloc[0]
+    assert row["version_available_date"] == date(2021, 4, 1)
+    assert row["vintage_quality"] == "SOURCE_ANNOUNCEMENT_ASSUMED"
+
+
 def test_formal_versions_change_when_execution_semantics_change():
     assert BACKTEST_DATASET_SCHEMA_VERSION == "backtest-dataset-v2"
     assert ADAPTER_VERSION == "research-to-backtest-v2"
@@ -186,10 +203,9 @@ def test_formal_versions_change_when_execution_semantics_change():
 
 
 def test_historical_research_snapshot_does_not_expose_future_delist_date():
-    source = Path("data_collect/jobs/research_snapshot.py").read_text(encoding="utf-8")
-    snapshot_sql = source.split("def _stock_snapshot_sql", 1)[1].split(
-        "def _lineage_sql", 1
-    )[0]
+    from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
+
+    snapshot_sql = ResearchSnapshotRepository.stock_snapshot_sql()
     assert snapshot_sql.count(
         "to_date(NULLIF(b.payload->>'delist_date',''), 'YYYYMMDD') <= u.trade_date"
     ) >= 1

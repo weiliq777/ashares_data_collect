@@ -16,7 +16,9 @@ import pandas as pd
 import requests
 
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.utils.db import get_connection, replace_day_then_insert
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.market_repository import MarketRepository
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.eastmoney import em_get, UA
 
@@ -148,11 +150,31 @@ def _collect_day(trade_date: str) -> tuple[int, int]:
     n_pool = 0
     if pool_frames:
         merged = pd.concat(pool_frames, ignore_index=True)
-        _, n_pool = replace_day_then_insert(_POOL_TABLE, trade_date, merged)
+        kernel = DataAccessKernel(policy_registry=build_default_registry())
+        context = RunContext(
+            run_id=f"limit-pool-{trade_date}", job_name="a_share_limit_pool",
+            code_version="unknown", config_hash="unknown", pipeline_version="v1",
+        )
+        try:
+            n_pool = MarketRepository(kernel).replace_limit_day(
+                _POOL_TABLE, pd.to_datetime(trade_date).date(), merged.to_dict("records"), context
+            )
+        finally:
+            kernel.close()
     ths_df = normalize_ths(_fetch_ths(trade_date), trade_date)
     n_ths = 0
     if not ths_df.empty:
-        _, n_ths = replace_day_then_insert(_THS_TABLE, trade_date, ths_df)
+        kernel = DataAccessKernel(policy_registry=build_default_registry())
+        context = RunContext(
+            run_id=f"limit-reason-{trade_date}", job_name="a_share_limit_pool",
+            code_version="unknown", config_hash="unknown", pipeline_version="v1",
+        )
+        try:
+            n_ths = MarketRepository(kernel).replace_limit_day(
+                _THS_TABLE, pd.to_datetime(trade_date).date(), ths_df.to_dict("records"), context
+            )
+        finally:
+            kernel.close()
     return n_pool, n_ths
 
 
@@ -182,13 +204,18 @@ def run_verify(start_date: str, end_date: str, **kwargs) -> str:
     """近窗补缺：库内无当日行且源返回非空 → 补采（源空=无涨停或超窗，视为完整）。"""
     days = date_range(start_date, end_date)
     fixed = 0
-    with get_connection() as conn:
-        existing = pd.read_sql(
-            f'SELECT DISTINCT trade_date FROM "{_POOL_TABLE}" '
-            f"WHERE trade_date BETWEEN %s AND %s",
-            conn, params=[pd.to_datetime(start_date).date(),
-                          pd.to_datetime(end_date).date()])
-    have = set(existing["trade_date"])
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id="limit-pool-verify", job_name="a_share_limit_pool",
+        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    )
+    try:
+        have = MarketRepository(kernel).existing_dates(
+            _POOL_TABLE, "trade_date", pd.to_datetime(start_date).date(),
+            pd.to_datetime(end_date).date(), context
+        )
+    finally:
+        kernel.close()
     for d in days:
         if pd.to_datetime(d).date() in have:
             continue

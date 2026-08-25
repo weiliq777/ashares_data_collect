@@ -3,9 +3,20 @@ from __future__ import annotations
 from datetime import datetime
 from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.normalize.tushare_daily import normalize_daily_basic
-from data_collect.utils.db import save_to_postgres
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.collector_repository import CollectorRepository
 from data_collect.utils.date_utils import is_market_day
 from data_collect.utils.df_utils import normalize_trade_date
+
+
+def _save(df):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(run_id="a-share-valuation", job_name="a_share_valuation_tushare", code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1")
+    try:
+        return CollectorRepository(kernel).append("valuation_daily", df.to_dict("records"), context, partition="valuation-daily")
+    finally:
+        kernel.close()
 
 
 def run(run_date: str, **kwargs) -> str:
@@ -19,5 +30,5 @@ def run(run_date: str, **kwargs) -> str:
     out = df[[c for c in keep if c in df.columns]].copy()
     out["source"] = "tushare"
     out["fetched_at"] = datetime.now()
-    tried, inserted = save_to_postgres(out, pre_aligned_df=out, table_name="valuation_daily")
+    tried, inserted = _save(out)
     return f"Tushare估值完成：{inserted}/{tried}，日期={trade_date}"

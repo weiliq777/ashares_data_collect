@@ -1,160 +1,148 @@
-"""从 Tushare Raw 表重建当前阶段一的 Standard 表。
+"""Project immutable Tushare Raw facts into bounded Standard upserts.
 
-Raw 是事实层；本任务不访问 Tushare，只读取 PostgreSQL，因此可重复执行。
+Database reads, writes, conflict handling, and transaction boundaries belong to
+``RawStandardRepository``. This module contains only API-specific field
+normalization and job orchestration.
 """
 from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
-import uuid
+import time as time_module
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.raw_standard_repository import RawStandardRepository
 from data_collect.normalize.tushare_daily import normalize_daily, normalize_daily_basic
-from data_collect.utils.db import get_connection, save_to_postgres
+
+
+def _service(token: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(token, "tushare-raw-to-standard", "unknown", "unknown", "v1")
+    return kernel, RawStandardRepository(kernel), context
 
 
 def _payload_frames(
-    table: str,
-    chunk_size: int = 5000,
-    *,
-    version_dataset: str | None = None,
-    key_kind: str = "security_date",
+    table: str, chunk_size: int = 5000, *, version_dataset: str | None = None,
+    key_kind: str = "security_date", stock_codes: list[str] | None = None,
+    start_date=None, end_date=None,
 ):
-    """分块读取当前有效 Raw payload。
+    kernel, repository, context = _service(f"raw-standard-read-{table}")
+    try:
+        for rows in repository.iter_payload_rows(
+            table, context, chunk_size, version_dataset=version_dataset,
+            key_kind=key_kind, stock_codes=stock_codes,
+            start_date=start_date, end_date=end_date,
+        ):
+            yield pd.json_normalize(rows)
+    finally:
+        kernel.close()
 
-    ``*_raw`` 保存第一次看到的业务记录，后续修订保存在
-    ``tushare_market_raw_version``。全量重建必须优先选版本层中每个业务键
-    最新的一条；只有从未进入版本层的历史记录才回退 legacy Raw。否则一次
-    全量重建会把增量任务已经接收的上游修订静默恢复成旧值。
-    """
-    with get_connection() as conn:
-        with conn.cursor(name=f"raw_to_standard_{table}") as cur:
-            cur.itersize = chunk_size
-            if version_dataset is None:
-                cur.execute(f'SELECT payload FROM "{table}" ORDER BY 1')
-            elif key_kind == "calendar":
-                cur.execute(
-                    f"""
-                    WITH latest AS (
-                        SELECT DISTINCT ON (exchange, cal_date)
-                               exchange, cal_date, payload
-                          FROM tushare_market_raw_version
-                         WHERE dataset=%s
-                         ORDER BY exchange, cal_date, fetched_at DESC, record_id DESC
-                    )
-                    SELECT payload FROM latest
-                    UNION ALL
-                    SELECT legacy.payload
-                      FROM "{table}" legacy
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM tushare_market_raw_version version
-                          WHERE version.dataset=%s
-                            AND version.exchange=legacy.exchange
-                            AND version.cal_date=legacy.cal_date
-                     )
-                    """,
-                    (version_dataset, version_dataset),
-                )
-            else:
-                cur.execute(
-                    f"""
-                    WITH latest AS (
-                        SELECT DISTINCT ON (ts_code, trade_date)
-                               ts_code, trade_date, payload
-                          FROM tushare_market_raw_version
-                         WHERE dataset=%s
-                         ORDER BY ts_code, trade_date, fetched_at DESC, record_id DESC
-                    )
-                    SELECT payload FROM latest
-                    UNION ALL
-                    SELECT legacy.payload
-                      FROM "{table}" legacy
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM tushare_market_raw_version version
-                          WHERE version.dataset=%s
-                            AND version.ts_code=legacy.ts_code
-                            AND version.trade_date=legacy.trade_date
-                     )
-                    """,
-                    (version_dataset, version_dataset),
-                )
-            while True:
-                rows = cur.fetchmany(chunk_size)
-                if not rows:
-                    break
-                yield pd.json_normalize([value if isinstance(value, dict) else json.loads(value) for (value,) in rows])
+
+def _upsert_frame(frame: pd.DataFrame, target: str, conflict_columns: tuple[str, ...], page_size: int = 5000) -> int:
+    if frame.empty:
+        return 0
+    clean = frame.astype(object).where(pd.notna(frame), None)
+    rows = clean.to_dict("records")
+    kernel, repository, context = _service(f"raw-standard-write-{target}")
+    try:
+        total = 0
+        for offset in range(0, len(rows), page_size):
+            total += repository.upsert_standard_rows(
+                target, rows[offset:offset + page_size], conflict_columns, context
+            )
+        return total
+    finally:
+        kernel.close()
 
 
 def _write_chunks(
-    table: str,
-    transform,
-    chunk_size: int = 5000,
-    *,
-    version_dataset: str | None = None,
-    key_kind: str = "security_date",
+    table: str, transform, chunk_size: int = 5000, *,
+    version_dataset: str | None = None, key_kind: str = "security_date",
+    conflict_columns: tuple[str, ...] | None = None, stock_codes: list[str] | None = None,
+    start_date=None, end_date=None,
 ) -> tuple[int, int]:
-    """Build a Standard table off to the side and replace it atomically."""
+    if not conflict_columns:
+        raise ValueError(f"{transform.table_name} missing Standard conflict key")
     attempted = affected = 0
-    target = transform.table_name
-    staging = f"_rebuild_{target}_{uuid.uuid4().hex[:12]}"
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(f'CREATE UNLOGGED TABLE "{staging}" (LIKE "{target}" INCLUDING ALL)')
-        conn.commit()
-    try:
-        for raw in _payload_frames(
-            table,
-            chunk_size,
-            version_dataset=version_dataset,
-            key_kind=key_kind,
-        ):
-            frame = transform(raw)
-            if frame is None or frame.empty:
-                continue
-            current, inserted = save_to_postgres(frame, table_name=staging)
-            attempted += current
-            affected += inserted
-        with get_connection() as conn, conn.cursor() as cur:
-            # MVCC readers continue seeing the previous target contents until
-            # this transaction commits; a crash never exposes an empty or
-            # partially rebuilt Standard table.
-            cur.execute(f'LOCK TABLE "{target}" IN ACCESS EXCLUSIVE MODE')
-            cur.execute(f'TRUNCATE TABLE "{target}"')
-            cur.execute(f'INSERT INTO "{target}" SELECT * FROM "{staging}"')
-            if cur.rowcount != affected:
-                raise RuntimeError(
-                    f"{target} 原子替换行数不一致: staged={affected}, copied={cur.rowcount}"
-                )
-            cur.execute(f'DROP TABLE "{staging}"')
-            conn.commit()
-        return attempted, affected
-    except Exception:
-        with get_connection() as conn, conn.cursor() as cur:
-            cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
-            conn.commit()
-        raise
+    for frame in _payload_frames(
+        table, chunk_size, version_dataset=version_dataset, key_kind=key_kind,
+        stock_codes=stock_codes, start_date=start_date, end_date=end_date,
+    ):
+        normalized = transform(frame)
+        if normalized is None or normalized.empty:
+            continue
+        attempted += len(normalized)
+        affected += _upsert_frame(normalized, transform.table_name, conflict_columns)
+    return attempted, affected
 
 
 def rebuild_daily() -> tuple[int, int]:
     def transform(frame):
         return normalize_daily(frame)
-    transform.table_name = "daily_kline"
-    return _write_chunks("tushare_daily_raw", transform, version_dataset="daily")
+    transform.table_name = "std.daily_kline"
+    return _write_chunks("tushare_daily_raw", transform, version_dataset="daily", conflict_columns=("stock_code", "trade_date"))
 
 
-def rebuild_valuation() -> tuple[int, int]:
-    def transform(frame):
-        frame = normalize_daily_basic(frame)
-        if frame.empty:
-            return frame
-        keep = ["stock_code", "trade_date", "turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "total_mv", "circ_mv"]
-        frame = frame[[column for column in keep if column in frame.columns]].copy()
-        frame["source"] = "tushare"
-        frame["fetched_at"] = datetime.now()
+def _valuation_transform(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = normalize_daily_basic(frame)
+    if frame.empty:
         return frame
-    transform.table_name = "valuation_daily"
-    return _write_chunks("tushare_daily_basic_raw", transform, version_dataset="daily_basic")
+    for column in ("turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv"):
+        if column in frame:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["pe_ttm_vendor"] = frame.get("pe_ttm")
+    frame["ps_ttm_vendor"] = frame.get("ps_ttm")
+    frame["pb_vendor"] = frame.get("pb")
+    frame["dv_ttm_vendor"] = frame.get("dv_ttm")
+    frame["dv_ttm_source"] = "TUSHARE_DAILY_BASIC"
+    frame["source_observed_at"] = pd.to_datetime(frame.get("_source_observed_at"), errors="coerce")
+    shanghai = ZoneInfo("Asia/Shanghai")
+    frame["data_available_timestamp"] = frame["trade_date"].map(
+        lambda value: datetime.combine(value, time(17, 0), tzinfo=shanghai) if pd.notna(value) else None
+    )
+    keep = [
+        "stock_code", "trade_date", "turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm",
+        "dv_ratio", "total_mv", "circ_mv", "pe_ttm_vendor", "ps_ttm_vendor", "pb_vendor",
+        "dv_ttm", "dv_ttm_vendor", "dv_ttm_source", "source_observed_at", "data_available_timestamp",
+    ]
+    frame = frame[[column for column in keep if column in frame.columns]].copy()
+    frame["source"] = "tushare"
+    frame["fetched_at"] = frame["source_observed_at"].fillna(datetime.now())
+    return frame
+
+
+def rebuild_valuation(stock_codes=None, start_date=None, end_date=None, *, set_batch_trade_dates=1, throttle_seconds=0.1) -> tuple[int, int]:
+    if stock_codes is None and start_date is not None and end_date is not None:
+        return _rebuild_valuation_set_based(start_date, end_date, set_batch_trade_dates, throttle_seconds)
+    return _write_chunks(
+        "tushare_daily_basic_raw", _valuation_transform, version_dataset="daily_basic",
+        conflict_columns=("stock_code", "trade_date", "source"),
+        stock_codes=stock_codes, start_date=start_date, end_date=end_date,
+    )
+
+
+_valuation_transform.table_name = "std.valuation_daily"
+
+
+def _rebuild_valuation_set_based(start_date, end_date, batch_trade_dates=1, throttle_seconds=0.1) -> tuple[int, int]:
+    if batch_trade_dates <= 0:
+        raise ValueError("batch_trade_dates must be positive")
+    if throttle_seconds < 0:
+        raise ValueError("throttle_seconds must not be negative")
+    kernel, repository, context = _service("raw-standard-valuation-set-based")
+    try:
+        return repository.rebuild_valuation_set_based(
+            start_date, end_date, context,
+            batch_trade_dates=batch_trade_dates,
+            throttle_seconds=throttle_seconds,
+        )
+    finally:
+        kernel.close()
 
 
 def rebuild_adj_factor() -> tuple[int, int]:
@@ -163,26 +151,25 @@ def rebuild_adj_factor() -> tuple[int, int]:
         frame["trade_date"] = pd.to_datetime(frame["trade_date"], format="%Y%m%d", errors="coerce").dt.date
         frame["adj_factor"] = pd.to_numeric(frame["adj_factor"], errors="coerce")
         frame = frame[["stock_code", "trade_date", "adj_factor"]].dropna(subset=["stock_code", "trade_date"])
-        frame["source"] = "tushare"
-        frame["fetched_at"] = datetime.now()
+        frame["source"], frame["fetched_at"] = "tushare", datetime.now()
         return frame
-    transform.table_name = "adj_factor_daily"
-    return _write_chunks("tushare_adj_factor_raw", transform, version_dataset="adj_factor")
+    transform.table_name = "std.adj_factor_daily"
+    return _write_chunks("tushare_adj_factor_raw", transform, version_dataset="adj_factor", conflict_columns=("stock_code", "trade_date", "source"))
 
 
-def rebuild_calendar() -> tuple[int, int]:
+def rebuild_calendar(start_date=None, end_date=None) -> tuple[int, int]:
     def transform(frame):
         frame["trade_date"] = pd.to_datetime(frame["cal_date"], format="%Y%m%d", errors="coerce").dt.date
         pretrade = frame["pretrade_date"] if "pretrade_date" in frame else pd.Series(pd.NaT, index=frame.index)
         frame["pretrade_date"] = pd.to_datetime(pretrade, format="%Y%m%d", errors="coerce").dt.date
         frame["is_open"] = pd.to_numeric(frame["is_open"], errors="coerce").fillna(0).astype(bool)
-        frame["source"] = "tushare"
-        frame["fetched_at"] = datetime.now()
+        frame["source"], frame["fetched_at"] = "tushare", datetime.now()
         return frame[["exchange", "trade_date", "is_open", "pretrade_date", "source", "fetched_at"]]
-    transform.table_name = "trading_calendar"
+    transform.table_name = "std.trading_calendar"
     return _write_chunks(
-        "tushare_trade_cal_raw", transform,
-        version_dataset="trade_cal", key_kind="calendar",
+        "tushare_trade_cal_raw", transform, version_dataset="trade_cal",
+        key_kind="calendar", conflict_columns=("exchange", "trade_date", "source"),
+        start_date=start_date, end_date=end_date,
     )
 
 
@@ -193,11 +180,10 @@ def rebuild_financial() -> tuple[int, int]:
             frame[column] = pd.to_datetime(frame[column], format="%Y%m%d", errors="coerce").dt.date
         keep = ["stock_code", "report_date", "announce_date", "roe", "roa", "debt_to_assets", "grossprofit_margin", "netprofit_margin", "ocf_to_or", "revenue_yoy", "netprofit_yoy", "eps", "bps"]
         frame = frame[[column for column in keep if column in frame.columns]]
-        frame["source"] = "tushare"
-        frame["fetched_at"] = datetime.now()
+        frame["source"], frame["fetched_at"] = "tushare", datetime.now()
         return frame
-    transform.table_name = "stock_financial_indicator"
-    return _write_chunks("tushare_fina_indicator_raw", transform)
+    transform.table_name = "std.stock_financial_indicator"
+    return _write_chunks("tushare_fina_indicator_raw", transform, conflict_columns=("stock_code", "report_date", "announce_date", "source"))
 
 
 def rebuild_all() -> dict[str, tuple[int, int]]:
@@ -205,7 +191,7 @@ def rebuild_all() -> dict[str, tuple[int, int]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="从 Tushare Raw 表重建 Standard 表")
+    parser = argparse.ArgumentParser(description="Project Tushare Raw into Standard")
     parser.add_argument("--table", choices=["calendar", "daily", "valuation", "adj_factor", "financial", "all"], default="all")
     args = parser.parse_args()
     result = rebuild_all() if args.table == "all" else {args.table: globals()[f"rebuild_{args.table}"]()}

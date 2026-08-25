@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: data-access-contract
+        name: data-access-contract
+        entry: python tools/check_data_access_contract.py --ci --new-only
+        language: system
+        pass_filenames: false
+      - id: data-access-contract-full
+        name: data-access-contract-full
+        entry: python tools/check_data_access_contract.py --ci
+        language: system
+        pass_filenames: false

@@ -6,7 +6,7 @@ import pytest
 
 from data_collect.jobs.index_minute import (
     build_index_minute_df,
-    _month_partition_ddl,
+    ensure_month_partition,
     run_backfill,
 )
 
@@ -36,17 +36,8 @@ def test_build_index_minute_df_empty():
     assert build_index_minute_df(None, "000300.SH").empty
 
 
-def test_month_partition_ddl_boundaries():
-    ddl = _month_partition_ddl("20260721")
-    assert "index_minute_2026_07" in ddl
-    assert "IF NOT EXISTS" in ddl
-    assert "FROM ('2026-07-01') TO ('2026-08-01')" in ddl
-
-
-def test_month_partition_ddl_december_rolls_year():
-    ddl = _month_partition_ddl("20261215")
-    assert "index_minute_2026_12" in ddl
-    assert "FROM ('2026-12-01') TO ('2027-01-01')" in ddl
+def test_month_partition_is_provisioned_by_migrations():
+    assert ensure_month_partition("20260721") is None
 
 
 def test_run_backfill_raises():

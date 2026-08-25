@@ -1,22 +1,21 @@
-"""按单个 Tushare 财务接口初始化 Raw 表。
-
-每次只处理一张表，使用独立 checkpoint，避免四个财务接口相互拖累或重复请求。
-"""
+"""Initialize immutable financial Raw and version layers through Kernel."""
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import time
 import uuid
 from datetime import date
-from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import pandas as pd
 
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.financial_repository import FinancialRepository
+from data_collect.data_access.repository.history_repository import HistoryRepository
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.utils.db import get_connection
 
 
 DATASETS = {
@@ -25,6 +24,7 @@ DATASETS = {
     "balancesheet": ("tushare_balancesheet_raw", "financial_balancesheet"),
     "cashflow": ("tushare_cashflow_raw", "financial_cashflow"),
 }
+DEFAULT_FINANCIAL_HISTORY_START = "20160801"
 
 
 def _logger():
@@ -32,7 +32,9 @@ def _logger():
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
-    handler = RotatingFileHandler(Path(__file__).resolve().parents[2] / "logs" / "tushare_financial_raw_init.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    logs = Path(__file__).resolve().parents[2] / "logs"
+    logs.mkdir(exist_ok=True)
+    handler = RotatingFileHandler(logs / "tushare_financial_raw_init.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.addHandler(logging.StreamHandler())
@@ -42,100 +44,117 @@ def _logger():
 logger = _logger()
 
 
-def _date_value(value):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    parsed = pd.to_datetime(value, format="%Y%m%d", errors="coerce")
-    return None if pd.isna(parsed) else parsed.date()
+def _service(token: str):
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(token, "tushare-financial-raw-init", "unknown", "unknown", "v1")
+    return kernel, HistoryRepository(kernel), FinancialRepository(kernel), context
 
 
-def _done(dataset, key):
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT status FROM tushare_history_checkpoint WHERE dataset=%s AND checkpoint_key=%s", (dataset, key))
-        row = cur.fetchone()
-    return bool(row and row[0] == "done")
+def _done(dataset: str, key: str, repository: HistoryRepository | None = None, context: RunContext | None = None) -> bool:
+    owned = repository is None or context is None
+    kernel = history = None
+    if owned:
+        kernel, history, _financial, context = _service(f"financial-done-{uuid.uuid4().hex}")
+        repository = history
+    try:
+        assert repository is not None and context is not None
+        if repository.status(dataset, key, context) == "done":
+            return True
+        parts = key.rsplit(":", 2)
+        return len(parts) == 3 and repository.completed_covering_window(dataset, parts[0], parts[1], parts[2], context)
+    finally:
+        if kernel is not None:
+            kernel.close()
 
 
-def _checkpoint(dataset, key, status, rows=0, error=None):
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("""INSERT INTO tushare_history_checkpoint
-            (dataset, checkpoint_key, status, rows_written, error_message, updated_at)
-            VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
-            ON CONFLICT (dataset, checkpoint_key) DO UPDATE SET
-              status=EXCLUDED.status, rows_written=EXCLUDED.rows_written,
-              error_message=EXCLUDED.error_message, updated_at=CURRENT_TIMESTAMP""",
-                    (dataset, key, status, rows, error))
-        conn.commit()
+def _checkpoint(
+    dataset: str, key: str, status: str = "done", rows: int = 0, error: str | None = None,
+    repository: HistoryRepository | None = None, context: RunContext | None = None,
+):
+    kernel = None
+    if repository is None or context is None:
+        kernel, repository, _financial, context = _service(f"financial-checkpoint-{uuid.uuid4().hex}")
+    try:
+        assert repository is not None and context is not None
+        repository.save(dataset, key, status, rows, context, error)
+    finally:
+        if kernel is not None:
+            kernel.close()
 
 
-def _save_raw(table, frame, batch_id=None) -> int:
+def _save_raw(
+    table: str, frame: pd.DataFrame, batch_id: str | None = None,
+    repository: FinancialRepository | None = None, context: RunContext | None = None,
+) -> int:
     if frame is None or frame.empty:
         return 0
-    records = frame.astype(object).where(pd.notna(frame), None).to_dict("records")
-    with get_connection() as conn, conn.cursor() as cur:
-        for row in records:
-            clean = {key: value for key, value in row.items()}
-            cur.execute(f'''INSERT INTO "{table}" (ts_code, ann_date, end_date, payload)
-                VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
-                        (clean.get("ts_code"), _date_value(clean.get("ann_date")), _date_value(clean.get("end_date")),
-                         json.dumps(clean, ensure_ascii=False, default=str, allow_nan=False)))
-        conn.commit()
-    if table == "tushare_fina_indicator_raw":
-        from data_collect.jobs.tushare_fina_indicator_version import save_indicator_versions
-
-        save_indicator_versions(
-            records,
-            batch_id=batch_id,
-        )
-    else:
-        from data_collect.jobs.tushare_financial_raw_version_backfill import save_financial_versions
-
-        save_financial_versions(table.removeprefix("tushare_").removesuffix("_raw"), records, batch_id=batch_id)
-    return len(frame)
+    api_name = next((name for name, (target, _checkpoint_name) in DATASETS.items() if target == table), None)
+    if api_name is None:
+        raise ValueError(f"unsupported financial raw table: {table}")
+    kernel = None
+    if repository is None or context is None:
+        kernel, _history, repository, context = _service(f"financial-save-{uuid.uuid4().hex}")
+    try:
+        records = frame.astype(object).where(pd.notna(frame), None).to_dict("records")
+        return repository.append_api_rows(api_name, records, [str(record.get("ts_code")) for record in records], batch_id or uuid.uuid4().hex, context)
+    finally:
+        if kernel is not None:
+            kernel.close()
 
 
-def _codes():
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT stock_code FROM stock_basic_info WHERE list_status IN ('L','D','P','G') ORDER BY stock_code")
-        return [row[0] for row in cur.fetchall()]
+def _codes(repository: HistoryRepository | None = None, context: RunContext | None = None) -> list[str]:
+    kernel = None
+    if repository is None or context is None:
+        kernel, repository, _financial, context = _service(f"financial-codes-{uuid.uuid4().hex}")
+    try:
+        assert repository is not None and context is not None
+        return repository.active_stock_codes(context)
+    finally:
+        if kernel is not None:
+            kernel.close()
 
 
-def run(dataset: str, start_date: str | None = None, end_date: str | None = None,
-        limit_stocks: int | None = None, batch_size: int = 25, batch_pause: float = 5.0) -> str:
+def run(
+    dataset: str, start_date: str | None = None, end_date: str | None = None,
+    limit_stocks: int | None = None, batch_size: int = 25, batch_pause: float = 5.0,
+) -> str:
     if dataset not in DATASETS:
-        raise ValueError(f"不支持的财务接口: {dataset}")
-    start = start_date or "20210802"
+        raise ValueError(f"unsupported financial dataset: {dataset}")
+    start = start_date or DEFAULT_FINANCIAL_HISTORY_START
     end = end_date or date.today().strftime("%Y%m%d")
     table, checkpoint_dataset = DATASETS[dataset]
-    codes = _codes()[: int(limit_stocks or 10**9)]
-    pro = get_pro()
-    api = getattr(pro, dataset)
     batch_id = f"financial-raw-{uuid.uuid4().hex}"
-    total = 0
-    logger.info("financial raw init started dataset=%s table=%s stocks=%s start=%s end=%s", dataset, table, len(codes), start, end)
-    for index, code in enumerate(codes, 1):
-        key = f"{code}:{start}:{end}"
-        if _done(checkpoint_dataset, key):
-            continue
-        try:
-            frame = call_api(api, ts_code=code, start_date=start, end_date=end)
-            rows = _save_raw(table, frame, batch_id=batch_id)
-            total += rows
-            _checkpoint(checkpoint_dataset, key, "done", rows)
-            if index % int(batch_size) == 0:
-                logger.info("%s progress=%s/%s rows=%s", dataset, index, len(codes), total)
-                time.sleep(float(batch_pause))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("%s failed code=%s", dataset, code)
-            _checkpoint(checkpoint_dataset, key, "failed", total, str(exc)[:500])
-            raise
-    return f"{dataset} raw 完成：stocks={len(codes)}, rows={total}"
+    kernel, history, financial, context = _service(batch_id)
+    try:
+        codes = _codes(history, context)[: int(limit_stocks or 10**9)]
+        api = getattr(get_pro(), dataset)
+        total = 0
+        logger.info("financial raw init started dataset=%s table=%s stocks=%s", dataset, table, len(codes))
+        for index, code in enumerate(codes, 1):
+            key = f"{code}:{start}:{end}"
+            if _done(checkpoint_dataset, key, history, context):
+                continue
+            try:
+                frame = call_api(api, ts_code=code, start_date=start, end_date=end)
+                rows = _save_raw(table, frame, batch_id, financial, context)
+                total += rows
+                _checkpoint(checkpoint_dataset, key, "done", rows, repository=history, context=context)
+                if index % int(batch_size) == 0:
+                    logger.info("%s progress=%s/%s rows=%s", dataset, index, len(codes), total)
+                    time.sleep(float(batch_pause))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("%s failed code=%s", dataset, code)
+                _checkpoint(checkpoint_dataset, key, "failed", total, str(exc)[:500], history, context)
+                raise
+        return f"{dataset} raw complete stocks={len(codes)}, rows={total}"
+    finally:
+        kernel.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="按单个接口初始化 Tushare 财务 Raw 表")
+    parser = argparse.ArgumentParser(description="Initialize Tushare financial Raw")
     parser.add_argument("dataset", choices=sorted(DATASETS))
-    parser.add_argument("--start-date", default="20210802")
+    parser.add_argument("--start-date", default=DEFAULT_FINANCIAL_HISTORY_START)
     parser.add_argument("--end-date", default=date.today().strftime("%Y%m%d"))
     parser.add_argument("--limit-stocks", type=int)
     parser.add_argument("--batch-size", type=int, default=25)

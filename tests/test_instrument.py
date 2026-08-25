@@ -3,7 +3,6 @@
 from data_collect.jobs.a_share_instrument import (
     _DAILY_CHANGING_FIELDS,
     _fetch_instrument,
-    _pg_type_for_value,
 )
 
 
@@ -50,13 +49,6 @@ def test_fetch_returns_none_on_empty(monkeypatch):
     )
     result = _fetch_instrument("000001.SZ")
     assert result is None
-
-
-def test_pg_type_for_value():
-    assert _pg_type_for_value(True) == "BOOLEAN"
-    assert _pg_type_for_value(100) == "BIGINT"
-    assert _pg_type_for_value(11.22) == "DOUBLE PRECISION"
-    assert _pg_type_for_value("SZ") == "TEXT"
 
 
 def test_daily_changing_fields_defined():

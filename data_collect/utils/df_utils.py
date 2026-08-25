@@ -78,7 +78,9 @@ def align_dataframe_by_position(
         elif type_name == "date":
             series = pd.to_datetime(series, errors="coerce").dt.date
         elif source_col == "stock_code":
-            series = series.map(lambda x: _normalize_code_value(x, max_len))
+            series = series.map(
+                lambda x, limit=max_len: _normalize_code_value(x, limit)
+            )
 
         mapped[target_col] = series
 

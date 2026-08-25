@@ -17,7 +17,7 @@ FROZEN Snapshot 的策略候选、AI 反方审计、人工作决定和纸面组�
 
 阶段三核心代码已完成并通过验证；三日 Baseline Dataset/Run 已真实执行并通过订单、现金、输入哈希和 Raw 不变性审计。当前生产数据库存在三日 FROZEN Dataset 和 SUCCEEDED Run，但尚未生成完整五年历史 Dataset/Run。
 
-完整历史回测前仍需生成每个 SSE 开市日的 `research-v1.3` FROZEN Snapshot，重新执行 v2 Dataset `build→validate→freeze` 和正式 Run 对账。自动实盘交易不在当前范围，Portfolio 保留人工 `PAPER_MANUAL` Air-Gap。完整代码路径和当前 ID 见 `dev_doc/current_implementation_state_20260807.md`。
+完整历史回测前仍需生成每个 SSE 开市日的 `research-v1.3` FROZEN Snapshot，重新执行 v2 Dataset `build→validate→freeze` 和正式 Run 对账。自动实盘交易不在当前范围，Portfolio 保留人工 `PAPER_MANUAL` Air-Gap。数据访问与基座当前状态见 `dev_doc/data_access_current_status_20260818.md`；旧回测状态记录已归档。
 
 ## 2026-08-06 阶段三生产增强字段
 
@@ -519,6 +519,8 @@ tushare_cashflow_raw     -> financial_cash_flow_standard
 
 阶段二执行约束：历史验收后通过 `tushare_data_release` 冻结基线；正式行情增量使用 `tushare_market_incremental_by_date` 按交易日请求 `daily`、`daily_basic`、`adj_factor`，成功后自动重建状态/PIT、价格和估值 Feature；阶段二增量使用 `tushare_phase2_incremental`，其中状态类按交易日、分红按公告日期窗口、名称变更低频按日期窗口、指数按代码和日期区间请求，成功后自动重建受影响 Feature。财务增量使用 `tushare_financial_incremental`，报表按公告日期窗口、`fina_indicator` 按股票和报告期窗口请求，成功后重建财务 Standard/PIT/Feature。接口达到返回上限时必须分片并验证，不能静默标记完成。Raw 使用 checkpoint、完整 payload 和 payload_hash 幂等追加，所有 Standard、PIT、Feature 均可重建，任何派生任务不得修改或删除 Raw。`std.security_lifecycle` 使用名称变更区间归并，`std.dividend_event` 按业务键选择有效版本。
 
+财务 PIT 全量重建使用 `tushare_phase2_standard.rebuild_financial_asof` 的分批构建流程：按 `daily_kline` 日期窗口写入临时表，每窗口独立提交，完成后建立约束/索引并以短事务切换生产表；失败只清理临时表，保留旧 PIT，禁止恢复全量 `TRUNCATE + INSERT` 长事务。
+
 新增控制表 `tushare_data_release`：记录历史基线标签、截止日、验收状态和质量报告哈希。`draft` 仅用于准备，`validated` 才能被增量任务自动读取；`superseded` 保留历史发布审计记录。
 
 ## 15. Research 快照模型（2026-08-06）
@@ -676,7 +678,7 @@ std.dividend_event（实施且 ex_date <= trade_date）
 - `actual_shares` 只由真实 Fill 写入；计划、拒单、过期和未成交订单均为 0。`backtest.order.order_audit_hash` 由 PostgreSQL 按完整订单行和绑定 Dataset 版本生成，Portfolio Air-Gap 要求 `source_order_hash` 与其完全一致。对应迁移为 `sql/033_backtest_order_audit_hash.sql`。
 ## 2026-08-07 最新模型与实测状态覆盖
 
-本文前部关于“生产数据库尚无 Dataset/Run/规则记录”的内容属于历史进度记录，当前以 `dev_doc/current_implementation_state_20260807.md` 为准。
+本文前部关于“生产数据库尚无 Dataset/Run/规则记录”的内容属于历史进度记录，当前数据访问与基座状态以 `dev_doc/data_access_current_status_20260818.md` 为准。
 
 当前真实关系为：
 
@@ -686,6 +688,69 @@ Tushare Raw
 → PIT
 → Feature
 → research.snapshot_manifest / stock_snapshot_daily / snapshot_lineage
+
+## 2026-08-12 通用研究数据底座 V2
+
+迁移 `sql/045_research_data_foundation_v2.sql` 采用纯追加方式扩充现有链路，不删除 Raw、
+不覆盖 V1，也不要求每次增加公共指标时重构系统。Raw 原始事实继续保留；Standard 增加
+语义明确的字段；只有财务粒度和口径已发生变化的公共 Feature 使用独立
+`feature.company_financial_v2`。估值只是新增供应商字段和公共分位，因此继续扩展
+`feature.valuation_daily_v1`。
+
+新增或补齐的主要对象如下：
+
+- `financial_income_standard`：`net_profit_consolidated` 显式映射
+  `income.n_income`，`net_profit_parent` 显式映射 `income.n_income_attr_p`；旧
+  `net_profit` 兼容列不删除。
+- `financial_cash_flow_standard`：`operating_cashflow_ytd` 映射
+  `cashflow.n_cashflow_act`；`cashflow.net_profit` 仅保留为现金流量表调节项，不作为
+  OCF/净利润的利润来源。
+- `financial_balance_sheet_standard`、`fina_indicator_standard`：补齐归母权益、总权益、
+  供应商 `roe/roe_yearly/q_roe` 及统一 `data_available_timestamp`。
+- `valuation_daily` 和 `feature.valuation_daily_v1`：补齐
+  `pe_ttm_vendor`、`ps_ttm_vendor`、`pb_vendor`、`dv_ttm_vendor`、来源、可用时间、
+  5 年滚动股息率分位、观察日数和窗口完整性。
+- `feature.company_financial_v2`：保存单季、TTM、自算 `roe_ttm`、Margin、Growth、
+  OCF/合并净利润、五年事实窗口、异常原因、组件血缘和来源指纹。利润小于等于零时
+  OCF 比率为空；非一般工商业保留事实但现金流质量标记为 `NOT_APPLICABLE`，公司类型
+  缺失时标记 `UNKNOWN_COMP_TYPE`。毛利率不使用营业总成本兜底；每行另保存
+  `pit_evidence_level`，区分公告日期推定与仓库实际观察版本。
+- `ops.foundation_rebuild_run`、`ops.foundation_rebuild_checkpoint`：记录正式/烟测运行、
+  分区状态和写入行数。Feature 分区的数据写入与完成 checkpoint 同事务提交；Standard
+  页级 upsert 独立短事务提交，分区失败时幂等重放，失败只重做未完成分区。Run 另保存
+  Git commit、dirty 状态、diff hash；续跑把前后代码身份追加到 `resume_history`。
+- `research.snapshot_manifest`、`research.stock_snapshot_daily`：增加 V2 契约版本、决策与
+  数据截止时间、PIT 证据等级、财务来源指纹和组件血缘。V1 冻结快照保持不可变。
+
+正式构建器为 `data_collect.jobs.tushare_foundation_pipeline`。财务 Standard 按股票分区、
+估值 Standard 的 checkpoint 按月记录、内部集合式投影按单个交易日独立提交并限速，
+财务 Feature 按股票批次、估值 Feature 按股票提交；禁止使用覆盖全历史的大事务。任务
+持有 PostgreSQL session advisory lock，失败运行可通过同一
+`run_id` 续跑并复用已完成 checkpoint。发布 `schema_version=feature-contract-v2.0`
+的数据基线时，`tushare_release` 额外要求对应截止日存在 `VALIDATED` 的正式 V2 运行，
+并重新执行 V2 全量质量门禁。
+
+真实小样本写入已通过：运行 `e67a5414-f359-427b-9e8f-9df73a7c551e` 覆盖白马、银行、
+亏损、次新及异常样本；Standard 写入 15,277 行，财务 Feature 149 行，估值 Feature
+8,025 行。映射错误、未来数据、无效 TTM、无效 OCF 比率、行业适用性和股息率分位
+异常均为 0。正式研究输出边界为 `2021-08-02`，预热从 `2016-08-01` 开始；当前本地
+Raw 与交易日历可支持的截止日为 `2026-08-06`。
+
+### 2026-08-13 写入、恢复与质量契约补充
+
+- 全部高吞吐 Tushare 写任务使用同一数据库会话锁；生产环境同一时刻只允许一个仓库写者。
+- 高容量 Standard/Feature 不执行全表 `TRUNCATE + INSERT`。Raw→Standard 按页 upsert，
+  日频状态按月/股票提交，价格与估值按股票提交；任何失败都只能留下已完成分区，不留下
+  “已删未写”的可见状态。
+- 真实 `limit_stocks` 禁止写生产 Standard；小样本真实验证只允许隔离 smoke 表。
+- `ops.foundation_rebuild_checkpoint` 只可复用同一代码身份的结果。Git commit/diff 变化时，
+  原 run 保留审计记录但 checkpoint 全部失效并重算，防止一次运行混入两套计算语义。
+- 日常财务增量另用 `financial_derived_v2` checkpoint 持久化待重算股票。Raw 已写入但派生层
+  失败时，下一次任务仍会重算，不依赖“本次新增 Raw 行数大于 0”。
+- `feature.company_financial_v2` 的五年事实共用最新利润年锚点；非工商业 OCF 比率为空并标记
+  `NOT_APPLICABLE`。`pit.security_tradeability_daily` 对涨停/跌停分别封锁买入/卖出。
+- Snapshot 批量质量报告保存真实扫描截止日；历史 Snapshot 可绑定覆盖其截止日的 V2 正式运行，
+  但不能把较晚扫描伪装成较早日期的独立质量证据。
 → backtest.dataset_manifest / dataset_member / dataset_execution_bar / dataset_rule_snapshot
 → backtest.run_manifest / signal / order / fill / position_lot / cash_ledger / performance_daily / metric
 → portfolio.order_intent（仅 PENDING_APPROVAL）
