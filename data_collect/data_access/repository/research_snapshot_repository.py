@@ -20,11 +20,11 @@ _IMMUTABLE_INPUT_STATS_CACHE: dict[tuple, dict[str, Any]] = {}
 
 
 class ResearchSnapshotRepository(BaseRepository):
-    # Snapshot SQL is set-based and writes only one row per stock per phase;
-    # 1,000 codes keeps lineage batches at roughly 10,000 rows, well below
-    # the governed 50,000-row transaction ceiling, while avoiding excessive
-    # per-snapshot statement/commit overhead.
-    SNAPSHOT_CODE_BATCH_SIZE = 1_000
+    # Snapshot SQL is set-based, but one code batch must also remain below the
+    # governed 30-second statement deadline on the oldest/highest-cost dates.
+    # 500 codes keeps lineage batches bounded while avoiding the timeout seen
+    # with 1,000-code stock INSERT ... SELECT statements.
+    SNAPSHOT_CODE_BATCH_SIZE = 500
     INPUT_STATS_BATCH_ROWS = 2_000
 
     @staticmethod

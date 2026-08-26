@@ -54,6 +54,13 @@ def test_snapshot_input_stats_uses_one_stream_for_count_range_and_hash():
     assert "batch_rows=self.INPUT_STATS_BATCH_ROWS" in input_stats
 
 
+def test_snapshot_code_batches_stay_below_statement_deadline_budget():
+    source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    assert "SNAPSHOT_CODE_BATCH_SIZE = 500" in source
+
+
 def test_snapshot_validation_reuses_persisted_input_evidence():
     source = __import__("pathlib").Path(
         "data_collect/data_access/repository/research_snapshot_repository.py"
