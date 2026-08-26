@@ -83,9 +83,11 @@ class SnapshotRecord:
     quality_hash: str | None = None
     baseline_quality_hash: str | None = None
     baseline_source_hash: str | None = None
+    code_version: str | None = None
     git_commit: str | None = None
     git_dirty: bool = False
     diff_hash: str | None = None
+    code_archive_path: str | None = None
     built_at: datetime | None = None
     validated_at: datetime | None = None
     frozen_at: datetime | None = None
@@ -102,9 +104,11 @@ class SnapshotRecord:
             quality_hash=row.get("quality_report_hash"),
             baseline_quality_hash=row.get("baseline_quality_report_hash"),
             baseline_source_hash=row.get("baseline_source_manifest_hash"),
+            code_version=row.get("code_version"),
             git_commit=row.get("git_commit"),
             git_dirty=bool(row.get("git_dirty")),
             diff_hash=row.get("diff_hash"),
+            code_archive_path=row.get("code_archive_path"),
             built_at=row.get("built_at"),
             validated_at=row.get("validated_at"),
             frozen_at=row.get("frozen_at"),
@@ -125,6 +129,7 @@ class SeriesIssue:
 class LogFinding:
     path: str
     category: str
+    severity: str
     excerpt: str
 
 
@@ -144,7 +149,10 @@ class SeriesReport:
 
     @property
     def blocking(self) -> bool:
-        return any(issue.severity == "ERROR" for issue in self.issues) or bool(self.log_findings)
+        return (
+            any(issue.severity == "ERROR" for issue in self.issues)
+            or any(item.severity == "ERROR" for item in self.log_findings)
+        )
 
     def records_with_statuses(self, statuses: Iterable[str]) -> tuple[SnapshotRecord, ...]:
         accepted = frozenset(statuses)
@@ -164,13 +172,16 @@ class SeriesReport:
 
 
 _LOG_PATTERNS = (
-    ("statement_timeout", re.compile(r"statement timeout|canceling statement due to statement timeout", re.I)),
-    ("lock_timeout", re.compile(r"lock timeout|canceling statement due to lock timeout", re.I)),
-    ("deadlock", re.compile(r"deadlock detected", re.I)),
-    ("rollback", re.compile(r"\brollback\b|transaction.*rolled back", re.I)),
-    ("serialization", re.compile(r"could not serialize|serialization failure", re.I)),
-    ("failed_transaction", re.compile(r"InFailedSqlTransaction|current transaction is aborted", re.I)),
-    ("traceback", re.compile(r"Traceback \(most recent call last\)", re.I)),
+    ("statement_timeout", "ERROR", re.compile(r"statement timeout|canceling statement due to statement timeout", re.I)),
+    ("lock_timeout", "ERROR", re.compile(r"lock timeout|canceling statement due to lock timeout", re.I)),
+    ("deadlock", "ERROR", re.compile(r"deadlock detected", re.I)),
+    # A bare ROLLBACK can be deliberate (smoke-test cleanup or operator
+    # recovery).  Surface it without failing an otherwise healthy progress
+    # check; surrounding ERROR/Traceback lines are classified separately.
+    ("rollback", "WARNING", re.compile(r"\brollback\b|transaction.*rolled back", re.I)),
+    ("serialization", "ERROR", re.compile(r"could not serialize|serialization failure", re.I)),
+    ("failed_transaction", "ERROR", re.compile(r"InFailedSqlTransaction|current transaction is aborted", re.I)),
+    ("traceback", "ERROR", re.compile(r"Traceback \(most recent call last\)", re.I)),
 )
 
 
@@ -182,7 +193,9 @@ def scan_log_tails(paths: Sequence[str | Path], *, tail_bytes: int = 2 * 1024 * 
     for raw_path in paths:
         path = Path(raw_path)
         if not path.is_file():
-            findings.append(LogFinding(str(path), "missing_log", "log file does not exist"))
+            findings.append(LogFinding(
+                str(path), "missing_log", "ERROR", "log file does not exist",
+            ))
             continue
         with path.open("rb") as handle:
             handle.seek(0, 2)
@@ -191,12 +204,13 @@ def scan_log_tails(paths: Sequence[str | Path], *, tail_bytes: int = 2 * 1024 * 
             content = handle.read(tail_bytes).decode("utf-8", "replace")
         lines = content.splitlines()
         for index, line in enumerate(lines):
-            for category, pattern in _LOG_PATTERNS:
+            for category, severity, pattern in _LOG_PATTERNS:
                 if pattern.search(line):
                     start = max(0, index - 1)
                     end = min(len(lines), index + 2)
                     findings.append(LogFinding(
-                        str(path), category, " | ".join(lines[start:end])[:2000],
+                        str(path), category, severity,
+                        " | ".join(lines[start:end])[:2000],
                     ))
                     break
     return findings
@@ -291,7 +305,17 @@ class SnapshotSeriesMonitor:
                 report.issues.append(SeriesIssue(
                     "failed_work_queue", "WARNING",
                     "FAILED snapshots remain in the resumable work queue",
-                    {"count": len(failed)},
+                    {
+                        "count": len(failed),
+                        "samples": [
+                            {
+                                "date": record.cutoff.isoformat(),
+                                "snapshot_id": record.snapshot_id,
+                                "reason": (record.failure_reason or "")[:500],
+                            }
+                            for record in failed[:20]
+                        ],
+                    },
                 ))
 
         for record in records:
@@ -304,22 +328,68 @@ class SnapshotSeriesMonitor:
                     "publishable snapshot is missing required hash evidence",
                     {"snapshot_id": record.snapshot_id, "date": record.cutoff.isoformat()},
                 ))
+            if record.status in PUBLISHABLE_STATUSES and (
+                not record.code_version or not record.git_commit
+            ):
+                report.issues.append(SeriesIssue(
+                    "publishable_code_identity_missing", "ERROR",
+                    "publishable snapshot is missing its build code identity",
+                    {"snapshot_id": record.snapshot_id, "date": record.cutoff.isoformat()},
+                ))
             if record.git_dirty and not record.diff_hash:
                 report.issues.append(SeriesIssue(
                     "dirty_identity_incomplete", "ERROR",
                     "dirty snapshot code identity is missing diff_hash",
                     {"snapshot_id": record.snapshot_id, "date": record.cutoff.isoformat()},
                 ))
+            lifecycle_problem = None
+            if record.status == "BUILDING" and record.built_at is None:
+                lifecycle_problem = "BUILDING snapshot has no built_at"
+            elif record.status == "VALIDATED" and record.validated_at is None:
+                lifecycle_problem = "VALIDATED snapshot has no validated_at"
+            elif record.status == "FROZEN" and (
+                record.validated_at is None or record.frozen_at is None
+            ):
+                lifecycle_problem = "FROZEN snapshot lacks validated_at/frozen_at"
+            elif record.status == "FROZEN" and record.git_dirty and not record.code_archive_path:
+                lifecycle_problem = "dirty FROZEN snapshot has no code archive"
+            if lifecycle_problem:
+                report.issues.append(SeriesIssue(
+                    "lifecycle_evidence_incomplete", "ERROR", lifecycle_problem,
+                    {"snapshot_id": record.snapshot_id, "date": record.cutoff.isoformat()},
+                ))
+
+        if mode == MonitorMode.ACCEPTANCE:
+            build_identities = {
+                (
+                    record.code_version,
+                    record.git_commit,
+                    record.git_dirty,
+                    record.diff_hash,
+                )
+                for record in records
+                if record.status in PUBLISHABLE_STATUSES
+            }
+            if len(build_identities) > 1:
+                report.issues.append(SeriesIssue(
+                    "mixed_build_code_identity", "WARNING",
+                    "snapshot series contains multiple recorded build code identities",
+                    {"identity_count": len(build_identities)},
+                ))
 
         if stale_building_after is not None:
-            now = datetime.now(timezone.utc)
+            if stale_building_after <= timedelta(0):
+                raise ValueError("stale_building_after must be positive")
             stale = []
             for record in records:
                 built_at = record.built_at
                 if record.status != "BUILDING" or built_at is None:
                     continue
-                if built_at.tzinfo is None:
-                    built_at = built_at.replace(tzinfo=timezone.utc)
+                now = (
+                    datetime.now()
+                    if built_at.tzinfo is None
+                    else datetime.now(timezone.utc)
+                )
                 if now - built_at > stale_building_after:
                     stale.append({"snapshot_id": record.snapshot_id, "date": record.cutoff.isoformat()})
             if stale:
@@ -344,6 +414,39 @@ def _checkpoint_progress(progress_tracker, run_id: str, job_name: str, scope_key
         progress_tracker.mark_progress(run_id, job_name, scope_key, position)
 
 
+def _checkpoint_batch_done(
+    progress_tracker,
+    run_id: str,
+    job_name: str,
+    selector_digest: str,
+    phase: str,
+    records: Sequence[SnapshotRecord],
+) -> None:
+    """Persist one independently replayable batch, not a process-local count."""
+    if not records:
+        return
+    identity = "|".join(record.snapshot_id for record in records)
+    batch_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    scope_key = (
+        f"{selector_digest}:{phase}:"
+        f"{records[0].cutoff.isoformat()}:{records[-1].cutoff.isoformat()}:"
+        f"{batch_digest}"
+    )
+    previous = progress_tracker.load(run_id, job_name, scope_key)
+    if previous is None or not previous.done:
+        progress_tracker.mark_progress(
+            run_id, job_name, scope_key, len(records),
+        )
+        progress_tracker.mark_done(run_id, job_name, scope_key)
+
+
+def _resolve_run_id(value: str | None, default: str) -> str:
+    resolved = value if value is not None else default
+    if not resolved.strip() or len(resolved) > 160:
+        raise ValueError("run_id must contain 1..160 non-blank characters")
+    return resolved
+
+
 class SnapshotSeriesResume:
     """Validate BUILDING first, then build-and-validate DRAFT/FAILED batches."""
 
@@ -363,21 +466,21 @@ class SnapshotSeriesResume:
         self, selector: SeriesSelector, *, batch_size: int = 2, run_id: str | None = None,
     ) -> SeriesReport:
         bounded_batches((), batch_size)
-        run_id = run_id or f"snapshot-series-resume-{selector.digest}"
+        run_id = _resolve_run_id(
+            run_id, f"snapshot-series-resume-{selector.digest}",
+        )
         report = self.monitor.inspect(selector, mode=MonitorMode.PROGRESS)
         structural_errors = [issue for issue in report.issues if issue.severity == "ERROR"]
         if structural_errors:
             raise RuntimeError(f"snapshot series resume preflight failed: {structural_errors}")
 
         building = report.records_with_statuses({"BUILDING"})
-        completed = 0
         for chunk in bounded_batches(building, batch_size):
             ids = [record.snapshot_id for record in chunk]
             self.validate_batch(ids)
-            completed += len(ids)
-            _checkpoint_progress(
+            _checkpoint_batch_done(
                 self.progress_tracker, run_id, "snapshot_series_resume",
-                f"{selector.digest}:validate-building", completed,
+                selector.digest, "validate-building", chunk,
             )
         self.progress_tracker.mark_done(
             run_id, "snapshot_series_resume", f"{selector.digest}:validate-building",
@@ -385,17 +488,15 @@ class SnapshotSeriesResume:
 
         report = self.monitor.inspect(selector, mode=MonitorMode.PROGRESS)
         pending = report.records_with_statuses({"DRAFT", "FAILED"})
-        completed = 0
         for chunk in bounded_batches(pending, batch_size):
             ids = [record.snapshot_id for record in chunk]
             self.build_batch(ids)
             # Validate the same bounded batch immediately.  This prevents a
             # multi-year run from accumulating hundreds of BUILDING rows.
             self.validate_batch(ids)
-            completed += len(ids)
-            _checkpoint_progress(
+            _checkpoint_batch_done(
                 self.progress_tracker, run_id, "snapshot_series_resume",
-                f"{selector.digest}:build-validate", completed,
+                selector.digest, "build-validate", chunk,
             )
         self.progress_tracker.mark_done(
             run_id, "snapshot_series_resume", f"{selector.digest}:build-validate",
@@ -416,11 +517,14 @@ class SnapshotSeriesFinalize:
         progress_tracker,
         inspect_batch: Callable[[list[str]], dict[str, list[dict]]],
         freeze_batch: Callable[[list[str]], None],
+        *,
+        code_archive_available: bool = False,
     ) -> None:
         self.monitor = monitor
         self.progress_tracker = progress_tracker
         self.inspect_batch = inspect_batch
         self.freeze_batch = freeze_batch
+        self.code_archive_available = code_archive_available
 
     @staticmethod
     def _assert_resumable_state(
@@ -449,7 +553,9 @@ class SnapshotSeriesFinalize:
         self, selector: SeriesSelector, *, batch_size: int = 10, run_id: str | None = None,
     ) -> SeriesReport:
         bounded_batches((), batch_size)
-        run_id = run_id or f"snapshot-series-finalize-{selector.digest}"
+        run_id = _resolve_run_id(
+            run_id, f"snapshot-series-finalize-{selector.digest}",
+        )
         report = self.monitor.inspect(selector, mode=MonitorMode.ACCEPTANCE)
         preflight_scope = f"{selector.digest}:preflight"
         previous_preflight = self.progress_tracker.load(
@@ -461,21 +567,47 @@ class SnapshotSeriesFinalize:
                 previous_preflight is not None and previous_preflight.done
             ),
         )
+        dirty_pending = [
+            record for record in report.records
+            if record.status == "VALIDATED" and record.git_dirty
+        ]
+        if dirty_pending and not self.code_archive_available:
+            raise RuntimeError(
+                "dirty-built VALIDATED snapshots require code_archive_path before finalize"
+            )
 
         # Complete the deep preflight for every date before freezing the first
         # pending batch.  Queries remain per-snapshot and batch-bounded.
         inspected = 0
-        all_issues: dict[str, list[dict]] = {}
+        issue_count = 0
+        issue_samples: dict[str, list[dict]] = {}
         for chunk in bounded_batches(report.records, batch_size):
             issues = self.inspect_batch([record.snapshot_id for record in chunk])
-            all_issues.update(issues)
+            issue_count += len(issues)
+            for key, value in issues.items():
+                if len(issue_samples) >= 100:
+                    break
+                sample_key = key
+                if key == "__batch__":
+                    sample_key = (
+                        f"batch:{chunk[0].cutoff.isoformat()}:"
+                        f"{chunk[-1].cutoff.isoformat()}"
+                    )
+                issue_samples[sample_key] = value
             inspected += len(chunk)
             _checkpoint_progress(
                 self.progress_tracker, run_id, "snapshot_series_finalize",
                 preflight_scope, inspected,
             )
-        if all_issues:
-            raise RuntimeError(f"snapshot deep acceptance failed: {all_issues}")
+            _checkpoint_batch_done(
+                self.progress_tracker, run_id, "snapshot_series_finalize",
+                selector.digest, "preflight-batch", chunk,
+            )
+        if issue_count:
+            raise RuntimeError(
+                "snapshot deep acceptance failed: "
+                f"issue_groups={issue_count}, samples={issue_samples}"
+            )
         self.progress_tracker.mark_done(
             run_id, "snapshot_series_finalize", preflight_scope,
         )
@@ -494,6 +626,10 @@ class SnapshotSeriesFinalize:
                 )
             self.freeze_batch(ids)
             frozen += len(chunk)
+            _checkpoint_batch_done(
+                self.progress_tracker, run_id, "snapshot_series_finalize",
+                selector.digest, "freeze-batch", chunk,
+            )
             _checkpoint_progress(
                 self.progress_tracker, run_id, "snapshot_series_finalize",
                 f"{selector.digest}:freeze", frozen,

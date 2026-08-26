@@ -37,7 +37,8 @@ class SnapshotSeriesRepository(BaseRepository):
                        input_manifest_hash, quality_report_hash,
                        baseline_quality_report_hash,
                        baseline_source_manifest_hash,
-                       git_commit, git_dirty, diff_hash,
+                       code_version, git_commit, git_dirty, diff_hash,
+                       code_archive_path,
                        created_at, built_at, validated_at, frozen_at,
                        failed_at, failure_reason
                   FROM research.snapshot_manifest

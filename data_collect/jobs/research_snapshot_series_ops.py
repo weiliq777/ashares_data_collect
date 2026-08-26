@@ -12,7 +12,9 @@ from data_collect.data_access.repository.snapshot_series_repository import Snaps
 from data_collect.data_access.research_contract import is_foundation_schema
 from data_collect.jobs.research_snapshot import (
     _baseline,
+    _git_metadata,
     _quality_report,
+    _sha256_file,
     build_snapshots_batch,
     freeze_snapshots_batch,
     inspect_snapshots_batch,
@@ -137,6 +139,12 @@ def main(argv=None) -> int:
 
         checkpoint = Checkpoint(PostgresCheckpointStore())
         baseline, quality_report, quality_hash = _shared_evidence(selector)
+        freeze_metadata = None
+        archive_evidence = None
+        if args.command == "finalize":
+            freeze_metadata = _git_metadata()
+            if args.code_archive_path:
+                archive_evidence = _sha256_file(args.code_archive_path)
         lock_name = "research.snapshot.series"
         with kernel.lock_manager.session_exclusive(lock_name, selector.digest):
             if args.command == "resume":
@@ -174,7 +182,10 @@ def main(argv=None) -> int:
                         baseline=baseline,
                         quality_report=quality_report,
                         verify_source_manifest=False,
+                        metadata=freeze_metadata,
+                        code_archive_evidence=archive_evidence,
                     ),
+                    code_archive_available=bool(args.code_archive_path),
                 )
                 report = runner.run(
                     selector, batch_size=args.batch_size, run_id=args.run_id,

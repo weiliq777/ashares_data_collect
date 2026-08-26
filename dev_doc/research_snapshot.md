@@ -214,6 +214,11 @@ Snapshot 基础代码此前生成过三份 `research-v1.1` FROZEN 日快照（20
 `build → validate`，每批完成后写 checkpoint。该命令不提供 `--rebuild-building`，不会把
 `BUILDING` 自动改回 `FAILED`：
 
+批量校验只会把存在确定性质量、PIT、行数或血缘问题的 Snapshot 标记为 `FAILED`；数据库
+超时、连接中断或锁获取失败会保留原 `BUILDING` 状态，避免把基础设施瞬时故障误判成需要
+重建的数据错误。checkpoint 以每个批次的日期和 Snapshot ID 摘要为独立 scope，数据库状态
+仍是续跑事实来源。
+
 ```powershell
 .\.venv\Scripts\python.exe -m data_collect.jobs.research_snapshot_series_ops resume `
   --start-date 2021-08-02 `
@@ -243,3 +248,8 @@ Snapshot 基础代码此前生成过三份 `research-v1.1` FROZEN 日快照（20
 `resume` 和 `finalize` 共用同一个序列级 PostgreSQL advisory lock，防止两个新操作入口
 并发执行。旧版 `research_snapshot_series` 未持有该锁，因此仍必须先从操作系统和任务日志
 确认旧历史进程已经退出；不得仅凭 BUILDING 时间较久就自动接管。
+
+冻结状态迁移只写归档路径、归档哈希和归档大小，不覆盖 build 阶段已经写入 Manifest 的
+`code_version/git_commit/git_dirty/diff_hash`。若任何待冻结 Snapshot 是 dirty build，必须
+提供对应代码归档；归档文件只在 Finalize 启动时计算一次 SHA-256，后续批次复用该证据，
+避免对同一大文件重复读取数百次。
