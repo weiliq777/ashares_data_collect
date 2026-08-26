@@ -10,6 +10,50 @@ from data_collect.data_access.research_contract import is_foundation_schema
 
 
 class SnapshotSeriesRepository(BaseRepository):
+    def series_inventory(
+        self,
+        baseline_tag: str,
+        schema_version: str,
+        start: date,
+        end: date,
+        context: RunContext,
+        *,
+        max_rows: int,
+    ) -> list[dict]:
+        """Read a bounded manifest inventory through the cutoff index.
+
+        The historical series is deliberately read from the small manifest
+        table.  Progress monitoring must never join the materialized stock or
+        lineage tables while a builder is active.
+        """
+        if start > end:
+            raise ValueError("start must not be after end")
+        if max_rows < 1 or max_rows > 100_000:
+            raise ValueError("max_rows must be between 1 and 100000")
+        return self.kernel.read._repository_query(
+            context,
+            "research.snapshot_manifest",
+            """SELECT snapshot_id, research_cutoff_date, status,
+                       input_manifest_hash, quality_report_hash,
+                       baseline_quality_report_hash,
+                       baseline_source_manifest_hash,
+                       git_commit, git_dirty, diff_hash,
+                       created_at, built_at, validated_at, frozen_at,
+                       failed_at, failure_reason
+                  FROM research.snapshot_manifest
+                 WHERE research_cutoff_date BETWEEN %s AND %s
+                   AND data_baseline_tag=%s
+                   AND schema_version=%s
+                 ORDER BY research_cutoff_date, snapshot_id""",
+            params=(start, end, baseline_tag, schema_version),
+            scope=WorkScope(
+                date_from=start,
+                date_to=end,
+                partition="snapshot:series-inventory",
+            ),
+            max_rows=max_rows,
+        )
+
     def select_snapshots(
         self, baseline_tag: str, schema_version: str, start, end, context: RunContext,
     ) -> list[dict]:

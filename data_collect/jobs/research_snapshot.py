@@ -476,6 +476,105 @@ def build(snapshot_id: str) -> None:
         kernel.close()
 
 
+def inspect_snapshots_batch(
+    snapshot_ids: list[str],
+    *,
+    baseline=None,
+    quality_reports: dict[str, tuple[dict, str]] | None = None,
+    allowed_statuses: tuple[str, ...] = ("BUILDING", "VALIDATED", "FROZEN"),
+    verify_source_manifest: bool = False,
+) -> dict[str, list[dict]]:
+    """Run the snapshot acceptance checks without changing lifecycle state.
+
+    Callers must keep batches small.  Every stock/lineage query is scoped by
+    ``snapshot_id`` and uses the existing primary/lookup indexes; this helper
+    intentionally does not join or aggregate the whole historical series in a
+    single statement.
+    """
+    ids = tuple(str(value) for value in snapshot_ids)
+    if not ids:
+        return {}
+    if len(ids) > 100:
+        raise ValueError("snapshot inspection batches are limited to 100")
+    allowed = frozenset(str(value) for value in allowed_statuses)
+    if not allowed:
+        raise ValueError("allowed_statuses must not be empty")
+
+    kernel, repository, context = _service("inspect-batch")
+    try:
+        manifests = [repository.manifest(snapshot_id, context) for snapshot_id in ids]
+        baseline_tags = {item["baseline"] for item in manifests}
+        schema_versions = {item["schema_version"] for item in manifests}
+        if len(baseline_tags) != 1 or len(schema_versions) != 1:
+            raise ValueError("同一验收批次必须使用同一 baseline_tag/schema_version")
+        schema_version = next(iter(schema_versions))
+        baseline_value = baseline or _baseline(
+            max(item["cutoff"] for item in manifests),
+            next(iter(baseline_tags)),
+            verify_source_manifest=verify_source_manifest,
+        )
+        _assert_baseline_schema(baseline_value, schema_version)
+
+        issues_by_snapshot: dict[str, list[dict]] = {}
+        try:
+            repository.price_vintage_dates(
+                [item["cutoff"] for item in manifests], list(ids), schema_version, context,
+            )
+        except Exception as exc:
+            issues_by_snapshot["__batch__"] = [{"price_vintage": str(exc)}]
+        try:
+            PitValidationRepository(kernel).verify_batch(
+                [item["cutoff"] for item in manifests], list(ids), schema_version, context,
+            )
+        except Exception as exc:
+            issues_by_snapshot.setdefault("__batch__", []).append(
+                {"pit_cutoff": str(exc)}
+            )
+
+        for manifest in manifests:
+            snapshot_id = str(manifest["snapshot_id"])
+            issues: list[dict] = []
+            if manifest["status"] not in allowed:
+                issues.append({
+                    "unexpected_status": {
+                        "actual": manifest["status"],
+                        "allowed": sorted(allowed),
+                    }
+                })
+            if (
+                baseline_value[3] != manifest["baseline_quality_hash"]
+                or baseline_value[4] != manifest["baseline_source_manifest_hash"]
+            ):
+                issues.append({"baseline_hash_changed": True})
+            report, quality_hash = (
+                quality_reports[snapshot_id]
+                if quality_reports and snapshot_id in quality_reports
+                else _quality_report(manifest["cutoff"], schema_version, baseline_value)
+            )
+            if report["failures"] or quality_hash != manifest["quality_hash"]:
+                issues.append({
+                    "quality_report_changed": {
+                        "failures": report["failures"],
+                        "stored_hash": manifest["quality_hash"],
+                        "current_hash": quality_hash,
+                    }
+                })
+            issues.extend(repository.check_snapshot(
+                manifest,
+                baseline_value[5],
+                _inputs_for_schema(schema_version),
+                _row_bytes,
+                _manifest_hash,
+                len(REQUIRED_LINEAGE_GROUPS),
+                context,
+            ))
+            if issues:
+                issues_by_snapshot[snapshot_id] = issues
+        return issues_by_snapshot
+    finally:
+        kernel.close()
+
+
 def validate_snapshots_batch(
     snapshot_ids: list[str],
     *,
@@ -625,7 +724,12 @@ def _pit_report(cutoff: date, snapshot_id: str | None = None) -> dict:
         kernel.close()
 
 def freeze_snapshots_batch(
-    snapshot_ids: list[str], code_archive_path: str | None = None
+    snapshot_ids: list[str],
+    code_archive_path: str | None = None,
+    *,
+    baseline=None,
+    quality_report: dict | None = None,
+    verify_source_manifest: bool = False,
 ) -> None:
     """Freeze validated snapshots sharing one baseline with bounded IO.
 
@@ -655,15 +759,20 @@ def freeze_snapshots_batch(
         if len(baseline_tags) != 1 or len(schema_versions) != 1:
             raise ValueError("批量冻结必须使用同一 baseline_tag/schema_version")
         cutoffs = [item["cutoff"] for item in manifests]
-        baseline = _baseline(max(cutoffs), next(iter(baseline_tags)))
+        baseline_value = baseline or _baseline(
+            max(cutoffs), next(iter(baseline_tags)),
+            verify_source_manifest=verify_source_manifest,
+        )
         for manifest in manifests:
-            if baseline[3] != manifest["baseline_quality_hash"] or baseline[4] != manifest["baseline_source_manifest_hash"]:
+            if baseline_value[3] != manifest["baseline_quality_hash"] or baseline_value[4] != manifest["baseline_source_manifest_hash"]:
                 raise RuntimeError("Snapshot 绑定的基线哈希已变化，拒绝冻结")
             if not manifest["quality_hash"] or not manifest["input_hash"]:
                 raise RuntimeError("Snapshot 缺少质量哈希或输入哈希")
         schema_version = next(iter(schema_versions))
         _assert_price_vintage_for_dates(cutoffs, list(ids), schema_version)
-        report, _ = _quality_report(max(cutoffs), schema_version, baseline)
+        report = quality_report
+        if report is None:
+            report, _ = _quality_report(max(cutoffs), schema_version, baseline_value)
         if report["failures"]:
             raise RuntimeError(f"质量门禁未通过，拒绝批量冻结: {report['failures']}")
         assert_market_coverage_range_publishable(min(cutoffs), max(cutoffs))
