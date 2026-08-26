@@ -21,6 +21,7 @@ _IMMUTABLE_INPUT_STATS_CACHE: dict[tuple, dict[str, Any]] = {}
 
 class ResearchSnapshotRepository(BaseRepository):
     SNAPSHOT_CODE_BATCH_SIZE = 250
+    INPUT_STATS_BATCH_ROWS = 2_000
 
     @staticmethod
     def stock_snapshot_sql():
@@ -767,25 +768,24 @@ class ResearchSnapshotRepository(BaseRepository):
             cached = _IMMUTABLE_INPUT_STATS_CACHE.get(cache_key)
             if cached is not None:
                 return dict(cached)
-        aggregate_sql = (
-            f'SELECT COUNT(*) AS row_count, MIN("{date_column}") AS min_date, '
-            f'MAX("{date_column}") AS max_date FROM {source} WHERE {where}'
-            if date_column
-            else f"SELECT COUNT(*) AS row_count FROM {source} WHERE {where}"
-        )
-        aggregate = self.kernel.read._repository_query(
-            context, source, aggregate_sql, params,
-            WorkScope(date_to=cutoff, partition=f"snapshot-input:{source}"), 2,
-        )[0]
         selected = ", ".join(f'"{column}"' for column in columns)
         rows_sql = f'SELECT {selected} FROM {source} WHERE {where} ORDER BY {definition["order"]}'
         digest = hashlib.sha256()
+        row_count = 0
+        min_date = None
+        max_date = None
         for batch in self.kernel.read._repository_stream(
             context, source, rows_sql, params,
             WorkScope(date_to=cutoff, partition=f"snapshot-input:{source}"),
-            batch_rows=1_000,
+            batch_rows=self.INPUT_STATS_BATCH_ROWS,
         ):
             for row in batch:
+                row_count += 1
+                if date_column:
+                    value = row[date_column]
+                    if value is not None:
+                        min_date = value if min_date is None or value < min_date else min_date
+                        max_date = value if max_date is None or value > max_date else max_date
                 digest.update(row_bytes(tuple(row[column] for column in columns)))
         result = {
             "schema_name": definition["schema"],
@@ -793,9 +793,9 @@ class ResearchSnapshotRepository(BaseRepository):
             "selection_predicate": definition["predicate"],
             "selected_columns": list(columns),
             "hash_algorithm": "sha256",
-            "row_count": int(aggregate["row_count"] or 0),
-            "min_date": aggregate.get("min_date"),
-            "max_date": aggregate.get("max_date"),
+            "row_count": row_count,
+            "min_date": min_date,
+            "max_date": max_date,
             "content_hash": digest.hexdigest(),
         }
         if cache_key is not None:
@@ -964,10 +964,6 @@ class ResearchSnapshotRepository(BaseRepository):
         self, manifest: dict[str, Any], source_manifest: dict[str, Any],
         definitions, row_bytes, manifest_hash, required_lineage_groups: int, context: RunContext,
     ) -> list[dict[str, Any]]:
-        stats = [
-            self.input_stats(definition, manifest["cutoff"], source_manifest, context, row_bytes)
-            for definition in definitions
-        ]
         snapshot_id = manifest["snapshot_id"]
         cutoff = manifest["cutoff"]
         scope = WorkScope(date_from=cutoff, date_to=cutoff, partition=str(snapshot_id))
@@ -1006,6 +1002,32 @@ class ResearchSnapshotRepository(BaseRepository):
         )
         if incomplete:
             issues.append({"lineage_refs_without_version_or_hash": [(row["field_group"], row["value"]) for row in incomplete]})
+        stored_inputs = self.kernel.read._repository_query(
+            context, "research.snapshot_input",
+            """SELECT schema_name, table_name, selection_predicate, selected_columns,
+                              hash_algorithm, row_count, min_date, max_date, content_hash
+                         FROM research.snapshot_input
+                        WHERE snapshot_id=%s
+                        ORDER BY schema_name, table_name""",
+            (snapshot_id,), scope, max(2, len(definitions) + 1),
+        )
+        expected_keys = [(item["schema"], item["table"]) for item in definitions]
+        stored_by_key = {(row["schema_name"], row["table_name"]): row for row in stored_inputs}
+        if len(stored_inputs) != len(definitions) or set(stored_by_key) != set(expected_keys):
+            issues.append({
+                "snapshot_input_manifest_incomplete": {
+                    "expected": expected_keys, "stored": sorted(stored_by_key),
+                }
+            })
+        else:
+            ordered_inputs = [stored_by_key[key] for key in expected_keys]
+            current_hash = manifest_hash(ordered_inputs)
+            if current_hash != manifest["input_hash"]:
+                issues.append({
+                    "input_manifest_hash_changed": {
+                        "stored": manifest["input_hash"], "current": current_hash,
+                    }
+                })
         if manifest["schema_version"] == "research-v1.3":
             maturity = self.kernel.read._repository_query(
                 context, "research.stock_snapshot_daily",
@@ -1025,7 +1047,4 @@ class ResearchSnapshotRepository(BaseRepository):
             )[0]
             if any(maturity.values()):
                 issues.append({"research_v1_2_maturity_or_pit_failures": tuple(maturity.values())})
-        current_hash = manifest_hash(stats)
-        if current_hash != manifest["input_hash"]:
-            issues.append({"input_manifest_hash_changed": {"stored": manifest["input_hash"], "current": current_hash}})
         return issues

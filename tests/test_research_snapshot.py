@@ -44,6 +44,27 @@ def test_snapshot_input_manifest_precompute_preserves_order_and_hash():
     assert digest == "hash:first,second"
 
 
+def test_snapshot_input_stats_uses_one_stream_for_count_range_and_hash():
+    source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    input_stats = source.split("    def input_stats(", 1)[1].split("    def baseline(", 1)[0]
+    assert "aggregate_sql" not in input_stats
+    assert "row_count += 1" in input_stats
+    assert "batch_rows=self.INPUT_STATS_BATCH_ROWS" in input_stats
+
+
+def test_snapshot_validation_reuses_persisted_input_evidence():
+    source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    check = source.split("    def check_snapshot(", 1)[1]
+    assert '"research.snapshot_input"' in check
+    assert "snapshot_input_manifest_incomplete" in check
+    assert "input_manifest_hash_changed" in check
+    assert "self.input_stats(" not in check
+
+
 def test_foundation_snapshot_rejects_legacy_release_contract():
     baseline = (
         "legacy", date(2026, 8, 6), "validated", "quality", "source",
