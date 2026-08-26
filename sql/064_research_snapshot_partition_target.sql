@@ -31,6 +31,18 @@ BEGIN
 END;
 $$;
 
+-- If the final statement-level guard migration has already been applied,
+-- re-running this idempotent partition provisioner also repairs any newly
+-- created partitions.  On a clean ordered install the later repair migration
+-- performs the same installation after this file.
+DO $$
+BEGIN
+    IF to_regprocedure('research.install_stock_snapshot_partition_guards()') IS NOT NULL THEN
+        PERFORM research.install_stock_snapshot_partition_guards();
+    END IF;
+END;
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_snapshot_partitioned_code
     ON research.stock_snapshot_daily_partitioned (ts_code, research_date, snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_snapshot_partitioned_feature_version
