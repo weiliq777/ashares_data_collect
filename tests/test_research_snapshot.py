@@ -1,8 +1,7 @@
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
-from types import SimpleNamespace
-from datetime import date
 
 from data_collect.jobs import research_snapshot
 from data_collect.jobs.research_snapshot import (
@@ -14,6 +13,7 @@ from data_collect.jobs.research_snapshot import (
     _stock_snapshot_sql,
 )
 from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
+from data_collect.jobs.research_snapshot import freeze_snapshots_batch
 
 
 def test_snapshot_freeze_rechecks_baseline_and_quality_gate():
@@ -172,6 +172,13 @@ def test_series_freeze_reuses_one_precomputed_quality_report():
         "data_collect/jobs/research_snapshot_series.py"
     ).read_text(encoding="utf-8")
     assert "quality_report=base_report" in source
+
+
+def test_batch_freeze_accepts_precomputed_validation_evidence():
+    parameters = __import__("inspect").signature(freeze_snapshots_batch).parameters
+    assert "baseline" in parameters
+    assert "quality_report" in parameters
+    assert "verify_source_manifest" in parameters
 
 
 def test_foundation_snapshot_missing_lineage_is_jsonb():

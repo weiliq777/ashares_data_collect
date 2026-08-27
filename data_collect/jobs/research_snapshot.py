@@ -625,7 +625,9 @@ def _pit_report(cutoff: date, snapshot_id: str | None = None) -> dict:
         kernel.close()
 
 def freeze_snapshots_batch(
-    snapshot_ids: list[str], code_archive_path: str | None = None
+    snapshot_ids: list[str], code_archive_path: str | None = None,
+    *, baseline=None, quality_report: dict | None = None,
+    verify_source_manifest: bool = True,
 ) -> None:
     """Freeze validated snapshots sharing one baseline with bounded IO.
 
@@ -655,7 +657,10 @@ def freeze_snapshots_batch(
         if len(baseline_tags) != 1 or len(schema_versions) != 1:
             raise ValueError("批量冻结必须使用同一 baseline_tag/schema_version")
         cutoffs = [item["cutoff"] for item in manifests]
-        baseline = _baseline(max(cutoffs), next(iter(baseline_tags)))
+        baseline = baseline or _baseline(
+            max(cutoffs), next(iter(baseline_tags)),
+            verify_source_manifest=verify_source_manifest,
+        )
         for manifest in manifests:
             if baseline[3] != manifest["baseline_quality_hash"] or baseline[4] != manifest["baseline_source_manifest_hash"]:
                 raise RuntimeError("Snapshot 绑定的基线哈希已变化，拒绝冻结")
@@ -663,7 +668,9 @@ def freeze_snapshots_batch(
                 raise RuntimeError("Snapshot 缺少质量哈希或输入哈希")
         schema_version = next(iter(schema_versions))
         _assert_price_vintage_for_dates(cutoffs, list(ids), schema_version)
-        report, _ = _quality_report(max(cutoffs), schema_version, baseline)
+        report = quality_report or _quality_report(
+            max(cutoffs), schema_version, baseline,
+        )[0]
         if report["failures"]:
             raise RuntimeError(f"质量门禁未通过，拒绝批量冻结: {report['failures']}")
         assert_market_coverage_range_publishable(min(cutoffs), max(cutoffs))
