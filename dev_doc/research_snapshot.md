@@ -43,6 +43,10 @@ PIT/Feature，Research 分析和 Backtest 只允许读取 `FROZEN` 快照。
 - `quality_report_hash`、`quality_report`：生成前质量门禁结果；
 - `input_manifest_hash`：所有输入统计的汇总哈希；
 - `status`：`DRAFT → BUILDING → VALIDATED → FROZEN`，失败可从 `FAILED` 重新构建。
+  在进入 `FROZEN` 前，允许通过受控的、必须填写原因的修复操作将明确选中的
+  `VALIDATED → FAILED`，随后按 `FAILED → BUILDING → VALIDATED` 重新构建；该操作必须持有
+  序列锁，只能作用于显式快照 ID，绝不允许作用于 `FROZEN`。这用于修复历史 dirty 构建证据，
+  不是日常增量流程。
 
 `FROZEN` 必须同时具备质量哈希和输入哈希。工作区不干净时，必须保留
 `diff_hash` 或代码归档路径。数据库触发器禁止非法状态跳转、删除 Manifest，

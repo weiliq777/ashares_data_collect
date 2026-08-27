@@ -64,3 +64,25 @@ def test_snapshot_series_detects_partial_build_before_validation():
         ["partial-id", "complete-id"], ["partial-id", "complete-id"], 10
     )
     assert calls[0][3] == 2
+
+
+def test_snapshot_series_reopen_requires_explicit_reason_and_updates_validated():
+    calls = []
+    repository = SnapshotSeriesRepository.__new__(SnapshotSeriesRepository)
+
+    def fake_transition(**kwargs):
+        calls.append(kwargs)
+        return len(kwargs["rows"])
+
+    repository.kernel = SimpleNamespace(
+        write=SimpleNamespace(transition_snapshot_manifests=fake_transition),
+    )
+    with pytest.raises(ValueError, match="reason"):
+        repository.reopen_validated_snapshots(["snapshot-id"], " ", "context")
+
+    assert repository.reopen_validated_snapshots(
+        ["snapshot-id"], "repair dirty build", "context"
+    ) == 1
+    assert calls[0]["from_statuses"] == ("VALIDATED",)
+    assert calls[0]["to_status"] == "FAILED"
+    assert calls[0]["rows"][0]["failure_reason"].startswith("PRE_FREEZE_REPAIR:")

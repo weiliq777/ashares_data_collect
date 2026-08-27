@@ -164,3 +164,35 @@ class SnapshotSeriesRepository(BaseRepository):
         return self.kernel.write.fail_building_snapshots(
             context=context, scope=scope, snapshot_ids=ids, reason=reason,
         )
+
+    def reopen_validated_snapshots(
+        self, snapshot_ids: Iterable[str], reason: str, context: RunContext,
+    ) -> int:
+        """Reopen explicitly selected, not-yet-frozen snapshots for repair."""
+        ids = tuple(str(value) for value in snapshot_ids)
+        if not ids:
+            return 0
+        if not reason.strip():
+            raise ValueError("reopen reason must not be blank")
+        scope = WorkScope(
+            partition="snapshot:series-reopen",
+            dimensions={"snapshot_ids": ids},
+        )
+        changed = self.kernel.write.transition_snapshot_manifests(
+            context=context,
+            scope=scope,
+            rows=[
+                {
+                    "snapshot_id": snapshot_id,
+                    "failure_reason": f"PRE_FREEZE_REPAIR: {reason[:1980]}",
+                }
+                for snapshot_id in ids
+            ],
+            from_statuses=("VALIDATED",),
+            to_status="FAILED",
+        )
+        if changed != len(ids):
+            raise RuntimeError(
+                f"reopen VALIDATED snapshot count mismatch: expected {len(ids)}, got {changed}"
+            )
+        return changed
