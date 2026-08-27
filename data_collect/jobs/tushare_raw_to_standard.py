@@ -193,8 +193,32 @@ def rebuild_all() -> dict[str, tuple[int, int]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Project Tushare Raw into Standard")
     parser.add_argument("--table", choices=["calendar", "daily", "valuation", "adj_factor", "financial", "all"], default="all")
+    parser.add_argument("--start-date", help="bounded rebuild start date (YYYYMMDD or YYYY-MM-DD)")
+    parser.add_argument("--end-date", help="bounded rebuild end date (YYYYMMDD or YYYY-MM-DD)")
+    parser.add_argument("--batch-trade-dates", type=int, default=1)
+    parser.add_argument("--throttle-seconds", type=float, default=0.1)
     args = parser.parse_args()
-    result = rebuild_all() if args.table == "all" else {args.table: globals()[f"rebuild_{args.table}"]()}
+    if (args.start_date is None) != (args.end_date is None):
+        parser.error("--start-date and --end-date must be supplied together")
+    bounded_start = (
+        datetime.strptime(str(args.start_date).replace("-", ""), "%Y%m%d").date()
+        if args.start_date else None
+    )
+    bounded_end = (
+        datetime.strptime(str(args.end_date).replace("-", ""), "%Y%m%d").date()
+        if args.end_date else None
+    )
+    if args.table == "valuation" and args.start_date and args.end_date:
+        result = {"valuation": rebuild_valuation(
+            start_date=bounded_start,
+            end_date=bounded_end,
+            set_batch_trade_dates=args.batch_trade_dates,
+            throttle_seconds=args.throttle_seconds,
+        )}
+    elif args.start_date or args.end_date:
+        parser.error("bounded dates are currently supported only for --table valuation")
+    else:
+        result = rebuild_all() if args.table == "all" else {args.table: globals()[f"rebuild_{args.table}"]()}
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
