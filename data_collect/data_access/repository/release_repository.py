@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
@@ -50,15 +50,16 @@ class ReleaseRepository(BaseRepository):
     def source_manifest(self, cutoff: date, context: RunContext) -> tuple[dict, str]:
         manifest = {"schema_version": "tushare-release-source-v1", "cutoff_date": cutoff.isoformat(), "market_versions": {}, "legacy_market_raw": {}, "append_only_sources": {}}
         for dataset, column in {"daily": "trade_date", "daily_basic": "trade_date", "adj_factor": "trade_date", "trade_cal": "cal_date"}.items():
-            row = self._aggregate(
-                "tushare_market_raw_version",
-                f"SELECT COUNT(*) AS count, MAX(record_id) AS max_record_id, MAX(fetched_at) AS max_fetched_at FROM tushare_market_raw_version WHERE dataset=%s AND {column}<=%s",
-                (dataset, cutoff), context, f"release:market:{dataset}",
+            manifest["market_versions"][dataset] = self._manifest_date_ranges(
+                "tushare_market_raw_version", column, cutoff, context,
+                dataset=dataset, include_record_id=True,
+                partition=f"release:market:{dataset}",
             )
-            manifest["market_versions"][dataset] = self._manifest_row(row)
         for table, column in {"tushare_daily_raw": "trade_date", "tushare_daily_basic_raw": "trade_date", "tushare_adj_factor_raw": "trade_date", "tushare_trade_cal_raw": "cal_date"}.items():
-            row = self._aggregate(table, f"SELECT COUNT(*) AS count, MAX(fetched_at) AS max_fetched_at FROM {table} WHERE {column}<=%s", (cutoff,), context, f"release:legacy:{table}")
-            manifest["legacy_market_raw"][table] = {"row_count": int(row["count"] or 0), "max_fetched_at": row["max_fetched_at"].isoformat() if row["max_fetched_at"] else None}
+            manifest["legacy_market_raw"][table] = self._manifest_date_ranges(
+                table, column, cutoff, context, include_record_id=False,
+                partition=f"release:legacy:{table}",
+            )
         specs = {
             "tushare_financial_raw_version": ("record_id", "COALESCE(f_ann_date,ann_date,fetched_at::date)<=%s"),
             "fina_indicator_raw_version": ("record_id", "COALESCE(f_ann_date,ann_date,fetched_at::date)<=%s"),
@@ -159,6 +160,56 @@ class ReleaseRepository(BaseRepository):
 
     def _aggregate(self, source, sql, params, context, partition):
         return self.kernel.read._repository_query(context, source, sql, params=params, scope=WorkScope(partition=partition), max_rows=2)[0]
+
+    def _manifest_date_ranges(
+        self, table: str, date_column: str, cutoff: date, context: RunContext,
+        *, dataset: str | None = None, include_record_id: bool,
+        partition: str,
+    ) -> dict:
+        """Aggregate a large append-only source in bounded date windows."""
+        if date_column not in {"trade_date", "cal_date"}:
+            raise ValueError("unsupported source-manifest date column")
+        dataset_clause = " AND dataset=%s" if dataset is not None else ""
+        min_params = (dataset,) if dataset is not None else ()
+        minimum = self._aggregate(
+            table,
+            f"SELECT MIN({date_column}) AS min_date FROM {table} "
+            f"WHERE {date_column} IS NOT NULL{dataset_clause}",
+            min_params, context, f"{partition}:minimum",
+        )["min_date"]
+        if minimum is None or minimum > cutoff:
+            return {"row_count": 0, **({"max_record_id": None} if include_record_id else {}), "max_fetched_at": None}
+
+        total = 0
+        max_record_id = None
+        max_fetched_at = None
+        window_start = minimum
+        while window_start <= cutoff:
+            window_end = min(cutoff, window_start + timedelta(days=30))
+            select = "COUNT(*) AS count, MAX(fetched_at) AS max_fetched_at"
+            if include_record_id:
+                select = "COUNT(*) AS count, MAX(record_id) AS max_record_id, MAX(fetched_at) AS max_fetched_at"
+            row = self._aggregate(
+                table,
+                f"SELECT {select} FROM {table} WHERE {date_column} BETWEEN %s AND %s{dataset_clause}",
+                ((window_start, window_end, dataset) if dataset is not None
+                 else (window_start, window_end)),
+                context, f"{partition}:{window_start}:{window_end}",
+            )
+            total += int(row["count"] or 0)
+            if include_record_id and row.get("max_record_id") is not None:
+                max_record_id = max(max_record_id or 0, int(row["max_record_id"]))
+            if row.get("max_fetched_at") is not None and (
+                max_fetched_at is None or row["max_fetched_at"] > max_fetched_at
+            ):
+                max_fetched_at = row["max_fetched_at"]
+            window_start = window_end + timedelta(days=1)
+        result = {"row_count": total, "max_fetched_at": (
+            max_fetched_at.isoformat() if max_fetched_at else None
+        )}
+        if include_record_id:
+            result["max_record_id"] = max_record_id
+        return result
 
     def _scalar(self, source, sql, context, partition, params=()):
         return int(self.kernel.read._repository_query(context, source, sql, params=params, scope=WorkScope(partition=partition), max_rows=2)[0]["value"] or 0)
