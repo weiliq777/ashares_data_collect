@@ -243,7 +243,9 @@ class QualityInspectionRepository(BaseRepository):
         )
         return [{"dataset": r["dataset"], "status": r["status"], "count": r["count"]} for r in rows]
 
-    def phase2_checkpoint_completeness(self, context: RunContext) -> dict[str, Any]:
+    def phase2_checkpoint_completeness(
+        self, context: RunContext, cutoff: date | None = None,
+    ) -> dict[str, Any]:
         scope = WorkScope(partition="quality:phase2-checkpoints")
         result: dict[str, Any] = {}
         rows = self.kernel.read._repository_query(
@@ -276,9 +278,15 @@ class QualityInspectionRepository(BaseRepository):
                        COUNT(c.checkpoint_key) FILTER (WHERE c.status IN ('done','empty')) AS completed,
                        COUNT(*) FILTER (WHERE c.status='failed') AS failed
                   FROM (VALUES ('namechange'), ('dividend')) AS d(dataset)
-                  CROSS JOIN (SELECT COUNT(*) AS stock_count FROM std.stock_basic_info WHERE list_status IN ('L','D','P','G')) s
+                  CROSS JOIN (
+                      SELECT COUNT(*) AS stock_count
+                        FROM std.stock_basic_info
+                       WHERE list_status IN ('L','D','P','G')
+                         AND (%s::date IS NULL OR list_date<=%s::date)
+                  ) s
                   LEFT JOIN ops.tushare_history_checkpoint c ON c.dataset=d.dataset
                  GROUP BY d.dataset, s.stock_count ORDER BY d.dataset""",
+            (cutoff, cutoff),
             scope=scope, max_rows=10,
         )
         for row in rows:
