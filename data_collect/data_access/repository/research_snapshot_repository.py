@@ -26,6 +26,11 @@ class ResearchSnapshotRepository(BaseRepository):
     # with 1,000-code stock INSERT ... SELECT statements.
     SNAPSHOT_CODE_BATCH_SIZE = 500
     INPUT_STATS_BATCH_ROWS = 2_000
+    # Input-manifest hashing must remain row-wise, but a single named cursor
+    # over a wide historical feature table can still spend the whole statement
+    # deadline sorting/reading before returning its first batch.  Keyset pages
+    # keep each read independently bounded and use the date/code indexes.
+    INPUT_STATS_PAGE_ROWS = 500
 
     @staticmethod
     def stock_snapshot_sql():
@@ -773,16 +778,55 @@ class ResearchSnapshotRepository(BaseRepository):
             if cached is not None:
                 return dict(cached)
         selected = ", ".join(f'"{column}"' for column in columns)
-        rows_sql = f'SELECT {selected} FROM {source} WHERE {where} ORDER BY {definition["order"]}'
         digest = hashlib.sha256()
         row_count = 0
         min_date = None
         max_date = None
-        for batch in self.kernel.read._repository_stream(
-            context, source, rows_sql, params,
-            WorkScope(date_to=cutoff, partition=f"snapshot-input:{source}"),
-            batch_rows=self.INPUT_STATS_BATCH_ROWS,
-        ):
+        if source == "feature.price_daily_v2":
+            batches = self._paged_input_rows(
+                context=context,
+                source=source,
+                sql=(
+                    f'SELECT {selected} FROM {source} '
+                    f'WHERE {where} AND "ts_code" > %s '
+                    'ORDER BY "ts_code" LIMIT %s'
+                ),
+                params_prefix=tuple(params),
+                page_rows=self.INPUT_STATS_PAGE_ROWS,
+                cutoff=cutoff,
+                scope_partition=f"snapshot-input:{source}",
+            )
+        elif source == "feature.company_financial_v2":
+            # ``foundation_inputs`` selects one latest PIT-visible row per
+            # stock.  Push the keyset predicate into that selection instead
+            # of rerunning a full DISTINCT-ON subquery for every page.
+            batches = self._paged_input_rows(
+                context=context,
+                source=source,
+                sql=(
+                    f'SELECT DISTINCT ON ("ts_code") {selected} FROM {source} '
+                    'WHERE "data_available_timestamp" < '
+                    '(%s::date + 1)::timestamp AT TIME ZONE '\
+                    "'Asia/Shanghai' "
+                    'AND "report_date" <= %s '
+                    'AND "ts_code" > %s '
+                    'ORDER BY "ts_code", "report_date" DESC, '
+                    '"data_available_timestamp" DESC, "feature_id" DESC '
+                    'LIMIT %s'
+                ),
+                params_prefix=(cutoff, cutoff),
+                page_rows=self.INPUT_STATS_PAGE_ROWS,
+                cutoff=cutoff,
+                scope_partition=f"snapshot-input:{source}",
+            )
+        else:
+            rows_sql = f'SELECT {selected} FROM {source} WHERE {where} ORDER BY {definition["order"]}'
+            batches = self.kernel.read._repository_stream(
+                context, source, rows_sql, params,
+                WorkScope(date_to=cutoff, partition=f"snapshot-input:{source}"),
+                batch_rows=self.INPUT_STATS_BATCH_ROWS,
+            )
+        for batch in batches:
             for row in batch:
                 row_count += 1
                 if date_column:
@@ -805,6 +849,43 @@ class ResearchSnapshotRepository(BaseRepository):
         if cache_key is not None:
             _IMMUTABLE_INPUT_STATS_CACHE[cache_key] = dict(result)
         return result
+
+    def _paged_input_rows(
+        self,
+        *,
+        context: RunContext,
+        source: str,
+        sql: str,
+        params_prefix: tuple[Any, ...],
+        page_rows: int,
+        cutoff: date,
+        scope_partition: str,
+    ):
+        """Yield bounded keyset pages for wide snapshot input sources.
+
+        The SQL supplied by this Repository method must expose ``ts_code`` as
+        its first keyset column and have a final ``LIMIT %s`` placeholder.
+        Each page is a separate governed Repository read, so a slow page is
+        retried/rolled back without creating one long transaction.
+        """
+        last_code = ""
+        while True:
+            params = params_prefix + (last_code, page_rows)
+            rows = self.kernel.read._repository_query(
+                context,
+                source,
+                sql,
+                params,
+                WorkScope(date_to=cutoff, partition=scope_partition),
+                max_rows=page_rows,
+            )
+            if not rows:
+                return
+            yield rows
+            next_code = str(rows[-1]["ts_code"])
+            if next_code <= last_code or len(rows) < page_rows:
+                return
+            last_code = next_code
 
     def baseline(
         self,

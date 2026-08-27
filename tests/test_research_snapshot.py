@@ -1,6 +1,8 @@
 from datetime import date
 
 import pytest
+from types import SimpleNamespace
+from datetime import date
 
 from data_collect.jobs import research_snapshot
 from data_collect.jobs.research_snapshot import (
@@ -52,6 +54,51 @@ def test_snapshot_input_stats_uses_one_stream_for_count_range_and_hash():
     assert "aggregate_sql" not in input_stats
     assert "row_count += 1" in input_stats
     assert "batch_rows=self.INPUT_STATS_BATCH_ROWS" in input_stats
+
+
+def test_snapshot_input_stats_uses_bounded_keyset_pages_for_wide_inputs():
+    calls = []
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    repository.INPUT_STATS_PAGE_ROWS = 2
+
+    def fake_query(context, source, sql, params, scope, max_rows):
+        calls.append((source, sql, params, max_rows))
+        last_code = params[-2]
+        pages = {
+            "": [
+                {"ts_code": "000001.SZ", "trade_date": date(2021, 8, 10)},
+                {"ts_code": "000002.SZ", "trade_date": date(2021, 8, 10)},
+            ],
+            "000002.SZ": [
+                {"ts_code": "000003.SZ", "trade_date": date(2021, 8, 10)},
+            ],
+        }
+        return pages[last_code]
+
+    repository.kernel = SimpleNamespace(
+        read=SimpleNamespace(_repository_query=fake_query),
+    )
+    definition = {
+        "schema": "feature",
+        "table": "price_daily_v2",
+        "columns": ("ts_code", "trade_date"),
+        "where": "trade_date = %s",
+        "params": lambda cutoff: (cutoff,),
+        "order": "trade_date, ts_code",
+        "date_column": "trade_date",
+        "predicate": "trade_date = :research_cutoff_date",
+    }
+
+    result = repository.input_stats(
+        definition, date(2021, 8, 10), None, "context", _row_bytes
+    )
+
+    assert result["row_count"] == 3
+    assert len(calls) == 2
+    assert all(call[3] == 2 for call in calls)
+    assert calls[0][2] == (date(2021, 8, 10), "", 2)
+    assert calls[1][2] == (date(2021, 8, 10), "000002.SZ", 2)
+    assert '"ts_code" > %s' in calls[0][1]
 
 
 def test_snapshot_code_batches_stay_below_statement_deadline_budget():
