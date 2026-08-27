@@ -301,7 +301,7 @@ class WriteGateway:
         plan = SqlPlan(operation=Operation.UPSERT, target="ops.tushare_data_release", scope=scope, expected_mode="ROW_BASED", estimated_rows=2)
         self._kernel.query_guard.check(plan)
 
-        def update(chunk) -> int:
+        def update() -> int:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
                 cur.execute(
@@ -338,7 +338,7 @@ class WriteGateway:
         )
         self._kernel.query_guard.check(plan)
 
-        def update(chunk) -> int:
+        def update() -> int:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
                 cur.execute("SELECT set_config('app.release_actor', %s, true)", (actor,))

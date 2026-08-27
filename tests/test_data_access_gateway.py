@@ -391,6 +391,26 @@ def test_snapshot_manifest_transition_rejects_state_machine_bypass():
 
 # ---- read.query：scan_policy + where→SQL ----
 
+def test_release_state_callbacks_are_atomic_operations_without_chunk_argument():
+    kernel, conn = make_kernel(build_default_registry())
+    result = {
+        "tag": "release-test",
+        "quality_hash": "q" * 64,
+        "gate_json": "{}",
+        "manifest_json": "{}",
+        "source_manifest_hash": "m" * 64,
+    }
+    assert kernel.write.commit_release_validation(
+        ctx(), WorkScope(partition="release-test"), result,
+    ) == 0
+    assert kernel.write.revoke_release(
+        ctx(), WorkScope(partition="release-test"), "release-test",
+        "test", "e" * 64, "test-actor",
+    ) == 0
+    assert conn.committed == 2
+    assert conn.rolled_back == 0
+
+
 def test_read_requires_scope_on_scope_required():
     kernel, _ = make_kernel()
     with pytest.raises(GuardViolation):
