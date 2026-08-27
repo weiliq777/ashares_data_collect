@@ -190,8 +190,11 @@ class FoundationQualityRepository(BaseRepository):
             "valuation_extra_rows": (
                 valuation,
                 f"""SELECT COUNT(*) AS value FROM {valuation} v WHERE v.trade_date BETWEEN %s AND %s {code_valuation}
-                   AND NOT EXISTS (SELECT 1 FROM std.valuation_daily s WHERE s.stock_code=v.ts_code AND s.trade_date=v.trade_date AND s.source='tushare')""",
-                [start_date, end_date, *suffix],
+                   AND NOT EXISTS (SELECT 1 FROM std.valuation_daily s
+                                    WHERE s.trade_date BETWEEN %s AND %s
+                                      AND s.stock_code=v.ts_code AND s.trade_date=v.trade_date
+                                      AND s.source='tushare')""",
+                [start_date, end_date, *suffix, start_date, end_date],
             ),
             "valuation_contract_mismatch": (
                 valuation,
