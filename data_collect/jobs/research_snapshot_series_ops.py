@@ -107,10 +107,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_selector_arguments(resume)
     resume.add_argument("--batch-size", type=int, default=2)
     resume.add_argument("--run-id")
-    resume.add_argument(
-        "--rebuild-dirty", action="store_true",
-        help="显式重建无代码归档的 dirty VALIDATED Snapshot",
-    )
 
     finalize = commands.add_parser(
         "finalize", help="全系列深度验收通过后分批进入 FROZEN",
@@ -125,9 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     selector = _selector(args)
-    if args.command != "resume" and getattr(args, "rebuild_dirty", False):
-        parser = build_parser()
-        parser.error("--rebuild-dirty 只能用于 resume")
     kernel, monitor = _runtime(args.command)
     try:
         if args.command == "monitor":
@@ -155,21 +148,6 @@ def main(argv=None) -> int:
         lock_name = "research.snapshot.series"
         with kernel.lock_manager.session_exclusive(lock_name, selector.digest):
             if args.command == "resume":
-                if args.rebuild_dirty:
-                    preflight = monitor.inspect(selector, mode=MonitorMode.PROGRESS)
-                    dirty_ids = [
-                        record.snapshot_id
-                        for record in preflight.records
-                        if record.status == "VALIDATED"
-                        and record.git_dirty
-                        and not record.code_archive_path
-                    ]
-                    if dirty_ids:
-                        monitor.repository.reopen_validated_snapshots(
-                            dirty_ids,
-                            "显式重建：原 Snapshot 在 dirty 工作区构建且缺少代码归档",
-                            monitor.context,
-                        )
                 runner = SnapshotSeriesResume(
                     monitor,
                     checkpoint,
