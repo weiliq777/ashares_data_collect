@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
@@ -27,7 +27,50 @@ class FoundationQualityRepository(BaseRepository):
         codes: list[str] | None = None,
         company_table: str = "feature.company_financial_v2",
         valuation_table: str = "feature.valuation_daily_v1",
+        _windowed: bool = True,
+        _visibility_cutoff: date | None = None,
     ) -> dict:
+        visibility_cutoff = _visibility_cutoff or end_date
+        if _windowed and (end_date - start_date).days > 180:
+            merged_checks: dict[str, int] = {}
+            window_start = start_date
+            while window_start <= end_date:
+                window_end = min(end_date, window_start + timedelta(days=179))
+                window_report = self.inspect_foundation_v2(
+                    window_start, window_end, context, codes,
+                    company_table, valuation_table, _windowed=False,
+                    _visibility_cutoff=visibility_cutoff,
+                )
+                for name, value in window_report["checks"].items():
+                    merged_checks[name] = merged_checks.get(name, 0) + int(value)
+                window_start = window_end + timedelta(days=1)
+            zero_required = {
+                "income_mapping_mismatch", "cashflow_mapping_mismatch", "indicator_future_comp_type_link",
+                "company_missing_report_periods", "company_contract_mismatch", "invalid_complete_ttm",
+                "invalid_ocf_ratio", "invalid_comp_type_cashflow", "missing_pit_evidence",
+                "valuation_missing_rows", "valuation_extra_rows", "valuation_contract_mismatch",
+                "invalid_dividend_percentile", "valuation_future_rows",
+            }
+            failures = {
+                name: merged_checks[name] for name in zero_required
+                if merged_checks.get(name, 0) != 0
+            }
+            for name in ("company_rows", "valuation_rows"):
+                if merged_checks.get(name, 0) <= 0:
+                    failures[name] = "NO_ROWS"
+            return {
+                "scope": {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "codes": codes or "ALL",
+                },
+                "checks": merged_checks,
+                "failures": failures,
+                "informational": {
+                    "company_future_rows": merged_checks.get("company_future_rows", 0),
+                },
+                "passed": not failures,
+            }
         company = self._table(company_table)
         valuation = self._table(valuation_table)
         code_company = " AND ts_code=ANY(%s)" if codes else ""
@@ -87,7 +130,7 @@ class FoundationQualityRepository(BaseRepository):
                          SELECT 1 FROM {company} c WHERE c.ts_code=i.stock_code AND c.report_date=i.report_date
                            AND c.data_available_timestamp < (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')
                 ) missing""",
-                [start_date, end_date, end_date, *suffix, end_date],
+                [start_date, end_date, visibility_cutoff, *suffix, visibility_cutoff],
             ),
             "company_contract_mismatch": (
                 company,
@@ -110,7 +153,7 @@ class FoundationQualityRepository(BaseRepository):
                 company,
                 f"""SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s
                    AND data_available_timestamp >= (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'""" + code_company,
-                [start_date, end_date, end_date, *suffix],
+                [start_date, end_date, visibility_cutoff, *suffix],
             ),
             "invalid_ocf_ratio": (
                 company,

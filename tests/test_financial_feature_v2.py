@@ -316,7 +316,7 @@ def test_valuation_availability_gate_rejects_both_early_and_next_day_values():
     source = Path("data_collect/data_access/repository/foundation_quality_repository.py").read_text(
         encoding="utf-8"
     )
-    block = source.split('"valuation_future_rows"', 1)[1].split("),", 1)[0]
+    block = source.split('"valuation_future_rows":', 1)[1].split("),", 1)[0]
     assert "data_available_timestamp IS NULL" in block
     assert "data_available_timestamp <" in block
     assert "data_available_timestamp >=" in block
