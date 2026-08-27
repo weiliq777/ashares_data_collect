@@ -519,10 +519,12 @@ class SnapshotSeriesFinalize:
         freeze_batch: Callable[[list[str]], None],
         *,
         code_archive_available: bool = False,
+        immediate_inspect_batch: Callable[[list[str]], dict[str, list[dict]]] | None = None,
     ) -> None:
         self.monitor = monitor
         self.progress_tracker = progress_tracker
         self.inspect_batch = inspect_batch
+        self.immediate_inspect_batch = immediate_inspect_batch or inspect_batch
         self.freeze_batch = freeze_batch
         self.code_archive_available = code_archive_available
 
@@ -619,7 +621,7 @@ class SnapshotSeriesFinalize:
             # VALIDATED child rows are not database-immutable yet.  Repeat the
             # same bounded audit immediately before each freeze transition so
             # a change after the all-series preflight cannot be published.
-            immediate_issues = self.inspect_batch(ids)
+            immediate_issues = self.immediate_inspect_batch(ids)
             if immediate_issues:
                 raise RuntimeError(
                     f"snapshot changed after finalize preflight: {immediate_issues}"

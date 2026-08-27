@@ -483,6 +483,7 @@ def inspect_snapshots_batch(
     quality_reports: dict[str, tuple[dict, str]] | None = None,
     allowed_statuses: tuple[str, ...] = ("BUILDING", "VALIDATED", "FROZEN"),
     verify_source_manifest: bool = False,
+    verify_global_checks: bool = True,
 ) -> dict[str, list[dict]]:
     """Run the snapshot acceptance checks without changing lifecycle state.
 
@@ -516,20 +517,21 @@ def inspect_snapshots_batch(
         _assert_baseline_schema(baseline_value, schema_version)
 
         issues_by_snapshot: dict[str, list[dict]] = {}
-        try:
-            repository.price_vintage_dates(
-                [item["cutoff"] for item in manifests], list(ids), schema_version, context,
-            )
-        except RuntimeError as exc:
-            issues_by_snapshot["__batch__"] = [{"price_vintage": str(exc)}]
-        try:
-            PitValidationRepository(kernel).verify_batch(
-                [item["cutoff"] for item in manifests], list(ids), schema_version, context,
-            )
-        except RuntimeError as exc:
-            issues_by_snapshot.setdefault("__batch__", []).append(
-                {"pit_cutoff": str(exc)}
-            )
+        if verify_global_checks:
+            try:
+                repository.price_vintage_dates(
+                    [item["cutoff"] for item in manifests], list(ids), schema_version, context,
+                )
+            except RuntimeError as exc:
+                issues_by_snapshot["__batch__"] = [{"price_vintage": str(exc)}]
+            try:
+                PitValidationRepository(kernel).verify_batch(
+                    [item["cutoff"] for item in manifests], list(ids), schema_version, context,
+                )
+            except RuntimeError as exc:
+                issues_by_snapshot.setdefault("__batch__", []).append(
+                    {"pit_cutoff": str(exc)}
+                )
 
         for manifest in manifests:
             snapshot_id = str(manifest["snapshot_id"])

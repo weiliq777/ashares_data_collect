@@ -197,6 +197,14 @@ def main(argv=None) -> int:
                         allowed_statuses=("VALIDATED", "FROZEN"),
                         verify_source_manifest=False,
                     ),
+                    immediate_inspect_batch=lambda ids: inspect_snapshots_batch(
+                        ids,
+                        baseline=baseline,
+                        quality_reports=_quality_mapping(ids, quality_report, quality_hash),
+                        allowed_statuses=("VALIDATED", "FROZEN"),
+                        verify_source_manifest=False,
+                        verify_global_checks=False,
+                    ),
                     freeze_batch=lambda ids: freeze_snapshots_batch(
                         ids,
                         args.code_archive_path,
