@@ -14,7 +14,7 @@ class PitValidationRepository(BaseRepository):
         ("price_feature_source_asof", "feature.price_daily_v2", "SELECT COUNT(*) AS value FROM feature.price_daily_v2 WHERE trade_date=%s AND source_asof_date>trade_date"),
         ("valuation_feature_source_asof", "feature.valuation_daily_v1", "SELECT COUNT(*) AS value FROM feature.valuation_daily_v1 WHERE trade_date=%s AND source_asof_date>trade_date"),
         ("tradeability_source_asof", "pit.security_tradeability_daily", "SELECT COUNT(*) AS value FROM pit.security_tradeability_daily WHERE trade_date=%s AND source_asof_date>trade_date"),
-        ("research_snapshot_financial_visibility", "research.stock_snapshot_daily", "SELECT COUNT(*) AS value FROM research.stock_snapshot_daily WHERE snapshot_id=%s AND effective_announce_date>research_date"),
+        ("research_snapshot_financial_visibility", "research.stock_snapshot_daily", "SELECT COUNT(*) AS value FROM research.stock_snapshot_daily WHERE snapshot_id=%s AND research_date=%s AND effective_announce_date>research_date"),
     )
 
     def verify(self, target_date: date, snapshot_id: str | None, context: RunContext) -> dict:
@@ -29,7 +29,7 @@ class PitValidationRepository(BaseRepository):
                     checks.append({"name": name, "violations": 1, "reason": "snapshot_id_required"})
                     issues.append(f"{name}=snapshot_id_required")
                     continue
-                params = (snapshot_id,)
+                params = (snapshot_id, target_date)
             else:
                 params = (target_date,)
             count = int(self.kernel.read._repository_query(context, source, sql, params, scope=scope, max_rows=2)[0]["value"] or 0)
@@ -66,12 +66,16 @@ class PitValidationRepository(BaseRepository):
             ("price_feature_source_asof", "feature.price_daily_v2", "SELECT COUNT(*) AS value FROM feature.price_daily_v2 WHERE trade_date=ANY(%s::date[]) AND source_asof_date>trade_date"),
             ("valuation_feature_source_asof", "feature.valuation_daily_v1", "SELECT COUNT(*) AS value FROM feature.valuation_daily_v1 WHERE trade_date=ANY(%s::date[]) AND source_asof_date>trade_date"),
             ("tradeability_source_asof", "pit.security_tradeability_daily", "SELECT COUNT(*) AS value FROM pit.security_tradeability_daily WHERE trade_date=ANY(%s::date[]) AND source_asof_date>trade_date"),
-            ("research_snapshot_financial_visibility", "research.stock_snapshot_daily", "SELECT COUNT(*) AS value FROM research.stock_snapshot_daily WHERE snapshot_id=ANY(%s::uuid[]) AND effective_announce_date>research_date"),
+            ("research_snapshot_financial_visibility", "research.stock_snapshot_daily", "SELECT COUNT(*) AS value FROM research.stock_snapshot_daily WHERE snapshot_id=ANY(%s::uuid[]) AND research_date=ANY(%s::date[]) AND effective_announce_date>research_date"),
         ))
         scope = WorkScope(date_from=min(cutoffs), date_to=max(cutoffs), partition="pit-validation-batch")
         failures = []
         for name, source, sql in checks:
-            params = (list(snapshot_ids),) if name == "research_snapshot_financial_visibility" else (list(cutoffs),)
+            params = (
+                (list(snapshot_ids), list(cutoffs))
+                if name == "research_snapshot_financial_visibility"
+                else (list(cutoffs),)
+            )
             count = int(self.kernel.read._repository_query(context, source, sql, params, scope, 2)[0]["value"] or 0)
             if count:
                 failures.append({"name": name, "violations": count})
