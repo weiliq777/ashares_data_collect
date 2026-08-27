@@ -1282,7 +1282,15 @@ class ResearchSnapshotRepository(BaseRepository):
                     }
                 })
             else:
-                ordered = [stored_by_key[key] for key in expected_keys]
+                # ``snapshot_id`` is only the batch grouping key.  The
+                # persisted input hash has always been defined over the
+                # original input-manifest columns, excluding that grouping
+                # column; keep the historical hash contract unchanged.
+                ordered = [
+                    {key: row[key] for key in row if key != "snapshot_id"}
+                    for key in expected_keys
+                    for row in [stored_by_key[key]]
+                ]
                 current_hash = manifest_hash(ordered)
                 if current_hash != manifest["input_hash"]:
                     add(snapshot_id, {
