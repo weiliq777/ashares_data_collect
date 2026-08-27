@@ -479,6 +479,7 @@ class WriteGateway:
         placeholders = ", ".join(["%s"] * (len(columns) + 1))
         assignments = ", ".join(
             f"{column}=v.{column}::jsonb" if column == "quality_report"
+            else f"{column}=v.{column}::bigint" if column == "code_archive_size_bytes"
             else f"{column}=v.{column}"
             for column in columns
         )
@@ -524,6 +525,7 @@ class WriteGateway:
         placeholders = ", ".join(["%s"] * len(values))
         assignments = ", ".join(
             f"{column}=v.{column}::jsonb" if column == "quality_report"
+            else f"{column}=v.{column}::bigint" if column == "code_archive_size_bytes"
             else f"{column}=v.{column}"
             for column in columns
         )

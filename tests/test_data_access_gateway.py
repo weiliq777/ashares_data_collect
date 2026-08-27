@@ -359,6 +359,17 @@ def test_snapshot_manifest_transition_casts_json_quality_report():
     assert "quality_report=v.quality_report::jsonb" in sql
 
 
+def test_snapshot_manifest_transition_casts_archive_size():
+    kernel, conn = make_kernel(build_default_registry())
+    kernel.write.transition_snapshot_manifest(
+        ctx(), WorkScope(partition="snapshot-1"), "snapshot-1",
+        ("VALIDATED",), "FROZEN",
+        {"code_archive_size_bytes": 1234},
+    )
+    sql = next(item["sql"] for item in conn.executed if item["kind"] == "execute")
+    assert "code_archive_size_bytes=v.code_archive_size_bytes::bigint" in sql
+
+
 def test_snapshot_manifest_transition_rejects_unapproved_column():
     kernel, _ = make_kernel(build_default_registry())
     scope = WorkScope(partition="snapshot-1", dimensions={"snapshot_id": "snapshot-1"})
