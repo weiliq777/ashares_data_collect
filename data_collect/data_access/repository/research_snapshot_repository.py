@@ -31,6 +31,14 @@ class ResearchSnapshotRepository(BaseRepository):
     # deadline sorting/reading before returning its first batch.  Keyset pages
     # keep each read independently bounded and use the date/code indexes.
     INPUT_STATS_PAGE_ROWS = 500
+    INPUT_STATS_KEYSET_COLUMNS = {
+        "pit.universe_daily": "ts_code",
+        "pit.security_tradeability_daily": "ts_code",
+        "feature.price_daily_v2": "ts_code",
+        "feature.valuation_daily_v1": "ts_code",
+        "std.security_status_daily": "ts_code",
+        "feature.shareholder_return_v1": "ts_code",
+    }
 
     @staticmethod
     def stock_snapshot_sql():
@@ -782,14 +790,15 @@ class ResearchSnapshotRepository(BaseRepository):
         row_count = 0
         min_date = None
         max_date = None
-        if source == "feature.price_daily_v2":
+        keyset_column = self.INPUT_STATS_KEYSET_COLUMNS.get(source)
+        if keyset_column:
             batches = self._paged_input_rows(
                 context=context,
                 source=source,
                 sql=(
                     f'SELECT {selected} FROM {source} '
-                    f'WHERE {where} AND "ts_code" > %s '
-                    'ORDER BY "ts_code" LIMIT %s'
+                    f'WHERE {where} AND "{keyset_column}" > %s '
+                    f'ORDER BY "{keyset_column}" LIMIT %s'
                 ),
                 params_prefix=tuple(params),
                 page_rows=self.INPUT_STATS_PAGE_ROWS,
