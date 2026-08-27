@@ -579,40 +579,45 @@ class SnapshotSeriesFinalize:
             )
 
         # Complete the deep preflight for every date before freezing the first
-        # pending batch.  Queries remain per-snapshot and batch-bounded.
-        inspected = 0
-        issue_count = 0
-        issue_samples: dict[str, list[dict]] = {}
-        for chunk in bounded_batches(report.records, batch_size):
-            issues = self.inspect_batch([record.snapshot_id for record in chunk])
-            issue_count += len(issues)
-            for key, value in issues.items():
-                if len(issue_samples) >= 100:
-                    break
-                sample_key = key
-                if key == "__batch__":
-                    sample_key = (
-                        f"batch:{chunk[0].cutoff.isoformat()}:"
-                        f"{chunk[-1].cutoff.isoformat()}"
-                    )
-                issue_samples[sample_key] = value
-            inspected += len(chunk)
-            _checkpoint_progress(
-                self.progress_tracker, run_id, "snapshot_series_finalize",
-                preflight_scope, inspected,
+        # pending batch.  Queries remain per-snapshot and batch-bounded.  A
+        # restart must honor the checkpoint: repeating all historical checks
+        # defeats resumability and can keep a production freeze at cursor 0.
+        if previous_preflight is None or not previous_preflight.done:
+            inspected = previous_preflight.cursor if previous_preflight else 0
+            if inspected < 0 or inspected > len(report.records):
+                raise RuntimeError("invalid snapshot preflight checkpoint cursor")
+            issue_count = 0
+            issue_samples: dict[str, list[dict]] = {}
+            for chunk in bounded_batches(report.records[inspected:], batch_size):
+                issues = self.inspect_batch([record.snapshot_id for record in chunk])
+                issue_count += len(issues)
+                for key, value in issues.items():
+                    if len(issue_samples) >= 100:
+                        break
+                    sample_key = key
+                    if key == "__batch__":
+                        sample_key = (
+                            f"batch:{chunk[0].cutoff.isoformat()}:"
+                            f"{chunk[-1].cutoff.isoformat()}"
+                        )
+                    issue_samples[sample_key] = value
+                inspected += len(chunk)
+                _checkpoint_progress(
+                    self.progress_tracker, run_id, "snapshot_series_finalize",
+                    preflight_scope, inspected,
+                )
+                _checkpoint_batch_done(
+                    self.progress_tracker, run_id, "snapshot_series_finalize",
+                    selector.digest, "preflight-batch", chunk,
+                )
+            if issue_count:
+                raise RuntimeError(
+                    "snapshot deep acceptance failed: "
+                    f"issue_groups={issue_count}, samples={issue_samples}"
+                )
+            self.progress_tracker.mark_done(
+                run_id, "snapshot_series_finalize", preflight_scope,
             )
-            _checkpoint_batch_done(
-                self.progress_tracker, run_id, "snapshot_series_finalize",
-                selector.digest, "preflight-batch", chunk,
-            )
-        if issue_count:
-            raise RuntimeError(
-                "snapshot deep acceptance failed: "
-                f"issue_groups={issue_count}, samples={issue_samples}"
-            )
-        self.progress_tracker.mark_done(
-            run_id, "snapshot_series_finalize", preflight_scope,
-        )
 
         pending = report.records_with_statuses({"VALIDATED"})
         frozen = 0
