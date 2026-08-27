@@ -1070,8 +1070,9 @@ class ResearchSnapshotRepository(BaseRepository):
             context, "research.stock_snapshot_daily",
             """SELECT COUNT(*) AS row_count, COUNT(DISTINCT research_date) AS date_count,
                        MIN(research_date) AS min_date, MAX(research_date) AS max_date
-                  FROM research.stock_snapshot_daily WHERE snapshot_id=%s""",
-            (snapshot_id,), scope, 2,
+                  FROM research.stock_snapshot_daily
+                 WHERE snapshot_id=%s AND research_date=%s""",
+            (snapshot_id, cutoff), scope, 2,
         )[0]
         issues = []
         if rows["row_count"] == 0 or rows["date_count"] != 1 or rows["min_date"] != cutoff or rows["max_date"] != cutoff:
@@ -1085,19 +1086,21 @@ class ResearchSnapshotRepository(BaseRepository):
             context, "research.snapshot_lineage",
             """SELECT COUNT(*) AS value FROM (
                 SELECT snapshot_id,research_date,ts_code FROM research.snapshot_lineage
-                 WHERE snapshot_id=%s GROUP BY snapshot_id,research_date,ts_code
-                HAVING COUNT(DISTINCT field_group)<>%s) x""",
-            (snapshot_id, required_lineage_groups), scope, 2,
+                 WHERE snapshot_id=%s AND research_date=%s
+                 GROUP BY snapshot_id,research_date,ts_code
+                 HAVING COUNT(DISTINCT field_group)<>%s) x""",
+            (snapshot_id, cutoff, required_lineage_groups), scope, 2,
         )[0]["value"]
         if missing:
             issues.append({"rows_with_incomplete_lineage": missing})
         incomplete = self.kernel.read._repository_query(
             context, "research.snapshot_lineage",
             """SELECT field_group, COUNT(*) AS value FROM research.snapshot_lineage
-                 WHERE snapshot_id=%s AND source_record_key NOT LIKE '%%:missing'
+                 WHERE snapshot_id=%s AND research_date=%s
+                   AND source_record_key NOT LIKE '%%:missing'
                    AND (source_record_version IS NULL OR source_payload_hash IS NULL)
                  GROUP BY field_group ORDER BY field_group""",
-            (snapshot_id,), scope, 100,
+            (snapshot_id, cutoff), scope, 100,
         )
         if incomplete:
             issues.append({"lineage_refs_without_version_or_hash": [(row["field_group"], row["value"]) for row in incomplete]})
@@ -1141,8 +1144,9 @@ class ResearchSnapshotRepository(BaseRepository):
                     COUNT(*) FILTER (WHERE roe_5y_all_above_15 AND annual_report_count_5y<>5) AS roe,
                     COUNT(*) FILTER (WHERE ocf_3y_all_positive AND ocf_report_count_3y<>3) AS ocf,
                     COUNT(*) FILTER (WHERE q_sales_yoy_4q_all_above_30 AND quarterly_report_count_4q<>4) AS quarterly
-                  FROM research.stock_snapshot_daily WHERE snapshot_id=%s""",
-                (snapshot_id,), scope, 2,
+                  FROM research.stock_snapshot_daily
+                 WHERE snapshot_id=%s AND research_date=%s""",
+                (snapshot_id, cutoff), scope, 2,
             )[0]
             if any(maturity.values()):
                 issues.append({"research_v1_2_maturity_or_pit_failures": tuple(maturity.values())})
