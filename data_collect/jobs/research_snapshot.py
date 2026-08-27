@@ -533,6 +533,14 @@ def inspect_snapshots_batch(
                     {"pit_cutoff": str(exc)}
                 )
 
+        batch_snapshot_issues = repository.check_snapshots_batch(
+            manifests,
+            baseline_value[5],
+            _inputs_for_schema(schema_version),
+            _manifest_hash,
+            len(REQUIRED_LINEAGE_GROUPS),
+            context,
+        )
         for manifest in manifests:
             snapshot_id = str(manifest["snapshot_id"])
             issues: list[dict] = []
@@ -561,15 +569,7 @@ def inspect_snapshots_batch(
                         "current_hash": quality_hash,
                     }
                 })
-            issues.extend(repository.check_snapshot(
-                manifest,
-                baseline_value[5],
-                _inputs_for_schema(schema_version),
-                _row_bytes,
-                _manifest_hash,
-                len(REQUIRED_LINEAGE_GROUPS),
-                context,
-            ))
+            issues.extend(batch_snapshot_issues.get(snapshot_id, []))
             if issues:
                 issues_by_snapshot[snapshot_id] = issues
         return issues_by_snapshot

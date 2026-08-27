@@ -1151,3 +1151,172 @@ class ResearchSnapshotRepository(BaseRepository):
             if any(maturity.values()):
                 issues.append({"research_v1_2_maturity_or_pit_failures": tuple(maturity.values())})
         return issues
+
+    def check_snapshots_batch(
+        self, manifests: list[dict[str, Any]], source_manifest: dict[str, Any],
+        definitions, manifest_hash, required_lineage_groups: int, context: RunContext,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Check a bounded snapshot batch with set-based, date-scoped reads.
+
+        This is deliberately limited to the small inspection batch supplied by
+        the caller.  It removes the per-snapshot query loop from series
+        finalization while retaining the same row, lineage, and input-manifest
+        checks as ``check_snapshot``.
+        """
+        if not manifests:
+            return {}
+        if len(manifests) > 100:
+            raise ValueError("snapshot inspection batches are limited to 100")
+        ids = [str(item["snapshot_id"]) for item in manifests]
+        cutoffs = [item["cutoff"] for item in manifests]
+        scope = WorkScope(
+            date_from=min(cutoffs), date_to=max(cutoffs),
+            partition="snapshot-check-batch",
+        )
+        issues: dict[str, list[dict[str, Any]]] = {}
+
+        def add(snapshot_id: str, issue: dict[str, Any]) -> None:
+            issues.setdefault(snapshot_id, []).append(issue)
+
+        stock_rows = self.kernel.read._repository_query(
+            context, "research.stock_snapshot_daily",
+            """SELECT snapshot_id, research_date, COUNT(*) AS row_count,
+                       COUNT(DISTINCT research_date) AS date_count,
+                       MIN(research_date) AS min_date, MAX(research_date) AS max_date
+                  FROM research.stock_snapshot_daily
+                 WHERE snapshot_id=ANY(%s::uuid[])
+                   AND research_date=ANY(%s::date[])
+                 GROUP BY snapshot_id, research_date""",
+            (ids, cutoffs), scope, max_rows=max(2, len(ids) + 1),
+        )
+        stock_by_id = {str(row["snapshot_id"]): row for row in stock_rows}
+
+        universe_rows = self.kernel.read._repository_query(
+            context, "pit.universe_daily",
+            """SELECT trade_date, COUNT(*) AS value
+                  FROM pit.universe_daily
+                 WHERE trade_date=ANY(%s::date[])
+                 GROUP BY trade_date""",
+            (cutoffs,), scope, max_rows=max(2, len(set(cutoffs)) + 1),
+        )
+        universe_by_date = {row["trade_date"]: row["value"] for row in universe_rows}
+        for manifest in manifests:
+            snapshot_id = str(manifest["snapshot_id"])
+            cutoff = manifest["cutoff"]
+            row = stock_by_id.get(snapshot_id)
+            if row is None or row["row_count"] == 0 or row["date_count"] != 1 \
+                    or row["min_date"] != cutoff or row["max_date"] != cutoff:
+                add(snapshot_id, {
+                    "snapshot_rows": row["row_count"] if row else 0,
+                    "distinct_dates": row["date_count"] if row else 0,
+                    "min_date": row["min_date"] if row else None,
+                    "max_date": row["max_date"] if row else None,
+                })
+            if row is None or row["row_count"] != universe_by_date.get(cutoff, 0):
+                add(snapshot_id, {
+                    "snapshot_universe_row_mismatch": {
+                        "snapshot_rows": row["row_count"] if row else 0,
+                        "universe_rows": universe_by_date.get(cutoff, 0),
+                    }
+                })
+
+        incomplete_lineage = self.kernel.read._repository_query(
+            context, "research.snapshot_lineage",
+            """SELECT snapshot_id, COUNT(*) AS value FROM (
+                    SELECT snapshot_id, research_date, ts_code
+                      FROM research.snapshot_lineage
+                     WHERE snapshot_id=ANY(%s::uuid[])
+                       AND research_date=ANY(%s::date[])
+                     GROUP BY snapshot_id, research_date, ts_code
+                    HAVING COUNT(DISTINCT field_group)<>%s
+                ) x GROUP BY snapshot_id""",
+            (ids, cutoffs, required_lineage_groups), scope,
+            max_rows=max(2, len(ids) + 1),
+        )
+        for row in incomplete_lineage:
+            add(str(row["snapshot_id"]), {"rows_with_incomplete_lineage": row["value"]})
+
+        missing_refs = self.kernel.read._repository_query(
+            context, "research.snapshot_lineage",
+            """SELECT snapshot_id, field_group, COUNT(*) AS value
+                  FROM research.snapshot_lineage
+                 WHERE snapshot_id=ANY(%s::uuid[])
+                   AND research_date=ANY(%s::date[])
+                   AND source_record_key NOT LIKE '%%:missing'
+                   AND (source_record_version IS NULL OR source_payload_hash IS NULL)
+                 GROUP BY snapshot_id, field_group
+                 ORDER BY snapshot_id, field_group""",
+            (ids, cutoffs), scope,
+            max_rows=max(2, len(ids) * required_lineage_groups + 1),
+        )
+        missing_by_id: dict[str, list[tuple[str, Any]]] = {}
+        for row in missing_refs:
+            missing_by_id.setdefault(str(row["snapshot_id"]), []).append(
+                (row["field_group"], row["value"])
+            )
+        for snapshot_id, values in missing_by_id.items():
+            add(snapshot_id, {"lineage_refs_without_version_or_hash": values})
+
+        stored_inputs = self.kernel.read._repository_query(
+            context, "research.snapshot_input",
+            """SELECT snapshot_id, schema_name, table_name, selection_predicate,
+                              selected_columns, hash_algorithm, row_count, min_date,
+                              max_date, content_hash
+                         FROM research.snapshot_input
+                        WHERE snapshot_id=ANY(%s::uuid[])
+                        ORDER BY snapshot_id, schema_name, table_name""",
+            (ids,), scope, max_rows=max(2, len(ids) * len(definitions) + 1),
+        )
+        expected_keys = [(item["schema"], item["table"]) for item in definitions]
+        inputs_by_id: dict[str, list[dict[str, Any]]] = {}
+        for row in stored_inputs:
+            inputs_by_id.setdefault(str(row["snapshot_id"]), []).append(row)
+        for manifest in manifests:
+            snapshot_id = str(manifest["snapshot_id"])
+            rows = inputs_by_id.get(snapshot_id, [])
+            stored_by_key = {(row["schema_name"], row["table_name"]): row for row in rows}
+            if len(rows) != len(definitions) or set(stored_by_key) != set(expected_keys):
+                add(snapshot_id, {
+                    "snapshot_input_manifest_incomplete": {
+                        "expected": expected_keys, "stored": sorted(stored_by_key),
+                    }
+                })
+            else:
+                ordered = [stored_by_key[key] for key in expected_keys]
+                current_hash = manifest_hash(ordered)
+                if current_hash != manifest["input_hash"]:
+                    add(snapshot_id, {
+                        "input_manifest_hash_changed": {
+                            "stored": manifest["input_hash"], "current": current_hash,
+                        }
+                    })
+
+        if manifests[0].get("schema_version") == "research-v1.3":
+            maturity = self.kernel.read._repository_query(
+                context, "research.stock_snapshot_daily",
+                """SELECT snapshot_id,
+                    COUNT(*) FILTER (WHERE ma20 IS NOT NULL AND COALESCE(ma20_observation_count,0)<20) AS ma20,
+                    COUNT(*) FILTER (WHERE ma60 IS NOT NULL AND COALESCE(ma60_observation_count,0)<60) AS ma60,
+                    COUNT(*) FILTER (WHERE ma120 IS NOT NULL AND COALESCE(ma120_observation_count,0)<120) AS ma120,
+                    COUNT(*) FILTER (WHERE pe_pct_5y IS NOT NULL AND (NOT COALESCE(has_full_pe_5y_history,FALSE) OR COALESCE(valuation_observation_count,0)<1000 OR pe_window_start_date_5y IS NULL OR research_date-pe_window_start_date_5y<1794)) AS pe,
+                    COUNT(*) FILTER (WHERE financial_version_available_date>research_date) AS financial_date,
+                    COUNT(*) FILTER (WHERE financial_vintage_quality='WAREHOUSE_OBSERVED_ONLY' AND financial_source_observed_at::date>research_date) AS financial_observed,
+                    COUNT(*) FILTER (WHERE instrument_source_record_key IS NULL OR instrument_source_record_version IS NULL OR instrument_source_payload_hash IS NULL) AS instrument,
+                    COUNT(*) FILTER (WHERE roe_5y_all_above_15 AND annual_report_count_5y<>5) AS roe,
+                    COUNT(*) FILTER (WHERE ocf_3y_all_positive AND ocf_report_count_3y<>3) AS ocf,
+                    COUNT(*) FILTER (WHERE q_sales_yoy_4q_all_above_30 AND quarterly_report_count_4q<>4) AS quarterly
+                  FROM research.stock_snapshot_daily
+                 WHERE snapshot_id=ANY(%s::uuid[]) AND research_date=ANY(%s::date[])
+                 GROUP BY snapshot_id""",
+                (ids, cutoffs), scope, max_rows=max(2, len(ids) + 1),
+            )
+            for row in maturity:
+                values = tuple(row[key] for key in (
+                    "ma20", "ma60", "ma120", "pe", "financial_date",
+                    "financial_observed", "instrument", "roe", "ocf", "quarterly",
+                ))
+                if any(values):
+                    add(str(row["snapshot_id"]), {
+                        "research_v1_2_maturity_or_pit_failures": values,
+                    })
+        return issues
