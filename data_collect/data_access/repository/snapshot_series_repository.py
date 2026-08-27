@@ -164,3 +164,37 @@ class SnapshotSeriesRepository(BaseRepository):
         return self.kernel.write.fail_building_snapshots(
             context=context, scope=scope, snapshot_ids=ids, reason=reason,
         )
+
+    def reopen_validated_snapshots(
+        self, snapshot_ids: Iterable[str], reason: str, context: RunContext,
+    ) -> int:
+        """Explicitly reopen selected VALIDATED snapshots for clean rebuild.
+
+        This is reserved for an operator-authorized repair such as replacing
+        a snapshot built from a dirty worktree.  It never touches FROZEN rows;
+        callers must pass an explicit id list while holding the series lock.
+        """
+        ids = tuple(str(value) for value in snapshot_ids)
+        if not ids:
+            return 0
+        if not reason.strip():
+            raise ValueError("reopen reason must not be blank")
+        scope = WorkScope(
+            partition="snapshot:series-reopen",
+            dimensions={"snapshot_ids": ids},
+        )
+        changed = self.kernel.write.transition_snapshot_manifests(
+            context=context,
+            scope=scope,
+            rows=[
+                {"snapshot_id": snapshot_id, "failure_reason": reason[:2000]}
+                for snapshot_id in ids
+            ],
+            from_statuses=("VALIDATED",),
+            to_status="FAILED",
+        )
+        if changed != len(ids):
+            raise RuntimeError(
+                f"reopen VALIDATED Snapshot 数量不一致：期望 {len(ids)}，实际 {changed}"
+            )
+        return changed
