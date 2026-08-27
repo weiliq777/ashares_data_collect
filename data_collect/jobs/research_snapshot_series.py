@@ -20,6 +20,7 @@ from data_collect.jobs.research_snapshot import (
     _quality_report,
     validate_snapshots_batch,
     freeze_snapshots_batch,
+    _inputs_for_schema,
 )
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
@@ -109,6 +110,21 @@ def existing_snapshots_batch(
         kernel.close()
 
 
+def incomplete_building_snapshots(
+    snapshot_ids: Iterable[str], expected_input_count: int,
+) -> tuple[str, ...]:
+    ids = tuple(str(value) for value in snapshot_ids)
+    if not ids:
+        return ()
+    kernel, repository, context = _service("incomplete-builds")
+    try:
+        return repository.incomplete_building_snapshots(
+            ids, expected_input_count, context,
+        )
+    finally:
+        kernel.close()
+
+
 def reset_building_snapshots(snapshot_ids: Iterable[str], reason: str) -> None:
     """Move stale BUILDING snapshots to FAILED so their children are rebuilt."""
     ids = tuple(str(value) for value in snapshot_ids)
@@ -182,6 +198,26 @@ def create_snapshot_series(
             status = "DRAFT"
         snapshots[cutoff.isoformat()] = snapshot_id
         statuses[cutoff.isoformat()] = status
+
+    # BUILDING is normally resumable, but an interrupted build may have
+    # committed child rows before snapshot_input.  Detect that state once and
+    # route it through the normal FAILED -> rebuild path.
+    building_ids = [
+        snapshot_id for cutoff in dates
+        if statuses[cutoff.isoformat()] == "BUILDING"
+        for snapshot_id in (snapshots[cutoff.isoformat()],)
+    ]
+    incomplete_ids = set(incomplete_building_snapshots(
+        building_ids, len(_inputs_for_schema(schema_version)),
+    ))
+    if incomplete_ids:
+        reset_building_snapshots(
+            incomplete_ids,
+            "构建完整性检查失败：Snapshot 输入清单不完整，必须重新构建",
+        )
+        for cutoff in dates:
+            if snapshots[cutoff.isoformat()] in incomplete_ids:
+                statuses[cutoff.isoformat()] = "FAILED"
 
     # Create all missing manifests in one batch; each date remains an
     # independent immutable Snapshot and can still be resumed by date.

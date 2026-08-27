@@ -1,4 +1,5 @@
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +8,7 @@ from data_collect.jobs.research_snapshot_series import (
     normalize_cutoff_dates,
     validate_cutoff_dates_are_open,
 )
+from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
 
 
 def test_snapshot_series_dates_are_sorted_and_unique():
@@ -39,3 +41,26 @@ def test_snapshot_series_rejects_explicit_closed_cutoff(monkeypatch):
     )
     with pytest.raises(ValueError, match="开市日"):
         validate_cutoff_dates_are_open(["2026-01-03"])
+
+
+def test_snapshot_series_detects_partial_build_before_validation():
+    calls = []
+    repository = SnapshotSeriesRepository.__new__(SnapshotSeriesRepository)
+
+    def fake_query(context, source, sql, params, scope, max_rows):
+        calls.append((source, sql, params, max_rows))
+        return [{"snapshot_id": "partial-id"}]
+
+    repository.kernel = SimpleNamespace(
+        read=SimpleNamespace(_repository_query=fake_query),
+    )
+    result = repository.incomplete_building_snapshots(
+        ["partial-id", "complete-id"], 10, "context"
+    )
+
+    assert result == ("partial-id",)
+    assert calls[0][0] == "research.snapshot_manifest"
+    assert calls[0][2] == (
+        ["partial-id", "complete-id"], ["partial-id", "complete-id"], 10
+    )
+    assert calls[0][3] == 2

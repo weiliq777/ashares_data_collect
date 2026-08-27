@@ -73,6 +73,44 @@ class SnapshotSeriesRepository(BaseRepository):
         )
         return {row["research_cutoff_date"]: (str(row["snapshot_id"]), row["status"]) for row in rows}
 
+    def incomplete_building_snapshots(
+        self,
+        snapshot_ids: Iterable[str],
+        expected_input_count: int,
+        context: RunContext,
+    ) -> tuple[str, ...]:
+        """Find resumable manifests whose build committed only partially.
+
+        A process can stop after child writes commit but before the input
+        manifest is persisted.  Such a row must be rebuilt, not sent directly
+        to validation.  The check is scoped to the target ids and reads the
+        small snapshot_input index rather than joining the large child tables.
+        """
+        ids = tuple(str(value) for value in snapshot_ids)
+        if not ids:
+            return ()
+        if expected_input_count <= 0:
+            raise ValueError("expected_input_count must be positive")
+        rows = self.kernel.read._repository_query(
+            context,
+            "research.snapshot_manifest",
+            """SELECT m.snapshot_id
+                 FROM research.snapshot_manifest m
+                 LEFT JOIN (
+                    SELECT snapshot_id, COUNT(*) AS input_count
+                      FROM research.snapshot_input
+                     WHERE snapshot_id=ANY(%s::uuid[])
+                     GROUP BY snapshot_id
+                 ) i ON i.snapshot_id=m.snapshot_id
+                WHERE m.snapshot_id=ANY(%s::uuid[])
+                  AND m.status='BUILDING'
+                  AND COALESCE(i.input_count,0)<>%s""",
+            (list(ids), list(ids), expected_input_count),
+            WorkScope(partition="snapshot:incomplete-builds"),
+            max_rows=len(ids),
+        )
+        return tuple(str(row["snapshot_id"]) for row in rows)
+
     def reset_building(self, snapshot_ids: Iterable[str], reason: str, context: RunContext) -> int:
         ids = tuple(str(value) for value in snapshot_ids)
         if not ids:
