@@ -22,9 +22,9 @@ _IMMUTABLE_INPUT_STATS_CACHE: dict[tuple, dict[str, Any]] = {}
 class ResearchSnapshotRepository(BaseRepository):
     # Snapshot SQL is set-based, but one code batch must also remain below the
     # governed 30-second statement deadline on the oldest/highest-cost dates.
-    # 500 codes keeps lineage batches bounded while avoiding the timeout seen
-    # with 1,000-code stock INSERT ... SELECT statements.
-    SNAPSHOT_CODE_BATCH_SIZE = 500
+    # 100 codes keeps each stock/lineage INSERT ... SELECT below the governed
+    # 30-second statement deadline even on the oldest, most expensive dates.
+    SNAPSHOT_CODE_BATCH_SIZE = 100
     INPUT_STATS_BATCH_ROWS = 2_000
     # Input-manifest hashing must remain row-wise, but a single named cursor
     # over a wide historical feature table can still spend the whole statement

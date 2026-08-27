@@ -105,7 +105,7 @@ def test_snapshot_code_batches_stay_below_statement_deadline_budget():
     source = __import__("pathlib").Path(
         "data_collect/data_access/repository/research_snapshot_repository.py"
     ).read_text(encoding="utf-8")
-    assert "SNAPSHOT_CODE_BATCH_SIZE = 500" in source
+    assert "SNAPSHOT_CODE_BATCH_SIZE = 100" in source
 
 
 def test_snapshot_validation_reuses_persisted_input_evidence():
