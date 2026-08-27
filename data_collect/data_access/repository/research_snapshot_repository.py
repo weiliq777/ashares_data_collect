@@ -746,6 +746,13 @@ class ResearchSnapshotRepository(BaseRepository):
 
     def freeze_snapshot(self, manifest: dict[str, Any], metadata: dict[str, Any],
                         archive: dict[str, Any], context: RunContext) -> None:
+        """Freeze without overwriting the code identity captured at build.
+
+        ``metadata`` describes the operational freezer, not the code that
+        materialized the snapshot.  The current schema has only one code
+        identity slot, so replacing it here would destroy build lineage.
+        """
+        _ = metadata
         snapshot_id = str(manifest["snapshot_id"])
         scope = self._snapshot_scope(snapshot_id, manifest["cutoff"])
         changed = self.kernel.write.transition_snapshot_manifest(
@@ -754,8 +761,6 @@ class ResearchSnapshotRepository(BaseRepository):
                 "code_archive_path": archive.get("path"),
                 "code_archive_sha256": archive.get("sha256"),
                 "code_archive_size_bytes": archive.get("size"),
-                "code_version": metadata["code_version"], "git_commit": metadata["commit"],
-                "git_dirty": metadata["dirty"], "diff_hash": metadata["diff_hash"],
             },
         )
         if changed != 1:

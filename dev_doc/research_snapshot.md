@@ -191,3 +191,65 @@ Snapshot 基础代码此前生成过三份 `research-v1.1` FROZEN 日快照（20
 实现默认版本已升级为 `research-v1.3`，并启用成熟度/PIT 检查、时点价格 Feature 及 Snapshot 输入边界锁。数据库当前没有 FROZEN `research-v1.3` 快照；已有 `research-v1.1` 记录为历史数据：690 条 FROZEN、1 条 DRAFT，`2021-08-02` 至 `2026-08-03` 的 SSE 开市日缺少 522 个，且 FROZEN 记录存在 dirty 代码/基线哈希缺口。它们只读保留，不能作为当前 Backtest Dataset v2 的正式输入。正式生产必须在干净代码版本上重新生成 `research-v1.3` 系列。
 
 当前 `baseline_20260803` 的数据库记录虽然为 `validated`，但 `source_manifest_hash/source_manifest` 为空；现行代码会在 Snapshot 创建前拒绝该基线。这是保护性门禁，不应通过手工填空值绕过；必须在 Raw/Standard/PIT/Feature 稳定后发布带完整 Source Manifest 的新基线。
+
+## 快照序列自动验收、续跑与冻结
+
+统一入口为 `data_collect.jobs.research_snapshot_series_ops`。该入口复用现有
+`ops.data_access_checkpoint`，不要求新增数据库迁移。
+
+后台历史构建运行期间只允许执行 `monitor`。它只读取 `std.trading_calendar` 和
+`research.snapshot_manifest` 两个小范围索引切片，不扫描股票快照、血缘或上游大表：
+
+```powershell
+.\.venv\Scripts\python.exe -m data_collect.jobs.research_snapshot_series_ops monitor `
+  --start-date 2021-08-02 `
+  --end-date 2026-08-07 `
+  --baseline-tag foundation_v2_20260807 `
+  --schema-version research-v2.0 `
+  --expected-snapshots 1216 `
+  --mode progress
+```
+
+历史进程确认结束后，续跑器先校验已有 `BUILDING`，再对 `DRAFT/FAILED` 执行小批次
+`build → validate`，每批完成后写 checkpoint。该命令不提供 `--rebuild-building`，不会把
+`BUILDING` 自动改回 `FAILED`：
+
+批量校验只会把存在确定性质量、PIT、行数或血缘问题的 Snapshot 标记为 `FAILED`；数据库
+超时、连接中断或锁获取失败会保留原 `BUILDING` 状态，避免把基础设施瞬时故障误判成需要
+重建的数据错误。checkpoint 以每个批次的日期和 Snapshot ID 摘要为独立 scope，数据库状态
+仍是续跑事实来源。
+
+```powershell
+.\.venv\Scripts\python.exe -m data_collect.jobs.research_snapshot_series_ops resume `
+  --start-date 2021-08-02 `
+  --end-date 2026-08-07 `
+  --baseline-tag foundation_v2_20260807 `
+  --schema-version research-v2.0 `
+  --expected-snapshots 1216 `
+  --batch-size 2
+```
+
+收口器只有在日期完整且全部处于 `VALIDATED/FROZEN` 时才能启动。首次运行必须全部为
+`VALIDATED`；中断续跑只接受按日期连续的 `FROZEN` 前缀。它先按小批次完成全系列行数、
+输入 Manifest 哈希、血缘、PIT 和质量证据检查，在任何冻结写入前收齐全部验收结果；随后
+每批冻结前再次复检，避免 `VALIDATED` 子表在全局预检后发生变化：
+
+```powershell
+.\.venv\Scripts\python.exe -m data_collect.jobs.research_snapshot_series_ops finalize `
+  --start-date 2021-08-02 `
+  --end-date 2026-08-07 `
+  --baseline-tag foundation_v2_20260807 `
+  --schema-version research-v2.0 `
+  --expected-snapshots 1216 `
+  --batch-size 10 `
+  --code-archive-path <code-archive.zip>
+```
+
+`resume` 和 `finalize` 共用同一个序列级 PostgreSQL advisory lock，防止两个新操作入口
+并发执行。旧版 `research_snapshot_series` 未持有该锁，因此仍必须先从操作系统和任务日志
+确认旧历史进程已经退出；不得仅凭 BUILDING 时间较久就自动接管。
+
+冻结状态迁移只写归档路径、归档哈希和归档大小，不覆盖 build 阶段已经写入 Manifest 的
+`code_version/git_commit/git_dirty/diff_hash`。若任何待冻结 Snapshot 是 dirty build，必须
+提供对应代码归档；归档文件只在 Finalize 启动时计算一次 SHA-256，后续批次复用该证据，
+避免对同一大文件重复读取数百次。
