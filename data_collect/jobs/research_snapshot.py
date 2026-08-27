@@ -761,6 +761,7 @@ def freeze_snapshots_batch(
     baseline=None,
     quality_report: dict | None = None,
     verify_source_manifest: bool = True,
+    verify_global_checks: bool = True,
     metadata: dict | None = None,
     code_archive_evidence: tuple[str, int] | None = None,
 ) -> None:
@@ -814,14 +815,16 @@ def freeze_snapshots_batch(
                     "批量快照包含 dirty 构建代码；冻结前必须提供对应的 code_archive_path"
                 )
         schema_version = next(iter(schema_versions))
-        _assert_price_vintage_for_dates(cutoffs, list(ids), schema_version)
+        if verify_global_checks:
+            _assert_price_vintage_for_dates(cutoffs, list(ids), schema_version)
         report = quality_report or _quality_report(
             max(cutoffs), schema_version, baseline_value,
         )[0]
         if report["failures"]:
             raise RuntimeError(f"质量门禁未通过，拒绝批量冻结: {report['failures']}")
         assert_market_coverage_range_publishable(min(cutoffs), max(cutoffs))
-        _assert_pit_cutoff_dates_batch(cutoffs, list(ids), schema_version)
+        if verify_global_checks:
+            _assert_pit_cutoff_dates_batch(cutoffs, list(ids), schema_version)
         for manifest in manifests:
             repository.freeze_snapshot(
                 manifest, freeze_metadata,

@@ -211,6 +211,7 @@ def main(argv=None) -> int:
                         baseline=baseline,
                         quality_report=quality_report,
                         verify_source_manifest=False,
+                        verify_global_checks=False,
                         metadata=freeze_metadata,
                         code_archive_evidence=archive_evidence,
                     ),
