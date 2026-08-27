@@ -54,7 +54,7 @@ def _run_lock(mode: str):
 def assert_migration_applied() -> None:
     required = {
         ("std", "financial_income_standard", "net_profit_consolidated"),
-        ("public", "valuation_daily", "dv_ttm_vendor"),
+        ("std", "valuation_daily", "dv_ttm_vendor"),
         ("feature", "valuation_daily_v1", "dv_ttm_percentile_5y"),
         ("feature", "company_financial_v2", "feature_contract_version"),
         ("ops", "foundation_rebuild_run", "run_id"),
