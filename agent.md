@@ -253,3 +253,5 @@ uv run python tools/run_pipeline_once.py `
 同日财务修订规则：同一业务键和同一公告日出现不同 payload 时，Standard（标准层）写入 `quality_status='WARNING'`；`version_available_date`/`data_available_timestamp` 保留业务可见边界，PIT（时点层）使用 `record_version DESC` 二级仲裁，不能用 `fetched_at`（仓库抓取时间）伪造官方公告时刻。
 
 并发规则：财务 Standard/PIT/Feature（标准层/时点层/特征层）转换、财务增量、财务迁移和基础重建统一持有 `warehouse-write/foundation-rebuild`（仓库写入排他锁）；新增财务写任务不得自建互不相交的锁名。
+
+分阶段重建规则（2026-08-28）：修复某一层时，启动前必须核对影响层级、输入输出表、代码版本和 checkpoint（检查点）范围；已验证且输入未变化的上游层不得因代码版本变化被无条件从头重跑。应按阶段复用已验证结果（例如 `--reuse-standard`），只有上游逻辑或数据确实受影响时才重建；先做任务范围、检查点和资源预检，避免无意义的大数据量重跑。
