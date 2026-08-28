@@ -294,6 +294,42 @@ class WriteGateway:
         self._kernel._checkpoint_done(context.run_id, context.job_name, scope_key)
         return total
 
+    def invalidate_foundation_checkpoints(
+        self, context: RunContext, scope: WorkScope, run_id: str, error: str,
+    ) -> int:
+        """Reset one foundation run's checkpoints in a bounded set-based write.
+
+        Resume invalidation is itself a framework operation.  Updating each
+        checkpoint through a separate upsert creates thousands of tiny
+        transactions and can take longer than the rebuild.  The run lock
+        makes this scoped update exclusive; the checkpoint table's row budget
+        keeps it below the normal transaction ceiling.
+        """
+        if not run_id or not error:
+            raise ValueError("run_id and error are required")
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="ops.foundation_rebuild_checkpoint",
+            scope=scope,
+            expected_mode="SET_BASED",
+            estimated_rows=self._kernel.transaction_manager.config.max_rows_per_tx,
+        )
+        self._kernel.query_guard.check(plan)
+
+        def invalidate() -> int:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE ops.foundation_rebuild_checkpoint
+                          SET status='PENDING', error_message=%s,
+                              updated_at=CURRENT_TIMESTAMP
+                        WHERE run_id=%s AND status<>'PENDING'""",
+                    (error, run_id),
+                )
+                return int(cur.rowcount or 0)
+
+        return self._kernel._run_chunk(invalidate)
+
     def commit_release_validation(
         self, context: RunContext, scope: WorkScope, result: Mapping[str, Any],
     ) -> int:

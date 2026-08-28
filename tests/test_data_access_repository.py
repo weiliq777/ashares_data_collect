@@ -226,6 +226,29 @@ def test_financial_event_reads_are_split_into_policy_bounded_code_batches():
     ).getsource(FinancialRepository.load_events)
 
 
+def test_foundation_checkpoint_invalidation_is_one_set_based_write():
+    from data_collect.data_access.repository.financial_repository import FinancialRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = FinancialRepository(kernel)
+    repository.kernel.write.invalidate_foundation_checkpoints(
+        ctx(),
+        WorkScope(partition="foundation-run:run-1", dimensions={"run_id": "run-1"}),
+        "run-1",
+        "invalidated: code identity changed",
+    )
+    updates = [
+        entry for entry in conn.executed
+        if entry["kind"] == "execute" and "UPDATE ops.foundation_rebuild_checkpoint" in entry["sql"]
+    ]
+    assert len(updates) == 1
+    assert "status='PENDING'" in updates[0]["sql"]
+    assert conn.committed == 1
+
+
 def test_financial_feature_jsonb_is_encoded_at_repository_boundary():
     from data_collect.data_access.repository.financial_repository import FinancialRepository
 

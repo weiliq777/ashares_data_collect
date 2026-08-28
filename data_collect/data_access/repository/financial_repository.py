@@ -691,16 +691,12 @@ class FinancialRepository(BaseRepository):
             raise RuntimeError(f"run is not resumable: {run_id} ({row.get('status')})")
         changed = row.get("git_commit") != metadata.get("commit") or row.get("diff_hash") != metadata.get("diff_hash")
         if changed:
-            checkpoints = self.kernel.read.query(
-                context=context, source="ops.foundation_rebuild_checkpoint",
-                columns=["run_id", "stage", "partition_key"],
-                where={"run_id__eq": run_id},
+            self.kernel.write.invalidate_foundation_checkpoints(
+                context=context,
+                scope=WorkScope(partition=f"foundation-run:{run_id}", dimensions={"run_id": run_id}),
+                run_id=run_id,
+                error="invalidated: code identity changed",
             )
-            for checkpoint in checkpoints:
-                self.save_checkpoint(
-                    run_id, checkpoint[1], checkpoint[2], "PENDING", context,
-                    error="invalidated: code identity changed",
-                )
         resume_row = {
             "run_id": run_id,
             "contract_version": row["contract_version"],
