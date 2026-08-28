@@ -36,6 +36,13 @@ def test_pipeline_entrypoint_exposes_dry_run():
     assert 'base_kwargs["dry_run"] = True' in source
 
 
+def test_foundation_pipeline_can_reuse_existing_standard_layer():
+    source = (ROOT / "data_collect/jobs/tushare_foundation_pipeline.py").read_text(encoding="utf-8")
+    assert 'parser.add_argument(\n        "--reuse-standard"' in source
+    assert "if not reuse_standard:" in source
+    assert '"reuse_standard": reuse_standard' in source
+
+
 def test_quality_gate_has_window_indexes_for_status_counts():
     sql = (ROOT / "sql/061_quality_gate_window_indexes.sql").read_text(encoding="utf-8")
     assert sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 5

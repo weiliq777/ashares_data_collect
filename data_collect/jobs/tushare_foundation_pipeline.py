@@ -198,7 +198,12 @@ def run_smoke(output_end: date | None = None) -> dict:
             raise
 
 
-def run_production_derived(output_end: date | None = None, batch_stocks: int = DEFAULT_FEATURE_BATCH_STOCKS, run_id: str | None = None) -> dict:
+def run_production_derived(
+    output_end: date | None = None,
+    batch_stocks: int = DEFAULT_FEATURE_BATCH_STOCKS,
+    run_id: str | None = None,
+    reuse_standard: bool = False,
+) -> dict:
     assert_migration_applied()
     output_end = output_end or latest_completed_trade_date()
     kernel, repository, context = _pipeline_access(run_id)
@@ -210,10 +215,23 @@ def run_production_derived(output_end: date | None = None, batch_stocks: int = D
         if run_id:
             resume_run(run_id, "PRODUCTION", output_end)
         else:
-            run_id = create_run("PRODUCTION", WARMUP_START, OUTPUT_START, output_end, {"batch_stocks": batch_stocks})
+            run_id = create_run(
+                "PRODUCTION", WARMUP_START, OUTPUT_START, output_end,
+                {"batch_stocks": batch_stocks, "reuse_standard": reuse_standard},
+            )
         try:
-            standard = [_standard_partition(run_id, codes[offset:offset + batch_stocks], output_end) for offset in range(0, len(codes), batch_stocks)]
-            valuation_standard = _valuation_standard_partitions(run_id, WARMUP_START, output_end)
+            standard = []
+            valuation_standard = []
+            if not reuse_standard:
+                standard = [
+                    _standard_partition(
+                        run_id, codes[offset:offset + batch_stocks], output_end,
+                    )
+                    for offset in range(0, len(codes), batch_stocks)
+                ]
+                valuation_standard = _valuation_standard_partitions(
+                    run_id, WARMUP_START, output_end,
+                )
             warmup = rebuild_company_financial_v2(None, WARMUP_START, WARMUP_START, OUTPUT_START - timedelta(days=1), target_table="feature.company_financial_v2", batch_stocks=batch_stocks)
             company = rebuild_company_financial_v2(run_id, WARMUP_START, OUTPUT_START, output_end, target_table="feature.company_financial_v2", batch_stocks=batch_stocks)
             valuation = rebuild_valuation_features(run_id, WARMUP_START, OUTPUT_START, output_end, target_table="feature.valuation_daily_v1")
@@ -233,9 +251,15 @@ def main():
     parser.add_argument("--output-end")
     parser.add_argument("--batch-stocks", type=int, default=DEFAULT_FEATURE_BATCH_STOCKS)
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--reuse-standard", action="store_true",
+        help="reuse the existing validated Standard layer and rebuild only Feature/quality stages",
+    )
     args = parser.parse_args()
     end = date.fromisoformat(args.output_end) if args.output_end else None
-    result = run_smoke(end) if args.mode == "smoke" else run_production_derived(end, args.batch_stocks, args.run_id)
+    result = run_smoke(end) if args.mode == "smoke" else run_production_derived(
+        end, args.batch_stocks, args.run_id, args.reuse_standard,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
