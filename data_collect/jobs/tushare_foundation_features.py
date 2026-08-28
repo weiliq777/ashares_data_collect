@@ -813,11 +813,11 @@ def rebuild_valuation_features(
     kernel, repository, context = _financial_access(run_id)
     codes = repository.valuation_codes(
         warmup_start, output_end, context, requested_codes,
-        # A scoped daily publication is freshness-checked through
-        # output_end.  Select only securities with a source observation on
-        # that end date; earlier observations remain available as warmup
-        # input for the rolling calculations.
-        selection_start=output_end,
+        # Select every security with at least one source observation in the
+        # output interval.  Selecting only rows on output_end would silently
+        # drop securities that stopped trading during the interval, leaving
+        # valid Standard rows without a corresponding Feature row.
+        selection_start=output_start,
     )
     total = completed = 0
     total_codes = len(codes)

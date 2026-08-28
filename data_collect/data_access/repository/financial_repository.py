@@ -313,15 +313,27 @@ class FinancialRepository(BaseRepository):
     def stock_codes(
         self, start: date, end: date, context: RunContext, requested: Iterable[str] | None = None
     ) -> list[str]:
-        where: dict[str, Any] = {"report_date__gte": start, "report_date__lte": end}
-        if requested:
-            where["stock_code__in"] = list(requested)
         scope = WorkScope(date_from=start, date_to=end, codes=tuple(requested or ()))
-        rows = self.kernel.read.query(
-            context=context, source="std.financial_income_standard", columns=["stock_code"],
-            where=where, scope=scope,
+        requested_codes = tuple(requested or ())
+        code_filter = " AND stock_code=ANY(%s)" if requested_codes else ""
+        params: list[Any] = [start, end]
+        if requested_codes:
+            params.append(list(requested_codes))
+        rows = self.kernel.read._repository_query(
+            context=context,
+            source="std.financial_income_standard",
+            sql=(
+                "SELECT DISTINCT stock_code FROM std.financial_income_standard "
+                "WHERE report_date BETWEEN %s AND %s" + code_filter +
+                " ORDER BY stock_code"
+            ),
+            params=params,
+            scope=scope,
+            max_rows=self.kernel.policy_registry.require(
+                "std.financial_income_standard"
+            ).max_read_rows,
         )
-        return sorted({str(row[0]) for row in rows})
+        return [str(row["stock_code"]) for row in rows]
 
     def publish_feature_partition(
         self,

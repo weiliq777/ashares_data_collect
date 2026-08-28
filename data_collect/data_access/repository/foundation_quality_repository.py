@@ -19,6 +19,97 @@ class FoundationQualityRepository(BaseRepository):
             raise ValueError(f"invalid qualified table: {value}")
         return value
 
+    def _valuation_coverage_checks(
+        self,
+        start_date: date,
+        end_date: date,
+        context: RunContext,
+        scope: WorkScope,
+        valuation: str,
+        codes: list[str] | None,
+    ) -> tuple[int, int]:
+        """Return exact (missing, extra) valuation rows without a wide anti-join.
+
+        A full-range anti-join between the mutable feature table and the
+        partitioned standard table forces PostgreSQL to sort millions of keys.
+        First compare per-trading-day row counts plus an ordered code
+        fingerprint.  Only dates whose fingerprint differs are checked with
+        exact anti-joins.  The fingerprint is therefore only a pre-filter; it
+        never replaces the exact check on a suspect date.
+        """
+        code_feature = " AND ts_code=ANY(%s)" if codes else ""
+        code_standard = " AND stock_code=ANY(%s)" if codes else ""
+        suffix = [codes] if codes else []
+        summary_sql = f"""
+            WITH feature_by_date AS (
+                SELECT trade_date, COUNT(*)::bigint AS row_count,
+                       md5(COALESCE(string_agg(ts_code, ',' ORDER BY ts_code), '')) AS code_hash
+                  FROM {valuation}
+                 WHERE trade_date BETWEEN %s AND %s{code_feature}
+                 GROUP BY trade_date
+            ), standard_by_date AS (
+                SELECT trade_date, COUNT(*)::bigint AS row_count,
+                       md5(COALESCE(string_agg(stock_code, ',' ORDER BY stock_code), '')) AS code_hash
+                  FROM std.valuation_daily
+                 WHERE trade_date BETWEEN %s AND %s
+                   AND source='tushare'{code_standard}
+                 GROUP BY trade_date
+            )
+            SELECT COALESCE(f.trade_date, s.trade_date) AS trade_date
+              FROM feature_by_date f
+              FULL OUTER JOIN standard_by_date s USING (trade_date)
+             WHERE f.row_count IS DISTINCT FROM s.row_count
+                OR f.code_hash IS DISTINCT FROM s.code_hash
+             ORDER BY 1
+        """
+        # Keep each aggregate well below the 30-second statement budget.  A
+        # 180-day quality window is still used by the caller, but the coverage
+        # pre-filter is split into bounded 60-day database reads.
+        suspect_rows = []
+        summary_start = start_date
+        while summary_start <= end_date:
+            summary_end = min(end_date, summary_start + timedelta(days=59))
+            params = [summary_start, summary_end, *suffix, summary_start, summary_end, *suffix]
+            suspect_rows.extend(self.kernel.read._repository_query(
+                context, valuation, summary_sql, params=params, scope=scope, max_rows=128,
+            ))
+            summary_start = summary_end + timedelta(days=1)
+        if not suspect_rows:
+            return 0, 0
+
+        missing = 0
+        extra = 0
+        for row in suspect_rows:
+            suspect_date = row["trade_date"]
+            missing_sql = f"""
+                SELECT COUNT(*) AS value
+                  FROM std.valuation_daily s
+                 WHERE s.trade_date=%s AND s.source='tushare'{code_standard}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {valuation} v
+                        WHERE v.ts_code=s.stock_code AND v.trade_date=s.trade_date{code_feature})
+            """
+            missing_params = [suspect_date, *suffix, *suffix]
+            missing += int(self.kernel.read._repository_query(
+                context, "std.valuation_daily", missing_sql,
+                params=missing_params, scope=scope, max_rows=2,
+            )[0]["value"] or 0)
+            extra_sql = f"""
+                SELECT COUNT(*) AS value
+                  FROM {valuation} v
+                 WHERE v.trade_date=%s{code_feature}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM std.valuation_daily s
+                        WHERE s.trade_date=v.trade_date
+                          AND s.stock_code=v.ts_code AND s.source='tushare'{code_standard})
+            """
+            extra_params = [suspect_date, *suffix, *suffix]
+            extra += int(self.kernel.read._repository_query(
+                context, valuation, extra_sql,
+                params=extra_params, scope=scope, max_rows=2,
+            )[0]["value"] or 0)
+        return missing, extra
+
     def inspect_foundation_v2(
         self,
         start_date: date,
@@ -180,22 +271,6 @@ class FoundationQualityRepository(BaseRepository):
                 f"SELECT COUNT(*) AS value FROM {valuation} WHERE trade_date BETWEEN %s AND %s" + code_valuation,
                 [start_date, end_date, *suffix],
             ),
-            "valuation_missing_rows": (
-                valuation,
-                f"""SELECT COUNT(*) AS value FROM std.valuation_daily s WHERE s.trade_date BETWEEN %s AND %s
-                   AND s.source='tushare' {code_standard}
-                   AND NOT EXISTS (SELECT 1 FROM {valuation} v WHERE v.ts_code=s.stock_code AND v.trade_date=s.trade_date)""",
-                [start_date, end_date, *suffix],
-            ),
-            "valuation_extra_rows": (
-                valuation,
-                f"""SELECT COUNT(*) AS value FROM {valuation} v WHERE v.trade_date BETWEEN %s AND %s {code_valuation}
-                   AND NOT EXISTS (SELECT 1 FROM std.valuation_daily s
-                                    WHERE s.trade_date BETWEEN %s AND %s
-                                      AND s.stock_code=v.ts_code AND s.trade_date=v.trade_date
-                                      AND s.source='tushare')""",
-                [start_date, end_date, *suffix, start_date, end_date],
-            ),
             "valuation_contract_mismatch": (
                 valuation,
                 f"SELECT COUNT(*) AS value FROM {valuation} WHERE trade_date BETWEEN %s AND %s AND feature_contract_version<>'feature-contract-v2.0'" + code_valuation,
@@ -218,6 +293,11 @@ class FoundationQualityRepository(BaseRepository):
         report = {"scope": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat(), "codes": codes or "ALL"}, "checks": {}, "failures": {}}
         for name, (source, sql, params) in checks.items():
             report["checks"][name] = int(self.kernel.read._repository_query(context, source, sql, params=params, scope=scope, max_rows=2)[0]["value"] or 0)
+        valuation_missing, valuation_extra = self._valuation_coverage_checks(
+            start_date, end_date, context, scope, valuation, codes,
+        )
+        report["checks"]["valuation_missing_rows"] = valuation_missing
+        report["checks"]["valuation_extra_rows"] = valuation_extra
         zero_required = {
             "income_mapping_mismatch", "cashflow_mapping_mismatch", "indicator_future_comp_type_link",
             "company_missing_report_periods", "company_contract_mismatch", "invalid_complete_ttm",
