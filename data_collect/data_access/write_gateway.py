@@ -296,6 +296,7 @@ class WriteGateway:
 
     def invalidate_foundation_checkpoints(
         self, context: RunContext, scope: WorkScope, run_id: str, error: str,
+        stages: Sequence[str] | None = None,
     ) -> int:
         """Reset one foundation run's checkpoints in a bounded set-based write.
 
@@ -316,16 +317,23 @@ class WriteGateway:
         )
         self._kernel.query_guard.check(plan)
 
+        if stages is not None:
+            stages = tuple(dict.fromkeys(str(stage) for stage in stages if str(stage)))
+            if not stages:
+                return 0
+
         def invalidate() -> int:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE ops.foundation_rebuild_checkpoint
-                          SET status='PENDING', error_message=%s,
-                              updated_at=CURRENT_TIMESTAMP
-                        WHERE run_id=%s AND status<>'PENDING'""",
-                    (error, run_id),
-                )
+                sql = """UPDATE ops.foundation_rebuild_checkpoint
+                            SET status='PENDING', error_message=%s,
+                                updated_at=CURRENT_TIMESTAMP
+                          WHERE run_id=%s AND status<>'PENDING'"""
+                params: tuple[object, ...] = (error, run_id)
+                if stages is not None:
+                    sql += " AND stage=ANY(%s)"
+                    params += (list(stages),)
+                cur.execute(sql, params)
                 return int(cur.rowcount or 0)
 
         return self._kernel._run_chunk(invalidate)

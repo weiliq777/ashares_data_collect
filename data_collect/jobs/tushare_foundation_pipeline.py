@@ -22,6 +22,7 @@ from data_collect.jobs.tushare_foundation_features import (
 )
 from data_collect.jobs.tushare_foundation_quality import inspect_foundation_v2
 from data_collect.jobs.tushare_raw_to_standard import rebuild_valuation
+from data_collect.jobs.foundation_stage_identity import stage_code_identities
 
 
 FIXED_SMOKE_CODES = ("600519.SH", "000858.SZ", "000001.SZ")
@@ -95,7 +96,18 @@ def resume_run(run_id: str, mode: str, output_end: date) -> None:
 
     kernel, repository, context = _pipeline_access(run_id)
     try:
-        repository.resume_run(run_id, mode, output_end, _git_metadata(), context)
+        metadata = _git_metadata()
+        previous = repository.foundation_run_metadata(run_id, context).get("git_commit")
+        current_identities = stage_code_identities()
+        previous_identities = stage_code_identities(str(previous).strip()) if previous else {}
+        stage_pairs = {
+            stage: (previous_identities.get(stage), current)
+            for stage, current in current_identities.items()
+        }
+        repository.resume_run(
+            run_id, mode, output_end, metadata, context,
+            stage_identities=stage_pairs,
+        )
     finally:
         kernel.close()
 
@@ -217,7 +229,11 @@ def run_production_derived(
         else:
             run_id = create_run(
                 "PRODUCTION", WARMUP_START, OUTPUT_START, output_end,
-                {"batch_stocks": batch_stocks, "reuse_standard": reuse_standard},
+                {
+                    "batch_stocks": batch_stocks,
+                    "reuse_standard": reuse_standard,
+                    "_stage_code_identities": stage_code_identities(),
+                },
             )
         try:
             standard = []

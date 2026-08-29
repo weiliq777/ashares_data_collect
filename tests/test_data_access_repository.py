@@ -249,6 +249,29 @@ def test_foundation_checkpoint_invalidation_is_one_set_based_write():
     assert conn.committed == 1
 
 
+def test_foundation_checkpoint_invalidation_can_target_changed_stages_only():
+    from data_collect.data_access.repository.financial_repository import FinancialRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    FinancialRepository(kernel).kernel.write.invalidate_foundation_checkpoints(
+        ctx(),
+        WorkScope(partition="foundation-run:run-1", dimensions={"run_id": "run-1"}),
+        "run-1",
+        "invalidated: stage computation identity changed",
+        stages=["valuation_daily_v2"],
+    )
+    update = next(
+        entry for entry in conn.executed
+        if entry["kind"] == "execute"
+        and "UPDATE ops.foundation_rebuild_checkpoint" in entry["sql"]
+    )
+    assert "stage=ANY(%s)" in update["sql"]
+    assert update["params"][-1] == ["valuation_daily_v2"]
+
+
 def test_foundation_completed_checkpoints_are_loaded_in_one_bounded_read():
     from data_collect.data_access.repository.financial_repository import FinancialRepository
 

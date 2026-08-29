@@ -43,6 +43,17 @@ def test_foundation_pipeline_can_reuse_existing_standard_layer():
     assert '"reuse_standard": reuse_standard' in source
 
 
+def test_foundation_stage_identity_is_explicit_and_fail_closed():
+    from data_collect.jobs.foundation_stage_identity import stage_code_identities
+
+    identities = stage_code_identities()
+    assert {
+        "company_financial_v2", "valuation_daily_v2", "standard_v2",
+        "valuation_standard_v2", "quality",
+    } <= identities.keys()
+    assert all(len(value) == 64 for value in identities.values())
+
+
 def test_quality_gate_has_window_indexes_for_status_counts():
     sql = (ROOT / "sql/061_quality_gate_window_indexes.sql").read_text(encoding="utf-8")
     assert sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 5

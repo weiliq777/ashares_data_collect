@@ -654,6 +654,15 @@ class FinancialRepository(BaseRepository):
             raise ValueError(f"unknown foundation run: {run_id}")
         return rows[0]
 
+    def foundation_run_metadata(self, run_id: str, context: RunContext) -> dict[str, Any]:
+        """Return the small immutable identity portion needed for safe resume."""
+        row = self._run_record(run_id, context)
+        return {
+            "git_commit": row.get("git_commit"),
+            "parameters": row.get("parameters"),
+            "status": row.get("status"),
+        }
+
     @staticmethod
     def _adapt_run_record(row: dict[str, Any]) -> dict[str, Any]:
         """Keep JSONB parameters adaptable when a row is round-tripped."""
@@ -681,6 +690,7 @@ class FinancialRepository(BaseRepository):
     def resume_run(
         self, run_id: str, mode: str, output_end: date,
         metadata: dict[str, Any], context: RunContext,
+        stage_identities: Mapping[str, tuple[str | None, str]] | None = None,
     ) -> None:
         row = self._run_record(run_id, context)
         if row.get("run_mode") != mode or row.get("output_end") != output_end:
@@ -691,12 +701,38 @@ class FinancialRepository(BaseRepository):
             raise RuntimeError(f"run is not resumable: {run_id} ({row.get('status')})")
         changed = row.get("git_commit") != metadata.get("commit") or row.get("diff_hash") != metadata.get("diff_hash")
         if changed:
-            self.kernel.write.invalidate_foundation_checkpoints(
-                context=context,
-                scope=WorkScope(partition=f"foundation-run:{run_id}", dimensions={"run_id": run_id}),
-                run_id=run_id,
-                error="invalidated: code identity changed",
-            )
+            if stage_identities is None:
+                self.kernel.write.invalidate_foundation_checkpoints(
+                    context=context,
+                    scope=WorkScope(partition=f"foundation-run:{run_id}", dimensions={"run_id": run_id}),
+                    run_id=run_id,
+                    error="invalidated: code identity changed",
+                )
+            else:
+                changed_stages = sorted(
+                    stage for stage, (previous, current) in stage_identities.items()
+                    if not previous or not current or previous != current
+                )
+                if changed_stages:
+                    self.kernel.write.invalidate_foundation_checkpoints(
+                        context=context,
+                        scope=WorkScope(partition=f"foundation-run:{run_id}", dimensions={"run_id": run_id}),
+                        run_id=run_id,
+                        error="invalidated: stage computation identity changed",
+                        stages=changed_stages,
+                    )
+        parameters = row.get("parameters") or {}
+        if isinstance(parameters, str):
+            try:
+                parameters = json.loads(parameters)
+            except json.JSONDecodeError:
+                parameters = {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        if stage_identities:
+            parameters["_stage_code_identities"] = {
+                stage: current for stage, (_, current) in stage_identities.items()
+            }
         resume_row = {
             "run_id": run_id,
             "contract_version": row["contract_version"],
@@ -705,7 +741,7 @@ class FinancialRepository(BaseRepository):
             "warmup_start": row.get("warmup_start"),
             "output_start": row.get("output_start"),
             "output_end": row.get("output_end"),
-            "parameters": row.get("parameters", {}),
+            "parameters": json.dumps(parameters, ensure_ascii=False),
             "error_message": None,
             "code_version": metadata.get("code_version", context.code_version),
             "git_commit": metadata.get("commit"),
@@ -716,7 +752,10 @@ class FinancialRepository(BaseRepository):
         self.kernel.write.upsert(
             context=context, scope=WorkScope(dimensions={"run_id": run_id}),
             target="ops.foundation_rebuild_run", rows=[resume_row], key=["run_id"],
-            update_columns=["status", "error_message", "code_version", "git_commit", "git_dirty", "diff_hash"],
+            update_columns=[
+                "status", "error_message", "parameters", "code_version",
+                "git_commit", "git_dirty", "diff_hash",
+            ],
         )
 
     def create_run(
