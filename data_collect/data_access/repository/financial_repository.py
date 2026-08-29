@@ -514,9 +514,21 @@ class FinancialRepository(BaseRepository):
             raise ValueError(
                 f"valuation publish batch rows {len(materialized)} exceeds max_rows={max_rows}"
             )
+        observed_dates = [
+            row.get("trade_date") for row in materialized
+            if isinstance(row.get("trade_date"), date)
+        ]
+        if not observed_dates:
+            raise ValueError("valuation publish batch has no valid trade_date")
+        # A stock may have stopped trading before the global rebuild end.
+        # Freshness for this one-stock publication must use its actual last
+        # source date; requiring the global end date would reject valid
+        # delisted/suspended history.  The production builder defaults to one
+        # stock per publication, so no other stock can hide a stale partition.
+        effective_end = max(observed_dates)
         scope = WorkScope(
             date_from=output_start,
-            date_to=output_end,
+            date_to=effective_end,
             codes=tuple(dict.fromkeys(codes)),
             dimensions={"date_column": "trade_date", "code_column": "ts_code"},
         )

@@ -42,7 +42,7 @@ CONTRACT_VERSION = "feature-contract-v2.0"
 TARGET_TABLE = "feature.company_financial_v2"
 VALUATION_TARGET_TABLE = "feature.valuation_daily_v1"
 VALUATION_CODE_BATCH_SIZE = max(
-    1, int(os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "20"))
+    1, int(os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "1"))
 )
 DEFAULT_FEATURE_BATCH_STOCKS = 5
 MAX_FEATURE_ROWS_PER_TRANSACTION = 20_000
