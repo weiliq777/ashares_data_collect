@@ -355,6 +355,8 @@ def test_release_manifest_aggregates_each_source_once_through_cutoff():
 
         def _aggregate(self, table, sql, params, context, partition):
             self.calls.append((table, sql, params, partition))
+            if "MIN(" in sql:
+                return {"min_date": date(2026, 8, 1)}
             return {
                 "count": 7, "max_record_id": 9,
                 "max_fetched_at": datetime(2026, 8, 21, 12, 0),
@@ -367,16 +369,50 @@ def test_release_manifest_aggregates_each_source_once_through_cutoff():
         dataset="daily", include_record_id=True, partition="release:market:daily",
     )
 
-    assert len(repository.calls) == 1
-    _, sql, params, partition = repository.calls[0]
-    assert "trade_date <= %s" in sql
-    assert "BETWEEN" not in sql
-    assert params == (cutoff, "daily")
-    assert partition.endswith(":through:2026-08-21")
+    assert len(repository.calls) == 2
+    _, sql, params, partition = repository.calls[1]
+    assert "trade_date BETWEEN %s AND %s" in sql
+    assert params == (date(2026, 8, 1), cutoff, "daily")
+    assert partition.endswith(":2026-08-01:2026-08-21")
     assert result == {
         "row_count": 7, "max_record_id": 9,
         "max_fetched_at": "2026-08-21T12:00:00",
     }
+
+
+def test_release_manifest_splits_only_a_timed_out_window():
+    from datetime import datetime
+    from data_collect.data_access.repository.release_repository import ReleaseRepository
+
+    class TimeoutProbe(ReleaseRepository):
+        def __init__(self):
+            super().__init__(None)
+            self.windows = []
+
+        def _aggregate(self, table, sql, params, context, partition):
+            if "MIN(" in sql:
+                return {"min_date": date(2026, 8, 1)}
+            start, end = params[:2]
+            self.windows.append((start, end))
+            if (end - start).days > 5:
+                raise RuntimeError("canceling statement due to statement timeout")
+            return {
+                "count": (end - start).days + 1,
+                "max_record_id": end.day,
+                "max_fetched_at": datetime.combine(end, datetime.min.time()),
+            }
+
+    repository = TimeoutProbe()
+    result = repository._manifest_date_ranges(
+        "tushare_market_raw_version", "trade_date", date(2026, 8, 21), None,
+        dataset="daily", include_record_id=True, partition="release:market:daily",
+    )
+
+    assert len(repository.windows) > 1
+    assert any((end - start).days > 5 for start, end in repository.windows)
+    assert any((end - start).days <= 5 for start, end in repository.windows)
+    assert result["row_count"] == 21
+    assert result["max_record_id"] == 21
 
 
 def test_feature_repository_rebuild_price_v2_scoped_merge():

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
@@ -13,6 +13,8 @@ from data_collect.data_access.repository.quality_inspection_repository import Qu
 
 
 class ReleaseRepository(BaseRepository):
+    _MANIFEST_WINDOW_DAYS = 180
+
     def create(
         self,
         tag: str,
@@ -166,39 +168,94 @@ class ReleaseRepository(BaseRepository):
         *, dataset: str | None = None, include_record_id: bool,
         partition: str,
     ) -> dict:
-        """Aggregate one append-only source once up to the release cutoff.
+        """Aggregate an append-only source in adaptive bounded date windows.
 
-        The manifest stores only totals and maxima, not per-window ranges. The
-        previous 30-day loop therefore rescanned the same indexed source many
-        times and made release validation take minutes. Covering indexes from
-        ``086_release_manifest_covering_indexes.sql`` keep this single
-        aggregate index-backed while preserving the exact manifest fields.
+        The manifest stores only totals and maxima, not per-window ranges. A
+        single full-history aggregate can exceed the statement deadline on a
+        large raw table, while the old 30-day loop caused excessive repeated
+        scans. Start with 180-day windows and split only the window that times
+        out; this preserves the per-statement safety limit without imposing
+        hundreds of fixed scans on every release validation.
         """
         if date_column not in {"trade_date", "cal_date"}:
             raise ValueError("unsupported source-manifest date column")
         dataset_clause = " AND dataset=%s" if dataset is not None else ""
-        select = "COUNT(*) AS count, MAX(fetched_at) AS max_fetched_at"
-        if include_record_id:
-            select = "COUNT(*) AS count, MAX(record_id) AS max_record_id, MAX(fetched_at) AS max_fetched_at"
-        params = (cutoff, dataset) if dataset is not None else (cutoff,)
-        row = self._aggregate(
+        minimum = self._aggregate(
             table,
-            f"SELECT {select} FROM {table} "
-            f"WHERE {date_column} IS NOT NULL AND {date_column} <= %s{dataset_clause}",
-            params, context, f"{partition}:through:{cutoff}",
-        )
+            f"SELECT MIN({date_column}) AS min_date FROM {table} "
+            f"WHERE {date_column} IS NOT NULL{dataset_clause}",
+            ((dataset,) if dataset is not None else ()),
+            context, f"{partition}:minimum",
+        )["min_date"]
+        if minimum is None or minimum > cutoff:
+            return {
+                "row_count": 0,
+                **({"max_record_id": None} if include_record_id else {}),
+                "max_fetched_at": None,
+            }
+
+        def aggregate_window(window_start: date, window_end: date) -> dict:
+            select = "COUNT(*) AS count, MAX(fetched_at) AS max_fetched_at"
+            if include_record_id:
+                select = "COUNT(*) AS count, MAX(record_id) AS max_record_id, MAX(fetched_at) AS max_fetched_at"
+            params = (
+                (window_start, window_end, dataset)
+                if dataset is not None else (window_start, window_end)
+            )
+            try:
+                return self._aggregate(
+                    table,
+                    f"SELECT {select} FROM {table} "
+                    f"WHERE {date_column} BETWEEN %s AND %s{dataset_clause}",
+                    params, context, f"{partition}:{window_start}:{window_end}",
+                )
+            except Exception as exc:
+                # PostgreSQL SQLSTATE 57014 is also used for explicit client
+                # cancellation. Only the statement-timeout message is safe
+                # to retry by splitting; other failures must remain visible.
+                if "statement timeout" not in str(exc).lower() or window_start >= window_end:
+                    raise
+                midpoint = window_start + (window_end - window_start) // 2
+                left = aggregate_window(window_start, midpoint)
+                right = aggregate_window(midpoint + timedelta(days=1), window_end)
+                merged = {
+                    "count": int(left.get("count") or 0) + int(right.get("count") or 0),
+                    "max_fetched_at": max(
+                        (value for value in (left.get("max_fetched_at"), right.get("max_fetched_at")) if value is not None),
+                        default=None,
+                    ),
+                }
+                if include_record_id:
+                    merged["max_record_id"] = max(
+                        (value for value in (left.get("max_record_id"), right.get("max_record_id")) if value is not None),
+                        default=None,
+                    )
+                return merged
+
+        total = 0
+        max_record_id = None
+        max_fetched_at = None
+        window_start = minimum
+        while window_start <= cutoff:
+            window_end = min(
+                cutoff,
+                window_start + timedelta(days=self._MANIFEST_WINDOW_DAYS - 1),
+            )
+            row = aggregate_window(window_start, window_end)
+            total += int(row.get("count") or 0)
+            if include_record_id and row.get("max_record_id") is not None:
+                max_record_id = max(max_record_id or 0, int(row["max_record_id"]))
+            if row.get("max_fetched_at") is not None and (
+                max_fetched_at is None or row["max_fetched_at"] > max_fetched_at
+            ):
+                max_fetched_at = row["max_fetched_at"]
+            window_start = window_end + timedelta(days=1)
         result = {
-            "row_count": int(row.get("count") or 0),
-            "max_fetched_at": (
-                row["max_fetched_at"].isoformat()
-                if row.get("max_fetched_at") else None
-            ),
+            "row_count": total,
+            "max_fetched_at": max_fetched_at.isoformat() if max_fetched_at else None,
         }
         if include_record_id:
-            result["max_record_id"] = (
-                int(row["max_record_id"])
-                if row.get("max_record_id") is not None else None
-            )
+            result["max_record_id"] = max_record_id
         return result
 
     def _scalar(self, source, sql, context, partition, params=()):
