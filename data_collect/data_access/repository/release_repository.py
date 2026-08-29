@@ -52,6 +52,14 @@ class ReleaseRepository(BaseRepository):
     def source_manifest(self, cutoff: date, context: RunContext) -> tuple[dict, str]:
         manifest = {"schema_version": "tushare-release-source-v1", "cutoff_date": cutoff.isoformat(), "market_versions": {}, "legacy_market_raw": {}, "append_only_sources": {}}
         manifest["market_versions"] = self._market_versions_manifest(cutoff, context)
+        # trade_cal uses cal_date instead of trade_date.  Keeping this tiny
+        # dataset separate lets the three large market datasets use the
+        # (dataset, trade_date) covering index without an OR predicate.
+        manifest["market_versions"]["trade_cal"] = self._manifest_date_ranges(
+            "tushare_market_raw_version", "cal_date", cutoff, context,
+            dataset="trade_cal", include_record_id=True,
+            partition="release:market:trade_cal",
+        )
         for table, column in {"tushare_daily_raw": "trade_date", "tushare_daily_basic_raw": "trade_date", "tushare_adj_factor_raw": "trade_date", "tushare_trade_cal_raw": "cal_date"}.items():
             manifest["legacy_market_raw"][table] = self._manifest_date_ranges(
                 table, column, cutoff, context, include_record_id=False,
@@ -75,15 +83,16 @@ class ReleaseRepository(BaseRepository):
     def _market_versions_manifest(self, cutoff: date, context: RunContext) -> dict[str, dict]:
         """Aggregate all versioned market datasets in shared date windows.
 
-        ``tushare_market_raw_version`` stores daily, daily_basic, adj_factor
-        and trade_cal in one large append-only table.  Scanning that table
-        once per dataset multiplies the I/O cost without adding evidence.
-        This method keeps the same per-dataset counts and maxima as the
-        previous implementation, but groups all four datasets in one bounded
-        query per window.  A timed-out window is still bisected independently
-        so the statement and transaction safety contract is unchanged.
+        ``tushare_market_raw_version`` stores daily, daily_basic and adj_factor
+        in one large append-only table with the same trade_date dimension.
+        Scanning that table once per dataset multiplies the I/O cost without
+        adding evidence.  This method keeps the same per-dataset counts and
+        maxima, but groups the three compatible datasets in one index-backed
+        query per window.  trade_cal is intentionally handled separately
+        because it uses cal_date.  A timed-out window is still bisected so the
+        statement and transaction safety contract is unchanged.
         """
-        datasets = ("daily", "daily_basic", "adj_factor", "trade_cal")
+        datasets = ("daily", "daily_basic", "adj_factor")
         empty = {
             dataset: {
                 "row_count": 0,
@@ -95,13 +104,20 @@ class ReleaseRepository(BaseRepository):
         minimum_rows = self.kernel.read._repository_query(
             context,
             "tushare_market_raw_version",
-            """SELECT dataset,
-                       MIN(CASE WHEN dataset='trade_cal' THEN cal_date ELSE trade_date END) AS min_date
-                  FROM tushare_market_raw_version
-                 WHERE dataset=ANY(%s)
-                   AND CASE WHEN dataset='trade_cal' THEN cal_date ELSE trade_date END IS NOT NULL
-                 GROUP BY dataset""",
-            params=[list(datasets)],
+            """SELECT dataset, min_date FROM (
+                    SELECT 'daily'::text AS dataset,
+                           (SELECT MIN(trade_date) FROM tushare_market_raw_version
+                             WHERE dataset='daily' AND trade_date IS NOT NULL) AS min_date
+                    UNION ALL
+                    SELECT 'daily_basic',
+                           (SELECT MIN(trade_date) FROM tushare_market_raw_version
+                             WHERE dataset='daily_basic' AND trade_date IS NOT NULL)
+                    UNION ALL
+                    SELECT 'adj_factor',
+                           (SELECT MIN(trade_date) FROM tushare_market_raw_version
+                             WHERE dataset='adj_factor' AND trade_date IS NOT NULL)
+                ) minima WHERE min_date IS NOT NULL""",
+            params=(),
             scope=WorkScope(date_to=cutoff, partition="release:market:minimum"),
             max_rows=10,
         )
@@ -123,10 +139,9 @@ class ReleaseRepository(BaseRepository):
                                MAX(fetched_at) AS max_fetched_at
                           FROM tushare_market_raw_version
                          WHERE dataset=ANY(%s)
-                           AND ((dataset='trade_cal' AND cal_date BETWEEN %s AND %s)
-                             OR (dataset<>'trade_cal' AND trade_date BETWEEN %s AND %s))
+                           AND trade_date BETWEEN %s AND %s
                          GROUP BY dataset""",
-                    params=[list(datasets), window_start, window_end, window_start, window_end],
+                    params=[list(datasets), window_start, window_end],
                     scope=WorkScope(
                         date_from=window_start, date_to=window_end,
                         partition=f"release:market:shared:{window_start}:{window_end}",

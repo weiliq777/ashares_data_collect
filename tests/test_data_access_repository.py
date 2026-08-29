@@ -425,17 +425,16 @@ def test_release_manifest_groups_versioned_market_datasets_in_one_scan():
     class ReadProbe:
         def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
             calls.append((source, sql, params))
-            if "MIN(CASE" in sql:
+            if "SELECT dataset, min_date" in sql:
                 return [
                     {"dataset": "daily", "min_date": date(2026, 8, 1)},
                     {"dataset": "daily_basic", "min_date": date(2026, 8, 1)},
                     {"dataset": "adj_factor", "min_date": date(2026, 8, 1)},
-                    {"dataset": "trade_cal", "min_date": date(2026, 8, 1)},
                 ]
             return [
                 {"dataset": dataset, "count": 3, "max_record_id": index,
                  "max_fetched_at": datetime(2026, 8, 21, 12, 0)}
-                for index, dataset in enumerate(("daily", "daily_basic", "adj_factor", "trade_cal"), 1)
+                for index, dataset in enumerate(("daily", "daily_basic", "adj_factor"), 1)
             ]
 
     repository = ReleaseRepository(SimpleNamespace(read=ReadProbe()))
@@ -443,8 +442,15 @@ def test_release_manifest_groups_versioned_market_datasets_in_one_scan():
 
     assert len(calls) == 2  # one grouped minimum query + one grouped aggregate
     assert all(item["row_count"] == 3 for item in result.values())
-    assert all(item["max_record_id"] in {1, 2, 3, 4} for item in result.values())
+    assert all(item["max_record_id"] in {1, 2, 3} for item in result.values())
     assert all(item["max_fetched_at"] == "2026-08-21T12:00:00" for item in result.values())
+    shared_sql = calls[1][1]
+    minimum_sql = calls[0][1]
+    assert "MIN(CASE" not in minimum_sql
+    assert minimum_sql.count("SELECT MIN(trade_date)") == 3
+    assert "trade_date BETWEEN %s AND %s" in shared_sql
+    assert "cal_date" not in shared_sql
+    assert " OR " not in shared_sql
 
 
 def test_feature_repository_rebuild_price_v2_scoped_merge():
