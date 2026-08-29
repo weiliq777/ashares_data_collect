@@ -832,17 +832,22 @@ def rebuild_valuation_features(
     )
     for offset in range(0, len(codes), VALUATION_CODE_BATCH_SIZE):
         batch = codes[offset : offset + VALUATION_CODE_BATCH_SIZE]
+        pending_batch = [code for code in batch if code not in completed_keys]
+        completed += len(batch) - len(pending_batch)
+        if not pending_batch:
+            logger.info(
+                "valuation rebuild progress target=%s completed=%s/%s skipped_batch=%s",
+                target_table, completed, total_codes, len(batch),
+            )
+            continue
         input_rows = defaultdict(list)
-        for row in repository.load_valuation_inputs(batch, warmup_start, output_end, context):
+        for row in repository.load_valuation_inputs(
+            pending_batch, warmup_start, output_end, context
+        ):
             input_rows[row["stock_code"]].append(row)
 
         prepared = []
-        for code in batch:
-            if (
-                run_id is not None and code in completed_keys
-            ):
-                completed += 1
-                continue
+        for code in pending_batch:
             rows = calculate_valuation_features(
                 input_rows.get(code, []), output_start, output_end
             )

@@ -21,6 +21,7 @@ from data_collect.jobs.tushare_foundation_features import (
     _pit_evidence_level,
     calculate_valuation_features,
 )
+import data_collect.jobs.tushare_foundation_features as foundation_features
 from data_collect.jobs.tushare_financial_raw_to_standard import transform
 
 
@@ -548,3 +549,60 @@ def test_vendor_indicator_requires_income_company_type_match():
         require_comp_type_match=True,
     )
     assert selected["values"]["roe_reported"] == 18.0
+
+
+def test_valuation_rebuild_filters_completed_codes_before_loading_inputs(monkeypatch):
+    class FakeKernel:
+        def close(self):
+            pass
+
+    class FakeRepository:
+        def __init__(self):
+            self.load_calls = []
+            self.published_codes = []
+            self.checkpoints = []
+
+        def valuation_codes(self, *args, **kwargs):
+            return ["A", "B", "C", "D", "E", "F"]
+
+        def completed_checkpoint_keys(self, run_id, stage, context):
+            assert (run_id, stage) == ("run", "valuation_daily_v2")
+            return {"A", "D", "E"}
+
+        def load_valuation_inputs(self, codes, *args):
+            codes = tuple(codes)
+            self.load_calls.append(codes)
+            return [
+                {"stock_code": code, "trade_date": date(2021, 8, 2)}
+                for code in codes
+            ]
+
+        def publish_valuation_partitions(self, target, partitions, *args, **kwargs):
+            items = list(partitions)
+            self.published_codes.extend(code for code, _rows in items)
+            return sum(len(rows) for _code, rows in items)
+
+        def save_checkpoint(self, run_id, stage, key, status, *args):
+            self.checkpoints.append((run_id, stage, key, status))
+
+    repository = FakeRepository()
+    kernel = FakeKernel()
+    monkeypatch.setattr(
+        foundation_features,
+        "_financial_access",
+        lambda run_id=None: (kernel, repository, object()),
+    )
+    monkeypatch.setattr(
+        foundation_features,
+        "calculate_valuation_features",
+        lambda rows, _output_start, _output_end: [dict(rows[0])],
+    )
+    monkeypatch.setattr(foundation_features, "VALUATION_CODE_BATCH_SIZE", 3)
+
+    result = foundation_features.rebuild_valuation_features(
+        "run", date(2016, 8, 1), date(2021, 8, 2), date(2026, 8, 21)
+    )
+
+    assert repository.load_calls == [("B", "C"), ("F",)]
+    assert repository.published_codes == ["B", "C", "F"]
+    assert result["partitions"] == 6

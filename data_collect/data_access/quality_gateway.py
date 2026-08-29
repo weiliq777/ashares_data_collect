@@ -110,10 +110,6 @@ class QualityGateway:
         staging = validate_qualified_name(staging)
         target = validate_qualified_name(target)
         conn = self._kernel._db_connection()
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {staging}")
-            row = cur.fetchone()
-        row_count = int(row[0]) if row else 0
         policy = self._kernel.policy_registry.require(target)
         duplicate_count = 0
         null_key_count = 0
@@ -126,15 +122,6 @@ class QualityGateway:
                 )
                 row = cur.fetchone()
             duplicate_count = int(row[0]) if row else 0
-            null_predicate = " OR ".join(
-                f"{column} IS NULL" for column in policy.primary_key
-            )
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {staging} WHERE {null_predicate}"
-                )
-                row = cur.fetchone()
-            null_key_count = int(row[0]) if row else 0
 
         date_column = next(
             (
@@ -143,29 +130,81 @@ class QualityGateway:
             ),
             None,
         )
-        outside_scope_count = 0
-        max_observed = None
+        # Combine the row-count, null-key, scope, freshness and PIT scans into
+        # one bounded aggregate over staging.  The duplicate-group check is
+        # intentionally kept separate because it requires GROUP BY.  The
+        # materialized JSON projection makes the generic PIT check evaluate
+        # to_jsonb once per staged row instead of once per referenced field.
+        aggregate_columns = ["COUNT(*) AS row_count"]
+        if policy.primary_key:
+            null_predicate = " OR ".join(
+                f"s.{column} IS NULL" for column in policy.primary_key
+            )
+            aggregate_columns.append(
+                f"COUNT(*) FILTER (WHERE {null_predicate}) AS null_key_count"
+            )
+        else:
+            aggregate_columns.append("0 AS null_key_count")
+
+        aggregate_params: list[Any] = []
         if date_column:
-            clauses = []
-            params = []
+            outside_clauses = []
             if scope.date_from is not None:
-                clauses.append(f"{date_column} < %s")
-                params.append(scope.date_from)
+                outside_clauses.append(f"s.{date_column} < %s")
+                aggregate_params.append(scope.date_from)
             if scope.date_to is not None:
-                clauses.append(f"{date_column} > %s")
-                params.append(scope.date_to)
-            if clauses:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"SELECT COUNT(*) FROM {staging} WHERE " + " OR ".join(clauses),
-                        tuple(params),
-                    )
-                    row = cur.fetchone()
-                outside_scope_count = int(row[0]) if row else 0
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT MAX({date_column}) FROM {staging}")
-                row = cur.fetchone()
-            max_observed = row[0] if row else None
+                outside_clauses.append(f"s.{date_column} > %s")
+                aggregate_params.append(scope.date_to)
+            outside_expression = (
+                " OR ".join(outside_clauses) if outside_clauses else "FALSE"
+            )
+            aggregate_columns.extend([
+                f"COUNT(*) FILTER (WHERE {outside_expression}) AS outside_scope_count",
+                f"MAX(s.{date_column}) AS max_observed",
+            ])
+        else:
+            aggregate_columns.extend([
+                "0 AS outside_scope_count",
+                "NULL AS max_observed",
+            ])
+
+        availability = (
+            "COALESCE(s.quality_row_json->>'version_available_date', "
+            "s.quality_row_json->>'source_available_at', "
+            "s.quality_row_json->>'financial_version_available_date', "
+            "s.quality_row_json->>'effective_announce_date')"
+        )
+        asof = (
+            "COALESCE(s.quality_row_json->>'asof_date', "
+            "s.quality_row_json->>'research_date', "
+            "s.quality_row_json->>'trade_date')"
+        )
+        aggregate_columns.append(
+            f"COUNT(*) FILTER (WHERE {availability} IS NOT NULL "
+            f"AND {asof} IS NOT NULL AND {availability}::timestamp > {asof}::timestamp) "
+            "AS pit_violation_count"
+        )
+        selected_columns = list(policy.primary_key)
+        if date_column:
+            selected_columns.append(date_column)
+        selected_columns = list(dict.fromkeys(selected_columns))
+        select_list = ", ".join(f"t.{column}" for column in selected_columns)
+        if select_list:
+            select_list += ", "
+        aggregate_sql = (
+            "WITH staged AS MATERIALIZED ("
+            f"SELECT {select_list}to_jsonb(t) AS quality_row_json FROM {staging} t"
+            ") SELECT " + ", ".join(aggregate_columns) + " FROM staged s"
+        )
+        with conn.cursor() as cur:
+            cur.execute(aggregate_sql, tuple(aggregate_params))
+            row = cur.fetchone()
+        row = row or (0, 0, 0, None, 0)
+        row_count = int(row[0] or 0)
+        null_key_count = int(row[1] or 0)
+        outside_scope_count = int(row[2] or 0)
+        max_observed = row[3]
+        pit_violation_count = int(row[4] or 0)
 
         completeness_blocks = row_count == 0 or null_key_count > 0
         freshness_block = bool(
@@ -174,34 +213,6 @@ class QualityGateway:
             and max_observed is not None
             and max_observed < scope.date_to
         )
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""SELECT COUNT(*) FROM {staging} t
-                     WHERE COALESCE(
-                               to_jsonb(t)->>'version_available_date',
-                               to_jsonb(t)->>'source_available_at',
-                               to_jsonb(t)->>'financial_version_available_date',
-                               to_jsonb(t)->>'effective_announce_date'
-                           ) IS NOT NULL
-                       AND COALESCE(
-                               to_jsonb(t)->>'asof_date',
-                               to_jsonb(t)->>'research_date',
-                               to_jsonb(t)->>'trade_date'
-                           ) IS NOT NULL
-                       AND COALESCE(
-                               to_jsonb(t)->>'version_available_date',
-                               to_jsonb(t)->>'source_available_at',
-                               to_jsonb(t)->>'financial_version_available_date',
-                               to_jsonb(t)->>'effective_announce_date'
-                           )::timestamp
-                           > COALESCE(
-                               to_jsonb(t)->>'asof_date',
-                               to_jsonb(t)->>'research_date',
-                               to_jsonb(t)->>'trade_date'
-                           )::timestamp"""
-            )
-            row = cur.fetchone()
-        pit_violation_count = int(row[0]) if row else 0
         return {
             "completeness": {
                 "severity": "BLOCK" if completeness_blocks else "INFO",

@@ -31,6 +31,9 @@ class FakeCursor:
         self.rowcount = 0
         if "pg_try_advisory_lock" in sql or "pg_advisory_unlock" in sql:
             self._fetch_rows = [(True,)]
+        elif "WITH staged AS MATERIALIZED" in sql and "pit_violation_count" in sql:
+            self._fetch_rows = [(1, 0, 0, None, 0)]
+            self.description = [SimpleNamespace(name="row_count")]
         elif sql.lstrip().upper().startswith("SELECT COUNT(*)"):
             self._fetch_rows = [(0 if "duplicates" in sql or " WHERE " in sql else 1,)]
             self.description = [SimpleNamespace(name="row_count")]

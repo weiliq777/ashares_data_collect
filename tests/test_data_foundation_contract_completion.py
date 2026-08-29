@@ -356,6 +356,14 @@ class _QualityCursor:
             self._row = (self.conn.row_count,)
         elif "HAVING COUNT(*) > 1" in sql:
             self._row = (self.conn.duplicate_groups,)
+        elif "WITH staged AS MATERIALIZED" in sql and "pit_violation_count" in sql:
+            self._row = (
+                self.conn.row_count,
+                self.conn.null_key_count,
+                self.conn.outside_scope_rows,
+                self.conn.max_observed,
+                self.conn.pit_violations,
+            )
         elif "snapshot_id IS NULL OR research_date IS NULL OR ts_code IS NULL" in sql:
             self._row = (self.conn.null_key_count,)
         elif "to_jsonb(t)->>'version_available_date'" in sql:
