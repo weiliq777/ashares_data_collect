@@ -248,7 +248,15 @@ def run_production_derived(
                 valuation_standard = _valuation_standard_partitions(
                     run_id, WARMUP_START, output_end,
                 )
-            warmup = rebuild_company_financial_v2(None, WARMUP_START, WARMUP_START, OUTPUT_START - timedelta(days=1), target_table="feature.company_financial_v2", batch_stocks=batch_stocks)
+            # Warmup is a bounded read input to the feature calculation.  It
+            # must not be materialized into the production Feature table: the
+            # previous implementation rewrote 2016..2021 on every resume,
+            # without a run checkpoint, making a resumable rebuild appear
+            # stuck and needlessly mutating historical output.
+            warmup = {
+                "skipped": True,
+                "reason": "warmup is read-only input, not published output",
+            }
             company = rebuild_company_financial_v2(run_id, WARMUP_START, OUTPUT_START, output_end, target_table="feature.company_financial_v2", batch_stocks=batch_stocks)
             valuation = rebuild_valuation_features(run_id, WARMUP_START, OUTPUT_START, output_end, target_table="feature.valuation_daily_v1")
             quality = inspect_foundation_v2(OUTPUT_START, output_end, None, "feature.company_financial_v2", "feature.valuation_daily_v1")

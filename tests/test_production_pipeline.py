@@ -54,6 +54,12 @@ def test_foundation_stage_identity_is_explicit_and_fail_closed():
     assert all(len(value) == 64 for value in identities.values())
 
 
+def test_foundation_pipeline_does_not_materialize_warmup_into_production_feature():
+    source = (ROOT / "data_collect/jobs/tushare_foundation_pipeline.py").read_text(encoding="utf-8")
+    assert '"reason": "warmup is read-only input, not published output"' in source
+    assert 'rebuild_company_financial_v2(None, WARMUP_START' not in source
+
+
 def test_quality_gate_has_window_indexes_for_status_counts():
     sql = (ROOT / "sql/061_quality_gate_window_indexes.sql").read_text(encoding="utf-8")
     assert sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 5
