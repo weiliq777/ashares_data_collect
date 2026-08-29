@@ -772,6 +772,35 @@ class FinancialRepository(BaseRepository):
         )
         return str(rows[0][0]) if rows else None
 
+    def completed_checkpoint_keys(
+        self, run_id: str, stage: str, context: RunContext
+    ) -> set[str]:
+        """Load completed partitions for one stage in one bounded read.
+
+        Resuming a production rebuild must not issue one database query per
+        stock partition.  The result is only a reuse hint; a partition is
+        still reusable only when the enclosing run has passed its code/
+        contract identity checks.
+        """
+        policy = self.kernel.policy_registry.require(
+            "ops.foundation_rebuild_checkpoint"
+        )
+        rows = self.kernel.read._repository_query(
+            context=context,
+            source="ops.foundation_rebuild_checkpoint",
+            sql=(
+                "SELECT partition_key FROM ops.foundation_rebuild_checkpoint "
+                "WHERE run_id=%s AND stage=%s AND status='COMPLETED'"
+            ),
+            params=(run_id, stage),
+            scope=WorkScope(
+                partition=f"foundation-run:{run_id}",
+                dimensions={"stage": stage},
+            ),
+            max_rows=policy.max_read_rows,
+        )
+        return {str(row["partition_key"]) for row in rows}
+
     def save_checkpoint(
         self,
         run_id: str,

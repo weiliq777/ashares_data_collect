@@ -249,6 +249,24 @@ def test_foundation_checkpoint_invalidation_is_one_set_based_write():
     assert conn.committed == 1
 
 
+def test_foundation_completed_checkpoints_are_loaded_in_one_bounded_read():
+    from data_collect.data_access.repository.financial_repository import FinancialRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = FinancialRepository(kernel)
+    assert repository.completed_checkpoint_keys("run-1", "company_financial_v2", ctx()) == set()
+    reads = [
+        entry for entry in conn.executed
+        if entry["kind"] == "execute"
+        and "SELECT partition_key FROM ops.foundation_rebuild_checkpoint" in entry["sql"]
+    ]
+    assert len(reads) == 1
+    assert reads[0]["params"] == ("run-1", "company_financial_v2")
+
+
 def test_financial_feature_jsonb_is_encoded_at_repository_boundary():
     from data_collect.data_access.repository.financial_repository import FinancialRepository
 

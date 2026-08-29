@@ -596,15 +596,15 @@ def rebuild_company_financial_v2(
     _target(target_table)
     kernel, repository, context = _financial_access(run_id)
     codes = repository.stock_codes(warmup_start, output_end, context, requested_codes)
+    completed_keys = (
+        repository.completed_checkpoint_keys(run_id, "company_financial_v2", context)
+        if run_id else set()
+    )
     attempted = written = completed = 0
     for offset in range(0, len(codes), batch_stocks):
         batch = codes[offset : offset + batch_stocks]
         partition_key = f"{batch[0]}..{batch[-1]}"
-        if (
-            run_id
-            and repository.checkpoint_status(run_id, "company_financial_v2", partition_key, context)
-            == "COMPLETED"
-        ):
+        if run_id and partition_key in completed_keys:
             completed += 1
             continue
         if run_id:
@@ -819,6 +819,10 @@ def rebuild_valuation_features(
         # valid Standard rows without a corresponding Feature row.
         selection_start=output_start,
     )
+    completed_keys = (
+        repository.completed_checkpoint_keys(run_id, "valuation_daily_v2", context)
+        if run_id else set()
+    )
     total = completed = 0
     total_codes = len(codes)
     logger.info(
@@ -835,8 +839,7 @@ def rebuild_valuation_features(
         prepared = []
         for code in batch:
             if (
-                run_id is not None
-                and repository.checkpoint_status(run_id, "valuation_daily_v2", code, context) == "COMPLETED"
+                run_id is not None and code in completed_keys
             ):
                 completed += 1
                 continue
