@@ -112,6 +112,14 @@ def test_feature_policy_partition_keys_match_domain_grain():
     assert registry.require("feature.shareholder_return_v1").partition_key == ("asof_date",)
 
 
+def test_valuation_feature_policy_declares_business_key():
+    registry = build_default_registry()
+    policy = registry.require("feature.valuation_daily_v1")
+    assert policy.primary_key == ("ts_code", "trade_date")
+    assert policy.partition_key == ("trade_date",)
+    assert policy.direct_read_allowed is False
+
+
 def test_legacy_stock_basic_raw_is_append_only():
     registry = build_default_registry()
     policy = registry.require("tushare_stock_basic_raw")

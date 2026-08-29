@@ -60,6 +60,15 @@ def build_default_registry() -> DatasetPolicyRegistry:
                 require_scope=True,
                 scan_policy=ScanPolicy.SCOPE_REQUIRED,
             ),
+            DatasetPolicy(
+                name="feature.valuation_daily_v1",
+                write_modes=frozenset([WriteMode.UPSERT, WriteMode.REBUILD]),
+                primary_key=("ts_code", "trade_date"),
+                partition_key=("trade_date",),
+                require_scope=True,
+                scan_policy=ScanPolicy.SCOPE_REQUIRED,
+                direct_read_allowed=False,
+            ),
             # ---- Mart contract views: application-facing, read-only projections ----
             DatasetPolicy(
                 name="mart.*",

@@ -60,9 +60,10 @@ def test_foundation_pipeline_does_not_materialize_warmup_into_production_feature
     assert 'rebuild_company_financial_v2(None, WARMUP_START' not in source
 
 
-def test_valuation_rebuild_defaults_to_one_stock_per_quality_scope():
+def test_valuation_rebuild_defaults_to_bounded_multi_stock_batch():
     source = (ROOT / "data_collect/jobs/tushare_foundation_features.py").read_text(encoding="utf-8")
-    assert 'os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "1")' in source
+    assert 'os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "15")' in source
+    assert "MAX_VALUATION_ROWS_PER_TRANSACTION = 20_000" in source
 
 
 def test_quality_gate_has_window_indexes_for_status_counts():

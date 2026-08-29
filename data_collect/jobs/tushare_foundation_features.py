@@ -41,8 +41,12 @@ logger = logging.getLogger(__name__)
 CONTRACT_VERSION = "feature-contract-v2.0"
 TARGET_TABLE = "feature.company_financial_v2"
 VALUATION_TARGET_TABLE = "feature.valuation_daily_v1"
+# A full valuation rebuild publishes at most 20,000 rows per transaction.
+# Fifteen securities fit that budget for the observed daily grain while
+# amortizing staging/validation overhead; the publish loop still splits a
+# batch by actual row count before opening a transaction.
 VALUATION_CODE_BATCH_SIZE = max(
-    1, int(os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "1"))
+    1, int(os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "15"))
 )
 DEFAULT_FEATURE_BATCH_STOCKS = 5
 MAX_FEATURE_ROWS_PER_TRANSACTION = 20_000
@@ -685,6 +689,7 @@ def _valuation_input(code: str, warmup_start: date, output_end: date):
 
 
 def calculate_valuation_features(rows, output_start: date, output_end: date):
+    rows = list(rows)
     q3, q5 = deque(), deque()
     pe3: list[float] = []
     pe5: list[float] = []
