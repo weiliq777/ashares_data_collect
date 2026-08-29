@@ -130,7 +130,10 @@ class RebuildGateway:
                     )
 
                 self._build_index(staging, target)
-                self._kernel.quality.validate(context, scope, staging, target)
+                self._kernel.quality.validate(
+                    context, scope, staging, target,
+                    staging_columns=tuple(columns or ()),
+                )
                 self._staging_hash(staging, target)
 
                 attached = self._publish(mode, target, staging, scope)
