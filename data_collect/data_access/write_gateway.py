@@ -338,6 +338,58 @@ class WriteGateway:
 
         return self._kernel._run_chunk(invalidate)
 
+    def save_foundation_checkpoint(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        row: Mapping[str, Any],
+    ) -> int:
+        """Apply the current state of one foundation-stage partition.
+
+        This mutable orchestration row is deliberately not routed through the
+        generic batch ``upsert`` checkpoint. A completed data-access cursor
+        describes an earlier write attempt, not the row's current database
+        state: code-identity invalidation may later move the row back to
+        PENDING, after which COMPLETED must be applied again.
+        """
+        required = (
+            "run_id", "stage", "partition_key", "status",
+            "rows_attempted", "rows_written", "result_hash", "error_message",
+        )
+        if any(column not in row for column in required):
+            raise ValueError("foundation checkpoint row is incomplete")
+        if row["status"] not in {"PENDING", "RUNNING", "COMPLETED", "FAILED"}:
+            raise ValueError("invalid foundation checkpoint status")
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="ops.foundation_rebuild_checkpoint",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+
+        def save() -> int:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO ops.foundation_rebuild_checkpoint
+                         (run_id, stage, partition_key, status, rows_attempted,
+                          rows_written, result_hash, error_message)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (run_id, stage, partition_key) DO UPDATE SET
+                         status=EXCLUDED.status,
+                         rows_attempted=EXCLUDED.rows_attempted,
+                         rows_written=EXCLUDED.rows_written,
+                         result_hash=EXCLUDED.result_hash,
+                         error_message=EXCLUDED.error_message,
+                         updated_at=CURRENT_TIMESTAMP""",
+                    tuple(row[column] for column in required),
+                )
+                return int(cur.rowcount or 0)
+
+        return self._kernel._run_chunk(save)
+
     def commit_release_validation(
         self, context: RunContext, scope: WorkScope, result: Mapping[str, Any],
     ) -> int:

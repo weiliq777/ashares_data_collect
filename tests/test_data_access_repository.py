@@ -272,6 +272,36 @@ def test_foundation_checkpoint_invalidation_can_target_changed_stages_only():
     assert update["params"][-1] == ["valuation_daily_v2"]
 
 
+def test_foundation_checkpoint_state_is_reapplied_after_invalidation():
+    """An earlier write cursor must not swallow a later state transition."""
+    from data_collect.data_access.repository.financial_repository import FinancialRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = FinancialRepository(kernel)
+    for _ in range(2):
+        repository.save_checkpoint(
+            "run-1", "company_financial_v2", "000001.SZ..000005.SZ",
+            "COMPLETED", ctx(), attempted=80, written=80,
+            result_hash="a" * 64,
+        )
+
+    statements = [
+        entry for entry in conn.executed
+        if entry["kind"] == "execute"
+        and entry["sql"].startswith(
+            "INSERT INTO ops.foundation_rebuild_checkpoint"
+        )
+    ]
+    assert len(statements) == 2
+    assert all(
+        "ON CONFLICT (run_id, stage, partition_key)" in entry["sql"]
+        for entry in statements
+    )
+
+
 def test_foundation_completed_checkpoints_are_loaded_in_one_bounded_read():
     from data_collect.data_access.repository.financial_repository import FinancialRepository
 

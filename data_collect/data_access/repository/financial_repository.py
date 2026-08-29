@@ -885,14 +885,8 @@ class FinancialRepository(BaseRepository):
             "result_hash": result_hash,
             "error_message": error,
         }
-        return self.kernel.write.upsert(
+        return self.kernel.write.save_foundation_checkpoint(
             context=context,
             scope=WorkScope(dimensions={"run_id": run_id, "stage": stage}),
-            target="ops.foundation_rebuild_checkpoint",
-            rows=[row],
-            key=["run_id", "stage", "partition_key"],
-            update_columns=[
-                "status", "rows_attempted", "rows_written", "result_hash",
-                "error_message",
-            ],
+            row=row,
         )
