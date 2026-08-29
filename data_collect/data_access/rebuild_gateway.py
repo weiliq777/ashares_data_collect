@@ -131,7 +131,7 @@ class RebuildGateway:
 
                 self._build_index(staging, target)
                 self._kernel.quality.validate(context, scope, staging, target)
-                self._staging_hash(staging)
+                self._staging_hash(staging, target)
 
                 attached = self._publish(mode, target, staging, scope)
                 published = True
@@ -751,16 +751,34 @@ class RebuildGateway:
 
         self._kernel._run_chunk(build_index, idempotent=False)
 
-    def _staging_hash(self, staging: str) -> str:
-        """Hash staging deterministically without building one giant value."""
+    def _staging_hash(self, staging: str, target: str | None = None) -> str:
+        """Hash staging deterministically without forcing a JSON sort spill.
+
+        Quality validation runs immediately before this method and blocks
+        duplicate primary keys.  For governed targets with a primary key, the
+        key order is therefore a deterministic row order and can use the
+        staging primary-key index.  The legacy JSON ordering remains the
+        fail-safe fallback for unkeyed test/migration relations.
+        """
+        staging = validate_qualified_name(staging)
+        order_by = "row_to_json(t)::text"
+        if target is not None:
+            target = validate_qualified_name(target)
+            policy = self._kernel.policy_registry.require(target)
+            if policy.primary_key:
+                order_by = ", ".join(
+                    f"t.{validate_table_name(column)}"
+                    for column in policy.primary_key
+                )
+
         def hash_staging() -> str:
             conn = self._kernel._db_connection()
             digest = hashlib.sha256()
             with conn.cursor(name=f"rebuild_hash_{uuid.uuid4().hex}") as cur:
                 cur.itersize = 10_000
                 cur.execute(
-                    "SELECT row_to_json(t)::text FROM %s t "
-                    "ORDER BY row_to_json(t)::text" % staging
+                    "SELECT row_to_json(t)::text FROM %s t ORDER BY %s" %
+                    (staging, order_by)
                 )
                 while True:
                     rows = cur.fetchmany(10_000)

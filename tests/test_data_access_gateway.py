@@ -770,6 +770,23 @@ def test_rebuild_hash_uses_named_cursor_and_streaming_fetchmany_without_string_a
     assert all("string_agg" not in entry["sql"].lower() for entry in conn.executed)
 
 
+def test_rebuild_hash_uses_staging_primary_key_order_when_target_is_known():
+    conn = FakeConnection(stream_rows=[("alpha",)])
+    kernel = DataAccessKernel(
+        policy_registry=registry(), connection_factory=lambda: conn,
+    )
+
+    kernel.rebuild._staging_hash(
+        "feature._staging_price_daily_v2_test", "feature.price_daily_v2"
+    )
+
+    hash_sql = next(
+        entry["sql"] for entry in conn.executed if "row_to_json" in entry["sql"]
+    )
+    assert "ORDER BY t.ts_code, t.trade_date" in hash_sql
+    assert "ORDER BY row_to_json(t)::text" not in hash_sql
+
+
 def test_rebuild_publish_acquires_and_releases_advisory_session_lock():
     kernel, conn = make_kernel()
     kernel.rebuild.publish(
