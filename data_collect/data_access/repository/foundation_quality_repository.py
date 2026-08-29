@@ -173,7 +173,7 @@ class FoundationQualityRepository(BaseRepository):
             codes=tuple(codes) if codes else None,
             partition="foundation-quality-v2",
         )
-        checks = {
+        scalar_checks = {
             "income_mapping_mismatch": (
                 "std.financial_income_standard",
                 """SELECT COUNT(*) AS value FROM std.financial_income_standard
@@ -200,11 +200,6 @@ class FoundationQualityRepository(BaseRepository):
                           AND i.data_available_timestamp <= f.data_available_timestamp)""" + (" AND f.ts_code=ANY(%s)" if codes else ""),
                 [start_date, end_date, *suffix],
             ),
-            "company_rows": (
-                company,
-                f"SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s" + code_company,
-                [start_date, end_date, *suffix],
-            ),
             "company_missing_report_periods": (
                 company,
                 f"""SELECT COUNT(*) AS value FROM (
@@ -223,76 +218,81 @@ class FoundationQualityRepository(BaseRepository):
                 ) missing""",
                 [start_date, end_date, visibility_cutoff, *suffix, visibility_cutoff],
             ),
-            "company_contract_mismatch": (
-                company,
-                f"SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s AND feature_contract_version<>'feature-contract-v2.0'" + code_company,
-                [start_date, end_date, *suffix],
-            ),
-            "invalid_complete_ttm": (
-                company,
-                f"""SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s
-                   AND ttm_complete AND (ttm_component_count<>ttm_required_component_count
-                     OR net_profit_consolidated_ttm IS NULL OR net_profit_parent_ttm IS NULL
-                     OR operating_cashflow_ttm IS NULL)""" + code_company,
-                [start_date, end_date, *suffix],
-            ),
-            # The Feature table is a mutable current view and can contain
-            # announcements observed after the release cutoff.  Keep this
-            # count for audit evidence; Snapshot/PIT selection is responsible
-            # for excluding these rows from a historical cutoff.
-            "company_future_rows": (
-                company,
-                f"""SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s
-                   AND data_available_timestamp >= (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'""" + code_company,
-                [start_date, end_date, visibility_cutoff, *suffix],
-            ),
-            "invalid_ocf_ratio": (
-                company,
-                f"""SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s AND comp_type='1'
-                   AND ((net_profit_consolidated_ttm<=0 AND ocf_to_net_profit_consolidated_ttm IS NOT NULL)
-                     OR (net_profit_consolidated_ttm>0 AND operating_cashflow_ttm IS NOT NULL
-                         AND ocf_to_net_profit_consolidated_ttm IS DISTINCT FROM operating_cashflow_ttm/net_profit_consolidated_ttm))""" + code_company,
-                [start_date, end_date, *suffix],
-            ),
-            "invalid_comp_type_cashflow": (
-                company,
-                f"""SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s
-                   AND ((comp_type IS NULL AND (cashflow_quality_status<>'UNKNOWN_COMP_TYPE' OR ocf_to_net_profit_consolidated_ttm IS NOT NULL))
-                     OR (comp_type IS NOT NULL AND comp_type<>'1' AND (cashflow_quality_status<>'NOT_APPLICABLE' OR ocf_to_net_profit_consolidated_ttm IS NOT NULL)))""" + code_company,
-                [start_date, end_date, *suffix],
-            ),
-            "missing_pit_evidence": (
-                company,
-                f"SELECT COUNT(*) AS value FROM {company} WHERE report_date BETWEEN %s AND %s AND COALESCE(pit_evidence_level,'UNKNOWN')='UNKNOWN'" + code_company,
-                [start_date, end_date, *suffix],
-            ),
-            "valuation_rows": (
-                valuation,
-                f"SELECT COUNT(*) AS value FROM {valuation} WHERE trade_date BETWEEN %s AND %s" + code_valuation,
-                [start_date, end_date, *suffix],
-            ),
-            "valuation_contract_mismatch": (
-                valuation,
-                f"SELECT COUNT(*) AS value FROM {valuation} WHERE trade_date BETWEEN %s AND %s AND feature_contract_version<>'feature-contract-v2.0'" + code_valuation,
-                [start_date, end_date, *suffix],
-            ),
-            "invalid_dividend_percentile": (
-                valuation,
-                f"""SELECT COUNT(*) AS value FROM {valuation} WHERE trade_date BETWEEN %s AND %s
-                   AND dv_ttm_percentile_5y IS NOT NULL AND (COALESCE(dv_observation_days,0)<%s OR dv_ttm_percentile_5y<0 OR dv_ttm_percentile_5y>1)""" + code_valuation,
-                [start_date, end_date, DIVIDEND_PERCENTILE_MIN_OBSERVATIONS, *suffix],
-            ),
-            "valuation_future_rows": (
-                valuation,
-                f"""SELECT COUNT(*) AS value FROM {valuation} WHERE trade_date BETWEEN %s AND %s
-                   AND (data_available_timestamp IS NULL OR data_available_timestamp < trade_date::timestamp AT TIME ZONE 'Asia/Shanghai'
-                        OR data_available_timestamp >= (trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai')""" + code_valuation,
-                [start_date, end_date, *suffix],
-            ),
         }
         report = {"scope": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat(), "codes": codes or "ALL"}, "checks": {}, "failures": {}}
-        for name, (source, sql, params) in checks.items():
+        for name, (source, sql, params) in scalar_checks.items():
             report["checks"][name] = int(self.kernel.read._repository_query(context, source, sql, params=params, scope=scope, max_rows=2)[0]["value"] or 0)
+
+        # These metrics share the same source and date predicate.  Returning
+        # all counters from one bounded aggregate preserves every individual
+        # quality rule while avoiding seven scans of the company feature
+        # partition for each 180-day window.
+        company_row = self.kernel.read._repository_query(
+            context,
+            company,
+            f"""SELECT
+                COUNT(*) AS company_rows,
+                COUNT(*) FILTER (WHERE feature_contract_version<>'feature-contract-v2.0') AS company_contract_mismatch,
+                COUNT(*) FILTER (WHERE ttm_complete AND (
+                    ttm_component_count<>ttm_required_component_count
+                    OR net_profit_consolidated_ttm IS NULL
+                    OR net_profit_parent_ttm IS NULL
+                    OR operating_cashflow_ttm IS NULL)) AS invalid_complete_ttm,
+                COUNT(*) FILTER (WHERE data_available_timestamp >=
+                    (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai') AS company_future_rows,
+                COUNT(*) FILTER (WHERE comp_type='1' AND (
+                    (net_profit_consolidated_ttm<=0 AND ocf_to_net_profit_consolidated_ttm IS NOT NULL)
+                    OR (net_profit_consolidated_ttm>0 AND operating_cashflow_ttm IS NOT NULL
+                        AND ocf_to_net_profit_consolidated_ttm IS DISTINCT FROM
+                            operating_cashflow_ttm/net_profit_consolidated_ttm))) AS invalid_ocf_ratio,
+                COUNT(*) FILTER (WHERE
+                    (comp_type IS NULL AND (
+                        cashflow_quality_status<>'UNKNOWN_COMP_TYPE'
+                        OR ocf_to_net_profit_consolidated_ttm IS NOT NULL))
+                    OR (comp_type IS NOT NULL AND comp_type<>'1' AND (
+                        cashflow_quality_status<>'NOT_APPLICABLE'
+                        OR ocf_to_net_profit_consolidated_ttm IS NOT NULL))) AS invalid_comp_type_cashflow,
+                COUNT(*) FILTER (WHERE COALESCE(pit_evidence_level,'UNKNOWN')='UNKNOWN') AS missing_pit_evidence
+              FROM {company}
+             WHERE report_date BETWEEN %s AND %s{code_company}""",
+            params=[visibility_cutoff, start_date, end_date, *suffix],
+            scope=scope,
+            max_rows=2,
+        )[0]
+        for name in (
+            "company_rows", "company_contract_mismatch", "invalid_complete_ttm",
+            "company_future_rows", "invalid_ocf_ratio",
+            "invalid_comp_type_cashflow", "missing_pit_evidence",
+        ):
+            report["checks"][name] = int(company_row[name] or 0)
+
+        # The valuation counters likewise use one bounded scan.  Coverage is
+        # still verified independently below: its fingerprint is only a
+        # pre-filter and suspect dates always receive exact anti-join checks.
+        valuation_row = self.kernel.read._repository_query(
+            context,
+            valuation,
+            f"""SELECT
+                COUNT(*) AS valuation_rows,
+                COUNT(*) FILTER (WHERE feature_contract_version<>'feature-contract-v2.0') AS valuation_contract_mismatch,
+                COUNT(*) FILTER (WHERE dv_ttm_percentile_5y IS NOT NULL AND (
+                    COALESCE(dv_observation_days,0)<%s
+                    OR dv_ttm_percentile_5y<0 OR dv_ttm_percentile_5y>1)) AS invalid_dividend_percentile,
+                COUNT(*) FILTER (WHERE
+                    data_available_timestamp IS NULL
+                    OR data_available_timestamp < trade_date::timestamp AT TIME ZONE 'Asia/Shanghai'
+                    OR data_available_timestamp >= (trade_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai') AS valuation_future_rows
+              FROM {valuation}
+             WHERE trade_date BETWEEN %s AND %s{code_valuation}""",
+            params=[DIVIDEND_PERCENTILE_MIN_OBSERVATIONS, start_date, end_date, *suffix],
+            scope=scope,
+            max_rows=2,
+        )[0]
+        for name in (
+            "valuation_rows", "valuation_contract_mismatch",
+            "invalid_dividend_percentile", "valuation_future_rows",
+        ):
+            report["checks"][name] = int(valuation_row[name] or 0)
         valuation_missing, valuation_extra = self._valuation_coverage_checks(
             start_date, end_date, context, scope, valuation, codes,
         )

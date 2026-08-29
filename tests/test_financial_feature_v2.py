@@ -313,11 +313,65 @@ def test_foundation_quality_treats_post_cutoff_feature_rows_as_audit_info():
     assert 'report["informational"]' in source
 
 
+def test_foundation_quality_batches_same_table_metrics_without_losing_rules():
+    from data_collect.data_access.repository.foundation_quality_repository import (
+        FoundationQualityRepository,
+    )
+
+    calls = []
+
+    class ReadProbe:
+        def _repository_query(
+            self, context, source, sql, params=(), scope=None, max_rows=None,
+        ):
+            calls.append((source, sql, params))
+            if "AS company_rows" in sql:
+                return [{
+                    "company_rows": 10,
+                    "company_contract_mismatch": 0,
+                    "invalid_complete_ttm": 0,
+                    "company_future_rows": 2,
+                    "invalid_ocf_ratio": 0,
+                    "invalid_comp_type_cashflow": 0,
+                    "missing_pit_evidence": 0,
+                }]
+            if "AS valuation_rows" in sql:
+                return [{
+                    "valuation_rows": 20,
+                    "valuation_contract_mismatch": 0,
+                    "invalid_dividend_percentile": 0,
+                    "valuation_future_rows": 0,
+                }]
+            if "WITH feature_by_date" in sql:
+                return []
+            return [{"value": 0}]
+
+    class KernelProbe:
+        read = ReadProbe()
+
+    report = FoundationQualityRepository(KernelProbe()).inspect_foundation_v2(
+        date(2026, 8, 1), date(2026, 8, 21), context=None,
+    )
+
+    company_calls = [sql for source, sql, _ in calls if source == "feature.company_financial_v2"]
+    valuation_calls = [sql for source, sql, _ in calls if source == "feature.valuation_daily_v1"]
+    assert len(company_calls) == 2  # missing-period anti-join + one combined scan
+    assert len(valuation_calls) == 2  # one combined scan + one bounded coverage fingerprint
+    assert "FILTER (WHERE" in next(sql for sql in company_calls if "AS company_rows" in sql)
+    assert "FILTER (WHERE" in next(sql for sql in valuation_calls if "AS valuation_rows" in sql)
+    assert report["checks"]["company_rows"] == 10
+    assert report["checks"]["company_future_rows"] == 2
+    assert report["checks"]["valuation_rows"] == 20
+    assert report["passed"] is True
+
+
 def test_valuation_availability_gate_rejects_both_early_and_next_day_values():
     source = Path("data_collect/data_access/repository/foundation_quality_repository.py").read_text(
         encoding="utf-8"
     )
-    block = source.split('"valuation_future_rows":', 1)[1].split("),", 1)[0]
+    block = source.split("AS valuation_future_rows", 1)[0].rsplit(
+        "COUNT(*) FILTER", 1
+    )[1]
     assert "data_available_timestamp IS NULL" in block
     assert "data_available_timestamp <" in block
     assert "data_available_timestamp >=" in block
