@@ -340,12 +340,17 @@ class _QualityCursor:
         self.conn = conn
         self.rowcount = 0
         self._row = None
+        self._rows = []
 
     def execute(self, sql, params=None):
         self.conn.executed.append({"kind": "execute", "sql": sql, "params": params})
         staged_rowcount = self.rowcount
         self.rowcount = 0
+        self._rows = []
         if sql.startswith("SET LOCAL statement_timeout"):
+            self._row = None
+        elif "FROM pg_catalog.pg_attribute" in sql:
+            self._rows = [("snapshot_id",), ("research_date",), ("ts_code",)]
             self._row = None
         elif sql.startswith("CREATE TEMP TABLE _staging_"):
             self._row = None
@@ -356,7 +361,7 @@ class _QualityCursor:
             self._row = (self.conn.row_count,)
         elif "HAVING COUNT(*) > 1" in sql:
             self._row = (self.conn.duplicate_groups,)
-        elif "WITH staged AS MATERIALIZED" in sql and "pit_violation_count" in sql:
+        elif "pit_violation_count" in sql:
             self._row = (
                 self.conn.row_count,
                 self.conn.null_key_count,
@@ -383,6 +388,9 @@ class _QualityCursor:
 
     def fetchone(self):
         return self._row
+
+    def fetchall(self):
+        return list(self._rows)
 
     def __enter__(self):
         return self
@@ -443,6 +451,13 @@ def test_quality_gateway_returns_six_results_and_persists_report():
         connection, "ops.data_quality_result"
     )["sql"]
     assert persisted["params"][0][-2] == 0
+
+    aggregate = next(
+        item["sql"] for item in connection.executed
+        if "pit_violation_count" in item["sql"]
+    )
+    assert "to_jsonb" not in aggregate
+    assert "FROM contract.stock_snapshot_daily s" in aggregate
     assert len(persisted["params"][0][-1]) == 64
 
 

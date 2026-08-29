@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.errors import DataAccessError
-from data_collect.data_access.query_guard import validate_qualified_name
+from data_collect.data_access.query_guard import validate_qualified_name, validate_table_name
 
 
 class QualityViolation(DataAccessError):
@@ -88,13 +88,16 @@ class QualityGateway:
         scope: WorkScope,
         staging: str,
         target: str,
+        staging_columns: tuple[str, ...] | None = None,
     ) -> None:
         """发布前质量门禁：存在 BLOCK 则抛 QualityViolation，阻止 FROZEN/publish。"""
         # Quality scans can involve several aggregate queries. Keep them
         # inside one governed read transaction so statement_timeout and the
         # cumulative TransactionManager deadline apply to the whole gate.
         checks = self._kernel._run_chunk(
-            lambda: self._gather_checks(context, scope, staging, target)
+            lambda: self._gather_checks(
+                context, scope, staging, target, staging_columns=staging_columns,
+            )
         )
         result = self.record(context, scope, checks, target=target)
         if result["block_count"] > 0:
@@ -103,7 +106,13 @@ class QualityGateway:
             )
 
     def _gather_checks(
-        self, context: RunContext, scope: WorkScope, staging: str, target: str
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        staging: str,
+        target: str,
+        *,
+        staging_columns: tuple[str, ...] | None = None,
     ) -> Mapping[str, Mapping[str, Any]]:
         """收集六类检查（生产实现接入真实覆盖/新鲜度/唯一性/合法性/一致性/PIT 安全）。"""
         # 默认：无 BLOCK，生产由子类/注入覆盖
@@ -132,9 +141,10 @@ class QualityGateway:
         )
         # Combine the row-count, null-key, scope, freshness and PIT scans into
         # one bounded aggregate over staging.  The duplicate-group check is
-        # intentionally kept separate because it requires GROUP BY.  The
-        # materialized JSON projection makes the generic PIT check evaluate
-        # to_jsonb once per staged row instead of once per referenced field.
+        # intentionally kept separate because it requires GROUP BY.  Resolve
+        # the small set of optional PIT columns from the relation metadata and
+        # reference them directly; materializing to_jsonb(t) for every wide
+        # staged row can spill at the normal 4 MB work_mem setting.
         aggregate_columns = ["COUNT(*) AS row_count"]
         if policy.primary_key:
             null_predicate = " OR ".join(
@@ -168,21 +178,39 @@ class QualityGateway:
                 "NULL AS max_observed",
             ])
 
-        availability = (
-            "COALESCE(s.quality_row_json->>'version_available_date', "
-            "s.quality_row_json->>'source_available_at', "
-            "s.quality_row_json->>'financial_version_available_date', "
-            "s.quality_row_json->>'effective_announce_date')"
-        )
-        asof = (
-            "COALESCE(s.quality_row_json->>'asof_date', "
-            "s.quality_row_json->>'research_date', "
-            "s.quality_row_json->>'trade_date')"
-        )
+        if staging_columns is None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT a.attname "
+                    "FROM pg_catalog.pg_attribute a "
+                    "WHERE a.attrelid = to_regclass(%s) "
+                    "AND a.attnum > 0 AND NOT a.attisdropped "
+                    "ORDER BY a.attnum",
+                    (staging,),
+                )
+                staging_columns = tuple(str(row[0]) for row in cur.fetchall())
+        available_columns = set(staging_columns)
+
+        def coalesced_timestamp(columns: tuple[str, ...]) -> str | None:
+            expressions = [
+                f"s.{validate_table_name(column)}::timestamp"
+                for column in columns if column in available_columns
+            ]
+            if not expressions:
+                return None
+            return "COALESCE(" + ", ".join(expressions) + ")"
+
+        availability = coalesced_timestamp((
+            "version_available_date", "source_available_at",
+            "financial_version_available_date", "effective_announce_date",
+        ))
+        asof = coalesced_timestamp(("asof_date", "research_date", "trade_date"))
         aggregate_columns.append(
-            f"COUNT(*) FILTER (WHERE {availability} IS NOT NULL "
-            f"AND {asof} IS NOT NULL AND {availability}::timestamp > {asof}::timestamp) "
-            "AS pit_violation_count"
+            (
+                f"COUNT(*) FILTER (WHERE {availability} IS NOT NULL "
+                f"AND {asof} IS NOT NULL AND {availability} > {asof}) "
+                "AS pit_violation_count"
+            ) if availability and asof else "0 AS pit_violation_count"
         )
         selected_columns = list(policy.primary_key)
         if date_column:
@@ -191,11 +219,7 @@ class QualityGateway:
         select_list = ", ".join(f"t.{column}" for column in selected_columns)
         if select_list:
             select_list += ", "
-        aggregate_sql = (
-            "WITH staged AS MATERIALIZED ("
-            f"SELECT {select_list}to_jsonb(t) AS quality_row_json FROM {staging} t"
-            ") SELECT " + ", ".join(aggregate_columns) + " FROM staged s"
-        )
+        aggregate_sql = "SELECT " + ", ".join(aggregate_columns) + f" FROM {staging} s"
         with conn.cursor() as cur:
             cur.execute(aggregate_sql, tuple(aggregate_params))
             row = cur.fetchone()
