@@ -403,25 +403,36 @@ class FinancialRepository(BaseRepository):
         scoped merge that the quality gate correctly rejects.
         """
         selection_start = selection_start or warmup_start
-        where: dict[str, Any] = {
-            "trade_date__gte": selection_start,
-            "trade_date__lte": output_end,
-        }
+        params: list[Any] = [selection_start, output_end]
+        code_clause = ""
         if requested:
-            where["stock_code__in"] = list(requested)
+            code_clause = " AND stock_code=ANY(%s)"
+            params.append(list(requested))
+        sql = (
+            "SELECT DISTINCT stock_code FROM std.valuation_daily "
+            "WHERE trade_date BETWEEN %s AND %s" + code_clause +
+            " ORDER BY stock_code"
+        )
         scope = WorkScope(
             date_from=selection_start,
             date_to=output_end,
             codes=tuple(requested or ()),
         )
-        rows = self.kernel.read.query(
+        # Do not use public read.query here: it applies the 100k-row detail
+        # limit before deduplication, which can silently omit securities when
+        # the source contains millions of daily observations.  The Repository
+        # query returns the bounded distinct security set directly.
+        rows = self.kernel.read._repository_query(
             context=context,
             source="std.valuation_daily",
-            columns=["stock_code"],
-            where=where,
+            sql=sql,
+            params=params,
             scope=scope,
+            max_rows=self.kernel.policy_registry.require(
+                "std.valuation_daily"
+            ).max_read_rows,
         )
-        return sorted({str(row[0]) for row in rows})
+        return sorted({str(row["stock_code"]) for row in rows})
 
     def load_valuation_input(
         self,

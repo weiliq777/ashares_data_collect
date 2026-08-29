@@ -290,6 +290,16 @@ def test_foundation_completed_checkpoints_are_loaded_in_one_bounded_read():
     assert reads[0]["params"] == ("run-1", "company_financial_v2")
 
 
+def test_valuation_code_discovery_deduplicates_before_detail_row_limit():
+    from data_collect.data_access.repository.financial_repository import FinancialRepository
+
+    source = __import__("inspect").getsource(FinancialRepository.valuation_codes)
+    assert "SELECT DISTINCT stock_code FROM std.valuation_daily" in source
+    assert "self.kernel.read._repository_query" in source
+    assert "self.kernel.read.query" not in source
+    assert "max_rows=self.kernel.policy_registry.require" in source
+
+
 def test_financial_feature_jsonb_is_encoded_at_repository_boundary():
     from data_collect.data_access.repository.financial_repository import FinancialRepository
 
