@@ -51,12 +51,7 @@ class ReleaseRepository(BaseRepository):
 
     def source_manifest(self, cutoff: date, context: RunContext) -> tuple[dict, str]:
         manifest = {"schema_version": "tushare-release-source-v1", "cutoff_date": cutoff.isoformat(), "market_versions": {}, "legacy_market_raw": {}, "append_only_sources": {}}
-        for dataset, column in {"daily": "trade_date", "daily_basic": "trade_date", "adj_factor": "trade_date", "trade_cal": "cal_date"}.items():
-            manifest["market_versions"][dataset] = self._manifest_date_ranges(
-                "tushare_market_raw_version", column, cutoff, context,
-                dataset=dataset, include_record_id=True,
-                partition=f"release:market:{dataset}",
-            )
+        manifest["market_versions"] = self._market_versions_manifest(cutoff, context)
         for table, column in {"tushare_daily_raw": "trade_date", "tushare_daily_basic_raw": "trade_date", "tushare_adj_factor_raw": "trade_date", "tushare_trade_cal_raw": "cal_date"}.items():
             manifest["legacy_market_raw"][table] = self._manifest_date_ranges(
                 table, column, cutoff, context, include_record_id=False,
@@ -76,6 +71,119 @@ class ReleaseRepository(BaseRepository):
             manifest["append_only_sources"][table] = self._manifest_row(row)
         encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
         return manifest, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _market_versions_manifest(self, cutoff: date, context: RunContext) -> dict[str, dict]:
+        """Aggregate all versioned market datasets in shared date windows.
+
+        ``tushare_market_raw_version`` stores daily, daily_basic, adj_factor
+        and trade_cal in one large append-only table.  Scanning that table
+        once per dataset multiplies the I/O cost without adding evidence.
+        This method keeps the same per-dataset counts and maxima as the
+        previous implementation, but groups all four datasets in one bounded
+        query per window.  A timed-out window is still bisected independently
+        so the statement and transaction safety contract is unchanged.
+        """
+        datasets = ("daily", "daily_basic", "adj_factor", "trade_cal")
+        empty = {
+            dataset: {
+                "row_count": 0,
+                "max_record_id": None,
+                "max_fetched_at": None,
+            }
+            for dataset in datasets
+        }
+        minimum_rows = self.kernel.read._repository_query(
+            context,
+            "tushare_market_raw_version",
+            """SELECT dataset,
+                       MIN(CASE WHEN dataset='trade_cal' THEN cal_date ELSE trade_date END) AS min_date
+                  FROM tushare_market_raw_version
+                 WHERE dataset=ANY(%s)
+                   AND CASE WHEN dataset='trade_cal' THEN cal_date ELSE trade_date END IS NOT NULL
+                 GROUP BY dataset""",
+            params=[list(datasets)],
+            scope=WorkScope(date_to=cutoff, partition="release:market:minimum"),
+            max_rows=10,
+        )
+        minimums = {
+            str(row["dataset"]): row["min_date"]
+            for row in minimum_rows
+            if row.get("min_date") is not None and row["min_date"] <= cutoff
+        }
+        if not minimums:
+            return empty
+
+        def aggregate_window(window_start: date, window_end: date) -> dict[str, dict]:
+            try:
+                rows = self.kernel.read._repository_query(
+                    context,
+                    "tushare_market_raw_version",
+                    """SELECT dataset, COUNT(*) AS count,
+                               MAX(record_id) AS max_record_id,
+                               MAX(fetched_at) AS max_fetched_at
+                          FROM tushare_market_raw_version
+                         WHERE dataset=ANY(%s)
+                           AND ((dataset='trade_cal' AND cal_date BETWEEN %s AND %s)
+                             OR (dataset<>'trade_cal' AND trade_date BETWEEN %s AND %s))
+                         GROUP BY dataset""",
+                    params=[list(datasets), window_start, window_end, window_start, window_end],
+                    scope=WorkScope(
+                        date_from=window_start, date_to=window_end,
+                        partition=f"release:market:shared:{window_start}:{window_end}",
+                    ),
+                    max_rows=10,
+                )
+                return {
+                    str(row["dataset"]): {
+                        "row_count": int(row.get("count") or 0),
+                        "max_record_id": int(row["max_record_id"]) if row.get("max_record_id") is not None else None,
+                        "max_fetched_at": row["max_fetched_at"].isoformat() if row.get("max_fetched_at") else None,
+                    }
+                    for row in rows
+                }
+            except Exception as exc:
+                if "statement timeout" not in str(exc).lower() or window_start >= window_end:
+                    raise
+                midpoint = window_start + (window_end - window_start) // 2
+                left = aggregate_window(window_start, midpoint)
+                right = aggregate_window(midpoint + timedelta(days=1), window_end)
+                merged = {}
+                for dataset in datasets:
+                    left_row = left.get(dataset, empty[dataset])
+                    right_row = right.get(dataset, empty[dataset])
+                    timestamps = [
+                        value for value in (left_row["max_fetched_at"], right_row["max_fetched_at"])
+                        if value is not None
+                    ]
+                    record_ids = [
+                        value for value in (left_row["max_record_id"], right_row["max_record_id"])
+                        if value is not None
+                    ]
+                    merged[dataset] = {
+                        "row_count": left_row["row_count"] + right_row["row_count"],
+                        "max_record_id": max(record_ids) if record_ids else None,
+                        "max_fetched_at": max(timestamps) if timestamps else None,
+                    }
+                return merged
+
+        result = {dataset: dict(values) for dataset, values in empty.items()}
+        window_start = min(minimums.values())
+        while window_start <= cutoff:
+            window_end = min(cutoff, window_start + timedelta(days=self._MANIFEST_WINDOW_DAYS - 1))
+            window_rows = aggregate_window(window_start, window_end)
+            for dataset, row in window_rows.items():
+                result[dataset]["row_count"] += row["row_count"]
+                if row["max_record_id"] is not None:
+                    result[dataset]["max_record_id"] = max(
+                        result[dataset]["max_record_id"] or 0, row["max_record_id"],
+                    )
+                if row["max_fetched_at"] is not None and (
+                    result[dataset]["max_fetched_at"] is None
+                    or row["max_fetched_at"] > result[dataset]["max_fetched_at"]
+                ):
+                    result[dataset]["max_fetched_at"] = row["max_fetched_at"]
+            window_start = window_end + timedelta(days=1)
+        return result
 
     def quality_gate(self, cutoff: date | None, include_foundation_v2: bool, context: RunContext) -> dict:
         quality = QualityInspectionRepository(self.kernel)

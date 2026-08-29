@@ -415,6 +415,38 @@ def test_release_manifest_splits_only_a_timed_out_window():
     assert result["max_record_id"] == 21
 
 
+def test_release_manifest_groups_versioned_market_datasets_in_one_scan():
+    from datetime import datetime
+    from types import SimpleNamespace
+    from data_collect.data_access.repository.release_repository import ReleaseRepository
+
+    calls = []
+
+    class ReadProbe:
+        def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
+            calls.append((source, sql, params))
+            if "MIN(CASE" in sql:
+                return [
+                    {"dataset": "daily", "min_date": date(2026, 8, 1)},
+                    {"dataset": "daily_basic", "min_date": date(2026, 8, 1)},
+                    {"dataset": "adj_factor", "min_date": date(2026, 8, 1)},
+                    {"dataset": "trade_cal", "min_date": date(2026, 8, 1)},
+                ]
+            return [
+                {"dataset": dataset, "count": 3, "max_record_id": index,
+                 "max_fetched_at": datetime(2026, 8, 21, 12, 0)}
+                for index, dataset in enumerate(("daily", "daily_basic", "adj_factor", "trade_cal"), 1)
+            ]
+
+    repository = ReleaseRepository(SimpleNamespace(read=ReadProbe()))
+    result = repository._market_versions_manifest(date(2026, 8, 21), None)
+
+    assert len(calls) == 2  # one grouped minimum query + one grouped aggregate
+    assert all(item["row_count"] == 3 for item in result.values())
+    assert all(item["max_record_id"] in {1, 2, 3, 4} for item in result.values())
+    assert all(item["max_fetched_at"] == "2026-08-21T12:00:00" for item in result.values())
+
+
 def test_feature_repository_rebuild_price_v2_scoped_merge():
     """rebuild_price_v2 迁移：分批 scoped merge（DELETE + INSERT...ON CONFLICT），无 TRUNCATE。"""
     from data_collect.data_access.repository.feature_repository import FeatureRepository
