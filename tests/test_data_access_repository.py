@@ -344,6 +344,41 @@ def test_financial_feature_jsonb_is_encoded_at_repository_boundary():
     assert lineage["sources"] == ["raw-1"]
 
 
+def test_release_manifest_aggregates_each_source_once_through_cutoff():
+    from datetime import datetime
+    from data_collect.data_access.repository.release_repository import ReleaseRepository
+
+    class ProbeReleaseRepository(ReleaseRepository):
+        def __init__(self):
+            super().__init__(None)
+            self.calls = []
+
+        def _aggregate(self, table, sql, params, context, partition):
+            self.calls.append((table, sql, params, partition))
+            return {
+                "count": 7, "max_record_id": 9,
+                "max_fetched_at": datetime(2026, 8, 21, 12, 0),
+            }
+
+    repository = ProbeReleaseRepository()
+    cutoff = date(2026, 8, 21)
+    result = repository._manifest_date_ranges(
+        "tushare_market_raw_version", "trade_date", cutoff, None,
+        dataset="daily", include_record_id=True, partition="release:market:daily",
+    )
+
+    assert len(repository.calls) == 1
+    _, sql, params, partition = repository.calls[0]
+    assert "trade_date <= %s" in sql
+    assert "BETWEEN" not in sql
+    assert params == (cutoff, "daily")
+    assert partition.endswith(":through:2026-08-21")
+    assert result == {
+        "row_count": 7, "max_record_id": 9,
+        "max_fetched_at": "2026-08-21T12:00:00",
+    }
+
+
 def test_feature_repository_rebuild_price_v2_scoped_merge():
     """rebuild_price_v2 迁移：分批 scoped merge（DELETE + INSERT...ON CONFLICT），无 TRUNCATE。"""
     from data_collect.data_access.repository.feature_repository import FeatureRepository
