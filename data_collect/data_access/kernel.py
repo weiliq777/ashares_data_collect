@@ -318,6 +318,12 @@ class DataAccessKernel:
     def _checkpoint_done(self, run_id: str, job_name: str, scope_key: str) -> None:
         self._checkpoint_action("done", run_id, job_name, scope_key)
 
+    def _checkpoint_clear(self, context: RunContext, scope_key: str) -> None:
+        """Discard progress whose physical staging state no longer exists."""
+        if self.transaction_manager.in_atomic:
+            raise RuntimeError("checkpoint reset is forbidden inside run_atomic")
+        self.checkpoint.clear(context.run_id, context.job_name, scope_key)
+
     def _checkpoint_action(self, action: str, *args) -> None:
         """Persist only committed progress.
 

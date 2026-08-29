@@ -89,25 +89,43 @@ class RebuildGateway:
             attached = False
             published = False
             try:
-                def create_staging() -> None:
-                    conn = self._kernel._db_connection()
-                    with conn.cursor() as cur:
-                        if temporary_staging:
-                            cur.execute(
-                                f"CREATE TEMP TABLE IF NOT EXISTS {staging} "
-                                f"(LIKE {target} INCLUDING ALL) "
-                                "ON COMMIT PRESERVE ROWS"
-                            )
-                        else:
-                            cur.execute(f"CREATE TABLE IF NOT EXISTS {staging} (LIKE {target})")
-
-                self._kernel._run_chunk(create_staging)
-
-                # Consume lazily under both row and estimated-byte budgets.
-                columns: list[str] | None = None
                 scope_key = self._kernel._checkpoint_batch_scope_key(
                     f"rebuild:{mode.value}", target, scope, ()
                 )
+
+                def create_staging() -> bool:
+                    conn = self._kernel._db_connection()
+                    with conn.cursor() as cur:
+                        if temporary_staging:
+                            # TEMP relations are connection-local. A durable
+                            # chunk checkpoint is resumable only while its
+                            # matching staging relation still exists in this
+                            # session. Process/connection restart removes the
+                            # relation but not the checkpoint.
+                            cur.execute("SELECT to_regclass(%s)", (staging,))
+                            existed = bool(cur.fetchone()[0])
+                            if existed:
+                                return False
+                            cur.execute(
+                                f"CREATE TEMP TABLE {staging} "
+                                f"(LIKE {target} INCLUDING ALL) "
+                                "ON COMMIT PRESERVE ROWS"
+                            )
+                            return True
+                        else:
+                            cur.execute(f"CREATE TABLE IF NOT EXISTS {staging} (LIKE {target})")
+                            return False
+
+                staging_created = self._kernel._run_chunk(create_staging)
+
+                if temporary_staging and staging_created:
+                    # A new empty TEMP table cannot contain chunks described
+                    # by a checkpoint from an earlier database session. Reset
+                    # only this bounded scope and stage it again from chunk 1.
+                    self._kernel._checkpoint_clear(context, scope_key)
+
+                # Consume lazily under both row and estimated-byte budgets.
+                columns: list[str] | None = None
                 resume_after, done = self._kernel._checkpoint_cursor(context, scope_key)
                 if done:
                     return 0

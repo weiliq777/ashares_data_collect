@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 
@@ -31,6 +32,19 @@ class FakeCursor:
         self.rowcount = 0
         if "pg_try_advisory_lock" in sql or "pg_advisory_unlock" in sql:
             self._fetch_rows = [(True,)]
+        elif sql.lstrip().upper().startswith("SELECT TO_REGCLASS"):
+            relation = params[0]
+            self._fetch_rows = [(relation if relation in self.conn.temp_relations else None,)]
+        elif sql.lstrip().upper().startswith("CREATE TEMP TABLE"):
+            match = re.search(r"CREATE\s+TEMP\s+TABLE\s+([^\s(]+)", sql, re.IGNORECASE)
+            if match:
+                self.conn.temp_relations.add(match.group(1))
+        elif sql.lstrip().upper().startswith("DROP TABLE"):
+            match = re.search(
+                r"DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+([^\s;]+)", sql, re.IGNORECASE
+            )
+            if match:
+                self.conn.temp_relations.discard(match.group(1))
         elif "pit_violation_count" in sql:
             self._fetch_rows = [(1, 0, 0, None, 0)]
             self.description = [SimpleNamespace(name="row_count")]
@@ -75,6 +89,7 @@ class FakeConnection:
         self.cursor_names: list[str | None] = []
         self.stream_rows = list(stream_rows or [])
         self.fetchmany_calls: list[int] = []
+        self.temp_relations: set[str] = set()
         self.supports_statement_deadline = True
         self.committed = 0
         self.rolled_back = 0

@@ -751,6 +751,59 @@ def test_rebuild_publish_lifecycle_scoped_merge():
     assert any("DELETE FROM feature.price_daily_v2 WHERE trade_date >=" in s for s in sqls)
 
 
+def test_scoped_merge_discards_stale_checkpoint_when_temp_staging_was_lost():
+    """A process restart loses TEMP staging, so its durable cursor is invalid."""
+    kernel, conn = make_kernel(max_rows=1)
+    context = ctx()
+    scope = WorkScope(date_from=date(2026, 1, 1))
+    scope_key = kernel._checkpoint_batch_scope_key(
+        "rebuild:SCOPED_MERGE", "feature.price_daily_v2", scope, ()
+    )
+    kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, 100)
+    kernel._checkpoint_done(context.run_id, context.job_name, scope_key)
+
+    written = kernel.rebuild.publish(
+        context=context,
+        scope=scope,
+        target="feature.price_daily_v2",
+        producer=lambda _scope: _feature_rows(2),
+        mode=RebuildMode.SCOPED_MERGE,
+    )
+
+    assert written == 2
+    inserts = [entry for entry in conn.executed if entry["kind"] == "executemany"]
+    assert sum(entry["rowcount"] for entry in inserts) == 2
+    state = kernel.checkpoint.load(context.run_id, context.job_name, scope_key)
+    assert state is not None and state.done and state.cursor == 2
+
+
+def test_scoped_merge_keeps_checkpoint_when_temp_staging_still_exists():
+    """A same-session retry may safely resume chunks already in TEMP staging."""
+    kernel, conn = make_kernel(max_rows=1)
+    context = ctx()
+    scope = WorkScope(date_from=date(2026, 1, 1))
+    staging = kernel.rebuild._temporary_staging_name(
+        "feature.price_daily_v2", context
+    )
+    conn.temp_relations.add(staging)
+    scope_key = kernel._checkpoint_batch_scope_key(
+        "rebuild:SCOPED_MERGE", "feature.price_daily_v2", scope, ()
+    )
+    kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, 1)
+
+    written = kernel.rebuild.publish(
+        context=context,
+        scope=scope,
+        target="feature.price_daily_v2",
+        producer=lambda _scope: _feature_rows(2),
+        mode=RebuildMode.SCOPED_MERGE,
+    )
+
+    assert written == 1
+    inserts = [entry for entry in conn.executed if entry["kind"] == "executemany"]
+    assert sum(entry["rowcount"] for entry in inserts) == 1
+
+
 def test_rebuild_hash_uses_named_cursor_and_streaming_fetchmany_without_string_agg():
     conn = FakeConnection(stream_rows=[("alpha",), ("beta",), ("gamma",)])
     kernel = DataAccessKernel(
