@@ -675,6 +675,27 @@ def test_run_insert_select_executes():
     assert any("INSERT INTO feature.price_daily_v2" in e["sql"] for e in conn.executed)
 
 
+def test_run_insert_select_allows_single_with_insert_select():
+    kernel, conn = make_kernel()
+    plan = SqlPlan(
+        operation=Operation.REBUILD,
+        target="feature.price_daily_v2",
+        scope=WorkScope(date_from=date(2026, 1, 1)),
+        expected_mode="SET_BASED",
+        allow_insert_select=True,
+    )
+    kernel.rebuild.run_insert_select(
+        sql=(
+            "WITH source AS (SELECT 1 AS value) "
+            "INSERT INTO feature.price_daily_v2 SELECT value FROM source"
+        ),
+        plan=plan,
+        context=ctx(),
+    )
+    assert conn.committed == 1
+    assert any("WITH source" in e["sql"] for e in conn.executed)
+
+
 def test_set_based_rebuild_does_not_enter_automatic_retry_boundary():
     kernel, conn = make_kernel()
     kernel.retry_policy.run = lambda *_args, **_kwargs: pytest.fail(

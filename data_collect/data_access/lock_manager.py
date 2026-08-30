@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 from contextlib import contextmanager
+from collections.abc import Iterable
 
 from data_collect.data_access.transaction_manager import TransactionManager
 
@@ -73,6 +74,45 @@ class LockManager:
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                conn.commit()
+            except Exception:
+                self._tm.rollback()
+
+    @contextmanager
+    def session_exclusive_many(self, target: str, scope_keys: Iterable[str]):
+        """Hold several deterministic session locks during one bounded batch."""
+        from data_collect.data_access.errors import LockNotAcquired
+
+        if self._tm.in_atomic:
+            raise RuntimeError(
+                "session_exclusive_many cannot run inside an atomic workflow"
+            )
+        normalized = tuple(sorted({str(value) for value in scope_keys if str(value).strip()}))
+        if not normalized:
+            raise ValueError("session_exclusive_many requires at least one scope key")
+
+        conn = self._tm._connection()
+        acquired: list[int] = []
+        try:
+            with conn.cursor() as cur:
+                for scope_key in normalized:
+                    key = self.lock_key(target, scope_key)
+                    cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+                    row = cur.fetchone()
+                    if not row or not row[0]:
+                        raise LockNotAcquired(
+                            f"同类任务正在运行，未取得排他锁: {target}/{scope_key}"
+                        )
+                    acquired.append(key)
+            conn.commit()
+            yield
+        finally:
+            if not acquired:
+                return
+            try:
+                with conn.cursor() as cur:
+                    for key in reversed(acquired):
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
                 conn.commit()
             except Exception:
                 self._tm.rollback()

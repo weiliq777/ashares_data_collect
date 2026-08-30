@@ -438,6 +438,7 @@ def build_snapshots_batch(
         baseline_value = baseline or _baseline(max(item["cutoff"] for item in manifests), next(iter(baseline_tags)))
         schema_version = next(iter(schema_versions))
         _assert_price_vintage_for_dates([item["cutoff"] for item in manifests], [], schema_version)
+        prepared = []
         for manifest in manifests:
             if manifest["status"] not in {"DRAFT", "FAILED"}:
                 raise RuntimeError(f"批量构建只允许 DRAFT/FAILED Snapshot: {manifest['snapshot_id']}")
@@ -446,8 +447,19 @@ def build_snapshots_batch(
             report, quality_hash = quality_reports[str(manifest["snapshot_id"])] if quality_reports else _quality_report(manifest["cutoff"], schema_version)
             if report["failures"]:
                 raise RuntimeError(f"质量门禁未通过: {manifest['cutoff']} {report['failures']}")
+            prepared.append((manifest, report, quality_hash))
+        if len(prepared) == 1:
+            manifest, report, quality_hash = prepared[0]
             repository.build_snapshot(
                 str(manifest["snapshot_id"]), manifest, baseline_value, report, quality_hash,
+                metadata, _inputs_for_schema(schema_version), _row_bytes, _manifest_hash, context,
+            )
+        else:
+            repository.build_snapshots_batch(
+                [manifest for manifest, _, _ in prepared],
+                baseline_value,
+                {str(manifest["snapshot_id"]): (report, quality_hash)
+                 for manifest, report, quality_hash in prepared},
                 metadata, _inputs_for_schema(schema_version), _row_bytes, _manifest_hash, context,
             )
     finally:

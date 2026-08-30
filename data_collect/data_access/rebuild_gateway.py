@@ -637,7 +637,18 @@ class RebuildGateway:
         if method == "run_insert_select":
             if not plan.allow_insert_select:
                 raise ValueError("run_insert_select 必须显式 allow_insert_select=True")
-            if len(statements) != 1 or not re.match(r"^INSERT\s+INTO\b", statements[0], re.I):
+            insert_match = re.search(r"\bINSERT\s+INTO\b", statements[0], re.I)
+            prefix = statements[0][:insert_match.start()] if insert_match else ""
+            prefix_dml = re.search(
+                r"\b(?:INSERT|UPDATE|DELETE)\s+(?:INTO|FROM)\b",
+                prefix, re.I,
+            )
+            if (
+                len(statements) != 1
+                or insert_match is None
+                or prefix_dml is not None
+                or (prefix.strip() and not prefix.lstrip().upper().startswith("WITH"))
+            ):
                 raise ValueError("run_insert_select 只接受单条 INSERT ... SELECT")
             if not re.search(r"\bSELECT\b", statements[0], re.I):
                 raise ValueError("run_insert_select 必须包含 SELECT")

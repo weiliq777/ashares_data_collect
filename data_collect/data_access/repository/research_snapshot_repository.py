@@ -409,6 +409,31 @@ class ResearchSnapshotRepository(BaseRepository):
         sql = sql.replace("FROM pit.universe_daily u", "FROM params m JOIN pit.universe_daily u ON u.trade_date=m.research_cutoff_date", 1)
         sql = sql.replace("b.record_id <= %s", "b.record_id <= m.stock_basic_max_record_id", 1)
         sql = sql.replace("WHERE u.trade_date=%s", "WHERE TRUE", 1)
+        sql = sql.replace(
+            "WHERE TRUE\n        ON CONFLICT",
+            "WHERE TRUE AND u.ts_code=ANY(%s::text[])\n        ON CONFLICT",
+            1,
+        )
+        return sql
+
+    @staticmethod
+    def foundation_snapshot_batch_sql():
+        """Return Foundation-v2 enrichment SQL for a bounded snapshot batch."""
+        sql = ResearchSnapshotRepository.foundation_snapshot_sql()
+        sql = sql.replace(
+            "SELECT %s, s.research_date",
+            "SELECT s.snapshot_id, s.research_date",
+            1,
+        )
+        sql = sql.replace(
+            "WHERE s.snapshot_id=%s",
+            "WHERE s.snapshot_id=ANY(%s::uuid[]) "
+            "AND s.research_date=ANY(%s::date[]) "
+            "AND s.ts_code=ANY(%s::text[])",
+            1,
+        )
+        if sql.count("%s") != 3:
+            raise RuntimeError("Foundation-v2 批量 SQL 参数数量异常")
         return sql
 
     @staticmethod
@@ -420,12 +445,14 @@ class ResearchSnapshotRepository(BaseRepository):
             raise RuntimeError("单日 lineage SQL 结构已变化，无法生成批量 SQL")
         sql = sql.replace(
             marker,
-            "WITH params AS (SELECT unnest(%s::uuid[]) AS snapshot_id), groups AS (",
+            "WITH params AS (SELECT unnest(%s::uuid[]) AS snapshot_id), "
+            "codes AS (SELECT unnest(%s::text[]) AS ts_code), groups AS (",
             1,
         )
         sql = sql.replace(
             "WHERE s.snapshot_id=(SELECT snapshot_id FROM params)",
-            "WHERE s.snapshot_id IN (SELECT snapshot_id FROM params)",
+            "WHERE s.snapshot_id IN (SELECT snapshot_id FROM params) "
+            "AND s.ts_code IN (SELECT ts_code FROM codes)",
         )
         return sql
 
@@ -723,6 +750,249 @@ class ResearchSnapshotRepository(BaseRepository):
                 context, scope, snapshot_id, ("DRAFT", "BUILDING", "FAILED"), "FAILED",
                 {"failure_reason": str(exc)[:2000]},
             )
+            raise
+
+    def build_snapshots_batch(
+        self,
+        manifests: list[dict[str, Any]],
+        baseline: tuple,
+        quality_reports: dict[str, tuple[dict, str]],
+        metadata: dict[str, Any],
+        definitions,
+        row_bytes,
+        manifest_hash,
+        context: RunContext,
+    ) -> None:
+        """Materialize a small date batch with shared set-based reads.
+
+        Snapshot lifecycle and input manifests remain independent per date, but
+        stock/foundation/lineage materialization shares the same code batches.
+        This removes the repeated query-planning and source-join work that made
+        a two-date ``build_snapshots_batch`` equivalent to two full single-day
+        builds.  Every Gateway call is still its own transaction, so the batch
+        never becomes one large transaction; an interrupted batch is rebuilt by
+        the normal BUILDING completeness checkpoint.
+        """
+        if not manifests:
+            return
+        if len(manifests) > 20:
+            raise ValueError("snapshot build batches are limited to 20")
+        ids = tuple(str(item["snapshot_id"]) for item in manifests)
+        cutoffs = tuple(item["cutoff"] for item in manifests)
+        if len(set(ids)) != len(ids) or len(set(cutoffs)) != len(cutoffs):
+            raise ValueError("snapshot build batch must contain unique ids and cutoff dates")
+        baseline_tags = {item["baseline"] for item in manifests}
+        schema_versions = {item["schema_version"] for item in manifests}
+        if len(baseline_tags) != 1 or len(schema_versions) != 1:
+            raise ValueError("同一批次必须使用同一 baseline_tag/schema_version")
+        schema_version = next(iter(schema_versions))
+
+        prepared: list[dict[str, Any]] = []
+        for manifest in manifests:
+            snapshot_id = str(manifest["snapshot_id"])
+            if manifest["status"] not in {"DRAFT", "FAILED"}:
+                raise RuntimeError(
+                    f"批量构建只允许 DRAFT/FAILED Snapshot: {snapshot_id} ({manifest['status']})"
+                )
+            if (
+                baseline[3] != manifest["baseline_quality_hash"]
+                or baseline[4] != manifest["baseline_source_manifest_hash"]
+            ):
+                raise RuntimeError("数据基线 Manifest 已变化，拒绝批量构建")
+            report, quality_hash = quality_reports.get(snapshot_id, (None, None))
+            if report is None or quality_hash is None:
+                raise RuntimeError(f"批量构建缺少质量证据: {snapshot_id}")
+            if report["failures"]:
+                raise RuntimeError(f"质量门禁未通过: {manifest['cutoff']} {report['failures']}")
+            stats, input_hash = self._precompute_input_manifest(
+                definitions, manifest["cutoff"], baseline[5], context, row_bytes, manifest_hash,
+            )
+            prepared.append({
+                "manifest": manifest,
+                "quality_hash": quality_hash,
+                "report": report,
+                "input_hash": input_hash,
+                "input_rows": [
+                    {
+                        "snapshot_id": snapshot_id,
+                        "schema_name": item["schema_name"],
+                        "table_name": item["table_name"],
+                        "selection_predicate": item["selection_predicate"],
+                        "selected_columns": item["selected_columns"],
+                        "hash_algorithm": item["hash_algorithm"],
+                        "row_count": item["row_count"],
+                        "min_date": item["min_date"],
+                        "max_date": item["max_date"],
+                        "content_hash": item["content_hash"],
+                    }
+                    for item in stats
+                ],
+            })
+
+        batch_scope = WorkScope(
+            date_from=min(cutoffs), date_to=max(cutoffs),
+            partition=f"snapshot-batch:{min(cutoffs)}:{max(cutoffs)}",
+            dimensions={
+                "snapshot_id": f"batch:{hashlib.sha256('|'.join(ids).encode('utf-8')).hexdigest()[:24]}",
+                "snapshot_ids": ids,
+            },
+        )
+        started: list[dict[str, Any]] = []
+        try:
+            with self.kernel.lock_manager.session_exclusive_many("research.snapshot", ids):
+                for item in prepared:
+                    manifest = item["manifest"]
+                    snapshot_id = str(manifest["snapshot_id"])
+                    scope = self._snapshot_scope(snapshot_id, manifest["cutoff"])
+                    changed = self.kernel.write.transition_snapshot_manifest(
+                        context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
+                        {
+                            "quality_report_hash": item["quality_hash"],
+                            "quality_report": json.dumps(
+                                item["report"], ensure_ascii=False, default=str,
+                            ),
+                            "code_version": metadata["code_version"],
+                            "git_commit": metadata["commit"],
+                            "git_dirty": metadata["dirty"],
+                            "diff_hash": metadata["diff_hash"],
+                            "failure_reason": None,
+                        },
+                    )
+                    if changed != 1:
+                        raise RuntimeError(f"Snapshot 状态在构建期间发生变化: {snapshot_id}")
+                    for target in (
+                        "research.snapshot_lineage",
+                        "research.stock_snapshot_daily",
+                        "research.snapshot_input",
+                    ):
+                        self._delete_snapshot_rows(snapshot_id, context, target, manifest["cutoff"])
+                    started.append(item)
+
+                high_water = baseline[5]["append_only_sources"][
+                    "tushare_stock_basic_raw_version"
+                ]["max_record_id"]
+                if high_water is None:
+                    raise RuntimeError("基线缺少 stock_basic Raw 版本高水位")
+                code_rows = self.kernel.read._repository_query(
+                    context,
+                    "pit.universe_daily",
+                    """SELECT DISTINCT ts_code
+                         FROM pit.universe_daily
+                        WHERE trade_date=ANY(%s::date[])
+                        ORDER BY ts_code""",
+                    (list(cutoffs),),
+                    WorkScope(
+                        date_from=min(cutoffs), date_to=max(cutoffs),
+                        partition="snapshot-batch-codes",
+                    ),
+                    max_rows=100_000,
+                )
+                codes = tuple(sorted({str(row["ts_code"]) for row in code_rows}))
+                if not codes:
+                    raise RuntimeError("批量快照没有可生成的 universe 数据")
+
+                stock_plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="research.stock_snapshot_daily",
+                    scope=batch_scope,
+                    expected_mode="SET_BASED",
+                    allow_insert_select=True,
+                )
+                stock_sql = self.stock_snapshot_batch_sql()
+                written = 0
+                for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
+                    code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
+                    written += self.kernel.rebuild.run_insert_select(
+                        stock_sql, stock_plan, context,
+                        (high_water, list(ids), list(code_batch)),
+                    )
+                if written <= 0:
+                    raise RuntimeError("批量快照没有写入 universe 数据")
+
+                if is_foundation_schema(schema_version):
+                    foundation_plan = SqlPlan(
+                        operation=Operation.REBUILD,
+                        target="research.stock_snapshot_daily",
+                        scope=batch_scope,
+                        expected_mode="SET_BASED",
+                    )
+                    foundation_sql = self.foundation_snapshot_batch_sql()
+                    for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
+                        code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
+                        self.kernel.rebuild.run_scoped_merge(
+                            foundation_sql, foundation_plan, context,
+                            (list(ids), list(cutoffs), list(code_batch)),
+                        )
+
+                # The lineage statement contains eleven UNION ALL branches
+                # with per-source hashing.  Keep it per snapshot so the
+                # planner can use the snapshot_id index and each statement
+                # remains below the 30-second deadline.  The expensive stock
+                # and Foundation-v2 joins above still benefit from sharing the
+                # same code batches across dates.
+                for item in prepared:
+                    manifest = item["manifest"]
+                    snapshot_id = str(manifest["snapshot_id"])
+                    cutoff = manifest["cutoff"]
+                    lineage_plan = SqlPlan(
+                        operation=Operation.REBUILD,
+                        target="research.snapshot_lineage",
+                        scope=self._snapshot_scope(snapshot_id, cutoff),
+                        expected_mode="SET_BASED",
+                        allow_insert_select=True,
+                    )
+                    lineage_sql = self.lineage_sql().replace(
+                        "WITH params AS (SELECT %s::uuid AS snapshot_id),",
+                        "WITH params AS (SELECT %s::uuid AS snapshot_id, "
+                        "%s::date AS research_date, %s::text[] AS codes),",
+                        1,
+                    ).replace(
+                        "WHERE s.snapshot_id=(SELECT snapshot_id FROM params)",
+                        "WHERE s.snapshot_id=(SELECT snapshot_id FROM params) "
+                        "AND s.research_date=(SELECT research_date FROM params) "
+                        "AND s.ts_code IN (SELECT unnest(codes) FROM params)",
+                    )
+                    for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
+                        code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
+                        self.kernel.rebuild.run_insert_select(
+                            lineage_sql, lineage_plan, context,
+                            (snapshot_id, cutoff, list(code_batch)),
+                        )
+
+                all_input_rows = [
+                    row for item in prepared for row in item["input_rows"]
+                ]
+                self.kernel.write.bulk_insert(
+                    context, batch_scope, "research.snapshot_input", all_input_rows,
+                )
+                for item in prepared:
+                    manifest = item["manifest"]
+                    snapshot_id = str(manifest["snapshot_id"])
+                    changed = self.kernel.write.transition_snapshot_manifest(
+                        context,
+                        self._snapshot_scope(snapshot_id, manifest["cutoff"]),
+                        snapshot_id,
+                        ("BUILDING",), "BUILDING",
+                        {"input_manifest_hash": item["input_hash"]},
+                    )
+                    if changed != 1:
+                        raise RuntimeError(f"Snapshot 输入 Manifest 更新失败: {snapshot_id}")
+        except Exception as exc:
+            reason = f"batch build failed: {str(exc)[:1900]}"
+            for item in started:
+                manifest = item["manifest"]
+                try:
+                    self.kernel.write.transition_snapshot_manifest(
+                        context,
+                        self._snapshot_scope(str(manifest["snapshot_id"]), manifest["cutoff"]),
+                        str(manifest["snapshot_id"]),
+                        ("DRAFT", "BUILDING", "FAILED"), "FAILED",
+                        {"failure_reason": reason},
+                    )
+                except Exception:
+                    # Preserve the original batch error; the next resume will
+                    # inspect BUILDING completeness before rebuilding.
+                    pass
             raise
 
     def validate_snapshot(self, manifest: dict[str, Any], baseline: tuple, quality_hash: str,

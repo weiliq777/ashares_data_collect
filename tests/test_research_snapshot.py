@@ -108,6 +108,22 @@ def test_snapshot_code_batches_stay_below_statement_deadline_budget():
     assert "SNAPSHOT_CODE_BATCH_SIZE = 100" in source
 
 
+def test_snapshot_batch_sql_binds_code_scope_for_each_materialization_layer():
+    stock_sql = ResearchSnapshotRepository.stock_snapshot_batch_sql()
+    foundation_sql = ResearchSnapshotRepository.foundation_snapshot_batch_sql()
+    lineage_sql = ResearchSnapshotRepository.lineage_batch_sql()
+
+    assert "u.ts_code=ANY(%s::text[])" in stock_sql
+    assert stock_sql.count("%s") == 3
+    assert "s.snapshot_id=ANY(%s::uuid[])" in foundation_sql
+    assert "s.research_date=ANY(%s::date[])" in foundation_sql
+    assert "s.ts_code=ANY(%s::text[])" in foundation_sql
+    assert foundation_sql.count("%s") == 3
+    assert "codes AS (SELECT unnest(%s::text[]) AS ts_code)" in lineage_sql
+    assert lineage_sql.count("%s") == 2
+    assert lineage_sql.count("AND s.ts_code IN (SELECT ts_code FROM codes)") == 11
+
+
 def test_snapshot_validation_reuses_persisted_input_evidence():
     source = __import__("pathlib").Path(
         "data_collect/data_access/repository/research_snapshot_repository.py"
