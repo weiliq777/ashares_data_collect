@@ -26,6 +26,14 @@ from data_collect.data_access.repository.foundation_contract_repository import F
 from data_collect.data_access.repository.schema_migration_repository import SchemaMigrationRepository
 from data_collect.data_access.repository.foundation_metadata_repository import FoundationMetadataRepository
 from data_collect.data_access.repository.contract_product_repository import ContractProductRepository
+from data_collect.data_access.repository.observation_repository import (
+    MarketAnomalyOutcomeRepository,
+    ObservationEventRepository,
+    ScenarioEvaluationRepository,
+    SectorAnomalyObservationRepository,
+    StockAnomalyObservationRepository,
+    StockSectorConfirmationRepository,
+)
 
 __all__ = [
     "BaseRepository",
@@ -52,4 +60,10 @@ __all__ = [
     "SchemaMigrationRepository",
     "FoundationMetadataRepository",
     "ContractProductRepository",
+    "StockAnomalyObservationRepository",
+    "SectorAnomalyObservationRepository",
+    "StockSectorConfirmationRepository",
+    "ObservationEventRepository",
+    "MarketAnomalyOutcomeRepository",
+    "ScenarioEvaluationRepository",
 ]

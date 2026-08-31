@@ -91,10 +91,21 @@ def _rebuild_market_date(frame, dataset, trade_date):
             if out.empty:
                 raise RuntimeError(f"daily_basic {trade_date} normalized to empty; preserve existing Standard")
             keep = [
-                "stock_code", "trade_date", "turnover_rate", "pe", "pe_ttm",
-                "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv",
+                "stock_code", "trade_date", "turnover_rate", "turnover_rate_f", "free_share",
+                "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv",
             ]
             out = out[[column for column in keep if column in out.columns]].copy()
+            if "free_share" in out:
+                out["free_share"] = pd.to_numeric(out["free_share"], errors="coerce") * 10000.0
+            out["free_share_unit"] = "shares"
+            out["source_asof_date"] = out["trade_date"]
+            out["quality_status"] = out.apply(
+                lambda row: "VALID" if (
+                    pd.notna(row.get("turnover_rate_f")) and pd.notna(row.get("free_share"))
+                    and float(row.get("turnover_rate_f")) >= 0 and float(row.get("free_share")) >= 0
+                ) else "WARNING",
+                axis=1,
+            )
             out["pe_ttm_vendor"] = out.get("pe_ttm")
             out["ps_ttm_vendor"] = out.get("ps_ttm")
             out["pb_vendor"] = out.get("pb")

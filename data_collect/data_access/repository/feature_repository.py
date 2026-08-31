@@ -47,12 +47,23 @@ WITH events AS (
                    THEN (raw_close * (1.0 + stock_rate) + cash_div) / prev_close
                  ELSE raw_close / prev_close
                END AS growth_factor
+               ,CASE
+                 WHEN raw_close IS NULL OR raw_close <= 0 THEN NULL
+                 WHEN prev_close IS NULL THEN 1.0
+                 WHEN prev_close <= 0 THEN NULL
+                 WHEN event_count > 0
+                   THEN (raw_close * (1.0 + stock_rate)) / prev_close
+                 ELSE raw_close / prev_close
+               END AS price_growth_factor
           FROM raw
     ), indexed AS (
         SELECT *,
                SUM(CASE WHEN growth_factor > 0 THEN LN(growth_factor) END)
                  OVER (PARTITION BY ts_code ORDER BY trade_date
                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS log_index,
+               SUM(CASE WHEN price_growth_factor > 0 THEN LN(price_growth_factor) END)
+                 OVER (PARTITION BY ts_code ORDER BY trade_date
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS price_log_index,
                COUNT(*) FILTER (WHERE growth_factor IS NULL OR growth_factor <= 0)
                  OVER (PARTITION BY ts_code ORDER BY trade_date
                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS invalid_count,
@@ -63,15 +74,19 @@ WITH events AS (
         SELECT ts_code, trade_date, raw_close, amount, volume,
                CASE WHEN invalid_count = 0 AND log_index IS NOT NULL
                     THEN anchor_close * EXP(log_index) END AS asof_close,
+               CASE WHEN invalid_count = 0 AND price_log_index IS NOT NULL
+                    THEN anchor_close * EXP(price_log_index) END AS adj_close_base,
                event_count, max_event_ex_date
           FROM indexed
     )
     INSERT INTO feature.price_adjustment_factor_asof
         (ts_code, trade_date, asof_adjustment_factor, asof_close,
+         adj_adjustment_factor, adj_close_base,
          event_count, source_event_max_ex_date, adjustment_mode,
          quality_status, source_asof_date)
     SELECT ts_code, trade_date,
            asof_close / NULLIF(raw_close, 0), asof_close,
+           adj_close_base / NULLIF(raw_close, 0), adj_close_base,
            event_count, max_event_ex_date, 'point_in_time_total_return',
            CASE WHEN asof_close IS NULL THEN 'MISSING_SOURCE'
                 WHEN raw_close IS NULL OR raw_close <= 0 THEN 'WARNING'
@@ -81,7 +96,9 @@ WITH events AS (
       WHERE trade_date BETWEEN %s AND %s
     ON CONFLICT (ts_code, trade_date) DO UPDATE SET
         asof_adjustment_factor=EXCLUDED.asof_adjustment_factor,
-        asof_close=EXCLUDED.asof_close, event_count=EXCLUDED.event_count,
+        asof_close=EXCLUDED.asof_close,
+        adj_adjustment_factor=EXCLUDED.adj_adjustment_factor,
+        adj_close_base=EXCLUDED.adj_close_base, event_count=EXCLUDED.event_count,
         source_event_max_ex_date=EXCLUDED.source_event_max_ex_date,
         adjustment_mode=EXCLUDED.adjustment_mode,
         quality_status=EXCLUDED.quality_status,
@@ -92,8 +109,8 @@ WITH events AS (
 _PRICE_V2_FEATURE_SQL = """DELETE FROM feature.price_daily_v2 WHERE ts_code=ANY(%s) AND trade_date BETWEEN %s AND %s;
 WITH base AS (
         SELECT d.stock_code AS ts_code, d.trade_date, d.close AS raw_close,
-               d.amount, d.volume, a.asof_close,
-               a.asof_adjustment_factor
+               d.amount, d.volume, a.asof_close, a.adj_close_base,
+               a.asof_adjustment_factor, a.adj_adjustment_factor
           FROM std.daily_kline d
           JOIN feature.price_adjustment_factor_asof a
             ON a.ts_code = d.stock_code AND a.trade_date = d.trade_date
@@ -130,13 +147,15 @@ WITH base AS (
           FROM returns
     )
     INSERT INTO feature.price_daily_v2
-        (ts_code, trade_date, raw_close, asof_close, asof_adjustment_factor,
+        (ts_code, trade_date, raw_close, asof_close, adj_close_base,
+         total_return_price, asof_adjustment_factor, price_coordinate_contract_version,
          return_1d, return_20d, return_60d, ma20, ma60, ma120,
          volatility_20d, amount_ma20, volume_ratio_20d,
          available_observation_count, ma20_observation_count,
          ma60_observation_count, ma120_observation_count, quality_status,
          feature_set_version, adjustment_mode, source_asof_date)
-    SELECT ts_code, trade_date, raw_close, asof_close, asof_adjustment_factor,
+    SELECT ts_code, trade_date, raw_close, asof_close, adj_close_base,
+           asof_close, asof_adjustment_factor, 'market-price-coordinate-v1',
            return_1d, return_20d, return_60d,
            CASE WHEN ma20_observation_count = 20 THEN ma20_raw END,
            CASE WHEN ma60_observation_count = 60 THEN ma60_raw END,
@@ -156,7 +175,10 @@ WITH base AS (
       WHERE trade_date BETWEEN %s AND %s
     ON CONFLICT (ts_code, trade_date) DO UPDATE SET
         raw_close=EXCLUDED.raw_close, asof_close=EXCLUDED.asof_close,
+        adj_close_base=EXCLUDED.adj_close_base,
+        total_return_price=EXCLUDED.total_return_price,
         asof_adjustment_factor=EXCLUDED.asof_adjustment_factor,
+        price_coordinate_contract_version=EXCLUDED.price_coordinate_contract_version,
         return_1d=EXCLUDED.return_1d, return_20d=EXCLUDED.return_20d,
         return_60d=EXCLUDED.return_60d, ma20=EXCLUDED.ma20,
         ma60=EXCLUDED.ma60, ma120=EXCLUDED.ma120,
@@ -186,6 +208,7 @@ WITH seed AS (
     SELECT DISTINCT ON (d.stock_code)
            d.stock_code AS ts_code, d.trade_date AS seed_date,
            d.close AS seed_raw_close, a.asof_close AS seed_asof_close,
+           a.adj_close_base AS seed_adj_close_base,
            a.source_event_max_ex_date AS seed_max_event
       FROM std.daily_kline d
       LEFT JOIN feature.price_adjustment_factor_asof a
@@ -205,7 +228,7 @@ WITH seed AS (
      GROUP BY ts_code, ex_date
 ), raw AS (
     SELECT d.stock_code AS ts_code, d.trade_date, d.close AS raw_close,
-           d.amount, d.volume, s.seed_asof_close, s.seed_max_event,
+           d.amount, d.volume, s.seed_asof_close, s.seed_adj_close_base, s.seed_max_event,
            s.seed_date,
            LAG(d.close) OVER w AS prev_close,
            ROW_NUMBER() OVER w AS row_no,
@@ -225,13 +248,21 @@ WITH seed AS (
         WHEN row_no=1 THEN 1.0
         WHEN raw_close IS NULL OR raw_close <= 0 OR prev_close IS NULL OR prev_close <= 0 THEN NULL
         WHEN event_count > 0 THEN (raw_close * (1.0 + stock_rate) + cash_div) / prev_close
-        ELSE raw_close / prev_close END AS growth_factor
+        ELSE raw_close / prev_close END AS growth_factor,
+        CASE
+        WHEN row_no=1 THEN 1.0
+        WHEN raw_close IS NULL OR raw_close <= 0 OR prev_close IS NULL OR prev_close <= 0 THEN NULL
+        WHEN event_count > 0 THEN (raw_close * (1.0 + stock_rate)) / prev_close
+        ELSE raw_close / prev_close END AS price_growth_factor
       FROM raw
 ), indexed AS (
     SELECT *,
            SUM(CASE WHEN growth_factor > 0 THEN LN(growth_factor) ELSE 0 END)
              OVER (PARTITION BY ts_code ORDER BY trade_date
                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS log_index,
+           SUM(CASE WHEN price_growth_factor > 0 THEN LN(price_growth_factor) ELSE 0 END)
+             OVER (PARTITION BY ts_code ORDER BY trade_date
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS price_log_index,
            COUNT(*) FILTER (WHERE growth_factor IS NULL OR growth_factor <= 0)
              OVER (PARTITION BY ts_code ORDER BY trade_date
                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS invalid_count,
@@ -244,14 +275,20 @@ WITH seed AS (
                 THEN COALESCE(MAX(seed_asof_close) OVER (PARTITION BY ts_code),
                               FIRST_VALUE(raw_close) OVER (PARTITION BY ts_code ORDER BY trade_date))
                      * EXP(log_index) END AS asof_close,
+           CASE WHEN invalid_count=0
+                THEN COALESCE(MAX(seed_adj_close_base) OVER (PARTITION BY ts_code),
+                              FIRST_VALUE(raw_close) OVER (PARTITION BY ts_code ORDER BY trade_date))
+                     * EXP(price_log_index) END AS adj_close_base,
            GREATEST(MAX(seed_max_event) OVER (PARTITION BY ts_code), local_max_event) AS max_event
       FROM indexed
 )
 INSERT INTO feature.price_adjustment_factor_asof
     (ts_code, trade_date, asof_adjustment_factor, asof_close,
+     adj_adjustment_factor, adj_close_base,
      event_count, source_event_max_ex_date, adjustment_mode,
      quality_status, source_asof_date)
 SELECT ts_code, trade_date, asof_close/NULLIF(raw_close,0), asof_close,
+       adj_close_base/NULLIF(raw_close,0), adj_close_base,
        event_count, max_event, 'point_in_time_total_return',
        CASE WHEN asof_close IS NULL THEN 'MISSING_SOURCE'
             WHEN raw_close IS NULL OR raw_close <= 0 THEN 'WARNING' ELSE 'VALID' END,
@@ -259,7 +296,9 @@ SELECT ts_code, trade_date, asof_close/NULLIF(raw_close,0), asof_close,
   FROM adjusted WHERE trade_date BETWEEN %s AND %s
 ON CONFLICT (ts_code, trade_date) DO UPDATE SET
     asof_adjustment_factor=EXCLUDED.asof_adjustment_factor,
-    asof_close=EXCLUDED.asof_close, event_count=EXCLUDED.event_count,
+    asof_close=EXCLUDED.asof_close,
+    adj_adjustment_factor=EXCLUDED.adj_adjustment_factor,
+    adj_close_base=EXCLUDED.adj_close_base, event_count=EXCLUDED.event_count,
     source_event_max_ex_date=EXCLUDED.source_event_max_ex_date,
     adjustment_mode=EXCLUDED.adjustment_mode, quality_status=EXCLUDED.quality_status,
     source_asof_date=EXCLUDED.source_asof_date, calculated_at=CURRENT_TIMESTAMP
@@ -273,7 +312,8 @@ WITH prior AS (
      GROUP BY ts_code
 ), base AS (
     SELECT d.stock_code AS ts_code, d.trade_date, d.close AS raw_close,
-           d.amount, d.volume, a.asof_close, a.asof_adjustment_factor
+           d.amount, d.volume, a.asof_close, a.adj_close_base,
+           a.asof_adjustment_factor
       FROM std.daily_kline d
       JOIN feature.price_adjustment_factor_asof a
         ON a.ts_code=d.stock_code AND a.trade_date=d.trade_date
@@ -304,13 +344,16 @@ WITH prior AS (
              w120 AS (PARTITION BY returns.ts_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW)
 )
 INSERT INTO feature.price_daily_v2
-    (ts_code,trade_date,raw_close,asof_close,asof_adjustment_factor,
+    (ts_code,trade_date,raw_close,asof_close,adj_close_base,total_return_price,
+     asof_adjustment_factor,price_coordinate_contract_version,
      return_1d,return_20d,return_60d,ma20,ma60,ma120,volatility_20d,
      amount_ma20,volume_ratio_20d,available_observation_count,
      ma20_observation_count,ma60_observation_count,ma120_observation_count,
      quality_status,feature_set_version,adjustment_mode,source_asof_date)
 SELECT metrics.ts_code,metrics.trade_date,metrics.raw_close,metrics.asof_close,
-       metrics.asof_adjustment_factor,metrics.return_1d,metrics.return_20d,
+       metrics.adj_close_base,metrics.asof_close,
+       metrics.asof_adjustment_factor,'market-price-coordinate-v1',
+       metrics.return_1d,metrics.return_20d,
        metrics.return_60d,
        CASE WHEN metrics.ma20_observation_count=20 THEN metrics.ma20_raw END,
        CASE WHEN metrics.ma60_observation_count=60 THEN metrics.ma60_raw END,
@@ -327,6 +370,8 @@ SELECT metrics.ts_code,metrics.trade_date,metrics.raw_close,metrics.asof_close,
   FROM metrics WHERE metrics.trade_date BETWEEN %s AND %s
 ON CONFLICT (ts_code,trade_date) DO UPDATE SET
     raw_close=EXCLUDED.raw_close,asof_close=EXCLUDED.asof_close,
+    adj_close_base=EXCLUDED.adj_close_base,
+    total_return_price=EXCLUDED.total_return_price,
     asof_adjustment_factor=EXCLUDED.asof_adjustment_factor,
     return_1d=EXCLUDED.return_1d,return_20d=EXCLUDED.return_20d,
     return_60d=EXCLUDED.return_60d,ma20=EXCLUDED.ma20,ma60=EXCLUDED.ma60,

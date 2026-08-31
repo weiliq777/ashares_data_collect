@@ -92,9 +92,14 @@ def _valuation_transform(frame: pd.DataFrame) -> pd.DataFrame:
     frame = normalize_daily_basic(frame)
     if frame.empty:
         return frame
-    for column in ("turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv"):
+    for column in ("turnover_rate", "turnover_rate_f", "free_share", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv"):
         if column in frame:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    # Tushare daily_basic reports free_share in ten-thousand shares.  The
+    # Standard layer stores physical shares so every downstream consumer uses
+    # one unit without reinterpreting the vendor payload.
+    if "free_share" in frame:
+        frame["free_share"] = frame["free_share"] * 10000.0
     frame["pe_ttm_vendor"] = frame.get("pe_ttm")
     frame["ps_ttm_vendor"] = frame.get("ps_ttm")
     frame["pb_vendor"] = frame.get("pb")
@@ -105,10 +110,21 @@ def _valuation_transform(frame: pd.DataFrame) -> pd.DataFrame:
     frame["data_available_timestamp"] = frame["trade_date"].map(
         lambda value: datetime.combine(value, time(17, 0), tzinfo=shanghai) if pd.notna(value) else None
     )
+    frame["free_share_unit"] = "shares"
+    frame["source_asof_date"] = frame["trade_date"]
+    frame["quality_status"] = frame.apply(
+        lambda row: "VALID" if (
+            pd.notna(row.get("turnover_rate_f")) and pd.notna(row.get("free_share"))
+            and float(row.get("turnover_rate_f")) >= 0 and float(row.get("free_share")) >= 0
+        ) else "WARNING",
+        axis=1,
+    )
     keep = [
-        "stock_code", "trade_date", "turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm",
+        "stock_code", "trade_date", "turnover_rate", "turnover_rate_f", "free_share", "free_share_unit",
+        "pe", "pe_ttm", "pb", "ps", "ps_ttm",
         "dv_ratio", "total_mv", "circ_mv", "pe_ttm_vendor", "ps_ttm_vendor", "pb_vendor",
         "dv_ttm", "dv_ttm_vendor", "dv_ttm_source", "source_observed_at", "data_available_timestamp",
+        "source_asof_date", "quality_status",
     ]
     frame = frame[[column for column in keep if column in frame.columns]].copy()
     frame["source"] = "tushare"

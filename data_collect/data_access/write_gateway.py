@@ -532,6 +532,81 @@ class WriteGateway:
             from_statuses, to_status,
         )
 
+    def transition_observation_snapshot(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        snapshot_id: str,
+        from_statuses: Sequence[str],
+        to_status: str,
+        fields: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Guarded lifecycle transition for ``observation.snapshot``.
+
+        This is intentionally a named transition rather than a generic update
+        entry point. The database trigger remains the final FROZEN guard; this
+        method only controls the allowed state machine and mutable metadata.
+        """
+        if not isinstance(context, RunContext) or not isinstance(scope, WorkScope):
+            raise TypeError("observation snapshot transition requires RunContext and WorkScope")
+        transitions = {
+            "DRAFT": {"BUILDING", "FAILED"},
+            "FAILED": {"BUILDING", "FAILED"},
+            "BUILDING": {"BUILDING", "VALIDATED", "FAILED"},
+            "VALIDATED": {"FROZEN", "FAILED"},
+        }
+        if not from_statuses or any(
+            to_status not in transitions.get(str(status), set()) for status in from_statuses
+        ):
+            raise ValueError(
+                f"invalid observation snapshot state transition: {tuple(from_statuses)} -> {to_status}"
+            )
+        fields = dict(fields or {})
+        allowed = {
+            "input_manifest_hash", "quality_report_hash", "quality_report",
+            "code_identity", "row_count", "stock_count", "sector_count", "date_count",
+            "failure_reason", "built_at", "validated_at", "frozen_at", "failed_at",
+        }
+        if set(fields) - allowed:
+            raise ValueError(
+                f"unsupported observation snapshot fields: {sorted(set(fields) - allowed)}"
+            )
+        if to_status == "FROZEN" and any(
+            not fields.get(name) for name in ("input_manifest_hash", "quality_report_hash", "frozen_at")
+        ):
+            raise ValueError("FROZEN observation snapshot requires input/quality hashes and frozen_at")
+        columns = tuple(sorted(fields))
+        values = [snapshot_id, *(fields.get(column) for column in columns)]
+        placeholders = ", ".join(["%s"] * len(values))
+        assignments = ", ".join(
+            f"{column}=v.{column}::jsonb" if column in {"quality_report", "code_identity"}
+            else f"{column}=v.{column}::integer" if column == "date_count"
+            else f"{column}=v.{column}::bigint" if column in {"row_count", "stock_count", "sector_count"}
+            else f"{column}=v.{column}"
+            for column in columns
+        )
+        value_columns = ", ".join(("snapshot_id", *columns))
+        sql = (
+            "UPDATE observation.snapshot AS m SET status=%s"
+            + (f", {assignments}" if assignments else "")
+            + f" FROM (VALUES ({placeholders})) AS v({value_columns})"
+            + " WHERE m.snapshot_id=v.snapshot_id::uuid"
+            + " AND m.status=ANY(%s::text[])"
+        )
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="observation.snapshot",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(
+                sql, [to_status, *values, list(from_statuses)]
+            )
+        )
+
     def transition_snapshot_manifests(
         self,
         context: RunContext,

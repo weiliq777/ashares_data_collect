@@ -252,10 +252,11 @@ class RawStandardRepository(BaseRepository):
         )
         numeric = ",".join(
             f"NULLIF(NULLIF(BTRIM(payload->>'{field}'),''),'NaN')::double precision AS {field}"
-            for field in ("turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv")
-        )
+            for field in ("turnover_rate", "turnover_rate_f", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm", "total_mv", "circ_mv")
+        ) + ",NULLIF(NULLIF(BTRIM(payload->>'free_share'),''),'NaN')::double precision * 10000.0 AS free_share"
         changed_columns = (
-            "turnover_rate", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "total_mv", "circ_mv",
+            "turnover_rate", "turnover_rate_f", "free_share", "free_share_unit",
+            "quality_status", "source_asof_date", "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "total_mv", "circ_mv",
             "fetched_at", "pe_ttm_vendor", "ps_ttm_vendor", "pb_vendor", "dv_ttm", "dv_ttm_vendor",
             "dv_ttm_source", "source_observed_at", "data_available_timestamp",
         )
@@ -278,10 +279,15 @@ class RawStandardRepository(BaseRepository):
                 SELECT ts_code,trade_date,{numeric},fetched_at FROM latest
             ), upserted AS (
                 INSERT INTO std.valuation_daily
-                    (stock_code,trade_date,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,total_mv,circ_mv,
+                    (stock_code,trade_date,turnover_rate,turnover_rate_f,free_share,free_share_unit,
+                     quality_status,source_asof_date,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,total_mv,circ_mv,
                      source,fetched_at,pe_ttm_vendor,ps_ttm_vendor,pb_vendor,dv_ttm,dv_ttm_vendor,
                      dv_ttm_source,source_observed_at,data_available_timestamp)
-                SELECT ts_code,trade_date,turnover_rate,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,total_mv,circ_mv,
+                SELECT ts_code,trade_date,turnover_rate,turnover_rate_f,free_share,'shares',
+                       CASE WHEN turnover_rate_f IS NOT NULL AND free_share IS NOT NULL
+                                  AND turnover_rate_f >= 0 AND free_share >= 0
+                            THEN 'VALID' ELSE 'WARNING' END,
+                       trade_date,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,total_mv,circ_mv,
                        'tushare',fetched_at AT TIME ZONE 'UTC',pe_ttm,ps_ttm,pb,dv_ttm,dv_ttm,
                        'TUSHARE_DAILY_BASIC',fetched_at,
                        (trade_date::timestamp + INTERVAL '17 hours') AT TIME ZONE 'Asia/Shanghai'
