@@ -1,11 +1,16 @@
 # Market Anomaly Observation Domain（市场异常观察域）实现契约
 
 状态：`FROZEN`（架构与契约冻结）
-生效日期：2026-08-30
+契约修订：2026-08-31（个股主链路与行业可选确认）
+生效日期：2026-08-31
 适用范围：市场异常观察、行业共振观察、事件证据关联、后验结果评估
 不适用范围：买入推荐、订单生成、止盈止损、自动交易
 
 > 本文是实现契约，不是参考资料。代码与本文冲突时，默认代码错误。任何指标、状态、时间语义、表结构或生命周期规则的变更，都必须创建新的 `methodology_hash`（方法论哈希）和新的观察发布批次，不得原地覆盖已冻结结果。
+
+本次修订将 `ACCUMULATION_LIKE`（类吸筹形态）改为纯个股量价形态，
+并将行业共振降级为独立的 `Sector Confirmation`（行业确认）证据。该变更是方法论变更，
+不得用新逻辑覆盖旧观察结果；实现时必须使用新的 `methodology_hash`。
 
 ## 1. 设计边界
 
@@ -19,6 +24,16 @@
 | `Strategy / Scenario` | 策略/场景评估 | 按某套行动规则会发生什么 | 污染通用市场事实 |
 
 `Observation`（观察域）独立于 `Research Snapshot`（研究快照）。二者可以在 `Candidate Context`（候选上下文）或 `Research Package`（研究包）中组合，但任一方不得要求另一方存在才能生成。
+
+观察域内部也分为两个层次：
+
+```text
+Stock Observation（个股异常观察）
+    = 核心事实链，独立计算，决定 anomaly_flag / primary_state
+
+Sector Confirmation（行业共振确认）
+    = 可选增强证据，只补充解释，不反向改变个股主状态
+```
 
 ### 1.2 不使用表名版本后缀，但保留内部可复现身份
 
@@ -54,6 +69,21 @@ Evaluation 评估域只能追加或幂等写入后验结果，不得回写 Obser
 OBS-EVIDENCE-001
 observation.event_link 只保存观察日已可见的 AS_OF_EVIDENCE；
 事后证据必须写入 evaluation.retrospective_event_link，且不得改变已冻结观察哈希。
+
+OBS-SECTOR-001
+行业映射、行业分母或行业聚合不可用时，不得阻断个股 Observation；
+个股主链路必须将行业确认状态记为 UNKNOWN，而不是伪造为否定结果。
+
+OBS-SECTOR-002
+NOT_CONFIRMED 只允许在行业数据完整、PIT 有效、分母满足质量门禁且确认规则计算成功时使用；
+数据缺失、覆盖不足、时间语义不明或计算失败都必须使用 UNKNOWN。
+
+OBS-SECTOR-003
+Sector Confirmation 不得修改 anomaly_flag、primary_state、state_reason_codes 或个股指标。
+
+OBS-METHOD-001
+取消行业共振对 ACCUMULATION_LIKE 的强制依赖属于方法论变更；
+必须创建新的 methodology_hash、calculation_run_id 和观察发布批次，旧结果只读保留。
 ```
 
 `observation_id` 的生成必须可重试。若使用 UUID，应使用由业务身份确定性生成的 UUID，或在数据库唯一冲突时读取并复用已存在的 ID；禁止每次重试随机生成新 ID。
@@ -96,6 +126,9 @@ Raw 原始层
 - 事件源无法确认可见时间。
 
 应写入 `calculation_status`（计算状态）、`quality_status`（质量状态）和 `missing_reason_code`（缺失原因码）。不满足最小历史窗口的记录不能进入有效异常统计。
+
+行业映射缺失只影响 Sector Confirmation 及行业聚合字段，不得把个股核心指标和个股主状态强制改为缺失；
+此时个股观察仍可进入 `VALIDATED`，但必须带有 `sector_confirmation_status = UNKNOWN` 和明确缺失原因。
 
 ## 3. 指标契约
 
@@ -173,6 +206,9 @@ Raw 原始层
 
 `relative_volume_zscore` 的市场截面只包含观察日有效股票集合，使用截面中位数而不是均值，以降低 A 股成交异常长尾对基准的影响。有效股票数低于政策最小值时，该指标为缺失，并记录 `INSUFFICIENT_UNIVERSE`（股票池不足）。行业广度的分母同样必须固定为观察日有效股票集合。
 
+行业指标属于可选增强字段。行业输入不可用时，相关字段为 NULL，
+并由 `sector_data_status` 和 `sector_confirmation_status` 解释原因；不得用 0、空字符串或当前行业分类补齐。
+
 ## 4. 评分、标签与状态机
 
 ### 4.1 五类评分
@@ -234,10 +270,34 @@ NORMAL
 - `return_20d` 位于 `[-0.05, 0.12]`；
 - `max_drawdown_20d > -0.10`；
 - `up_down_volume_ratio >= 1.10`；
-- 行业异常广度相对前 5 个交易日上升；
-- 个股与行业映射均有效。
+- 不依赖行业映射、行业广度或行业确认。
 
-缺少行业确认时不得将记录提升为 `ACCUMULATION_LIKE`，应保留标签但使用其他适用状态。
+该状态只表示个股价格与成交行为在规则上呈现“类吸筹形态”，不表示真实资金吸筹，
+也不表示买入价值。行业共振另行通过 `Sector Confirmation` 保存。
+
+### 4.5 Sector Confirmation（行业共振确认）
+
+行业确认不得参与个股 `primary_state` 的必要条件。每条个股观察必须明确保存：
+
+```text
+sector_confirmation_status
+    CONFIRMED       行业数据完整且满足确认规则
+    NOT_CONFIRMED   行业数据完整但未满足确认规则
+    UNKNOWN         数据缺失、PIT 不足、覆盖不足或计算失败
+
+sector_data_status
+    CONFIRMED       已通过行业 PIT、覆盖率和连续性门禁
+    DAILY_CAPTURED  已按日捕获，但尚未证明完整 PIT 语义
+    MISSING         没有可用行业输入
+    INVALID         输入存在但未通过质量门禁
+```
+
+只有 `sector_data_status = CONFIRMED` 时，`sector_confirmation_status` 才允许为
+`CONFIRMED` 或 `NOT_CONFIRMED`。`DAILY_CAPTURED` 不等于 `CONFIRMED` PIT，
+不得把每日抓取的当前成分直接宣称为五年历史行业 PIT。
+
+历史行业数据不可用时，个股观察照常计算，行业确认记为 `UNKNOWN`。未来行业数据补齐时，
+必须创建新的计算批次和输入哈希，不得更新已经 `FROZEN` 的观察记录。
 
 ## 5. 数据表与唯一性
 
@@ -281,12 +341,15 @@ UNIQUE (
 
 - `observation.stock_anomaly_tag`（个股异常标签表）：引用 `observation_id`；
 - `observation.sector_anomaly_daily`（行业异常观察日表）：按观察日和 PIT 行业代码保存行业统计；
+- `observation.stock_sector_confirmation`（个股行业确认表）：引用 `observation_id`，保存行业体系、行业代码、
+  行业数据状态、确认状态、确认分数和质量原因；
 - `observation.event_link`（当时可见事件证据表）：只保存 `AS_OF_EVIDENCE`（观察日当时可见证据）；
 - `evaluation.retrospective_event_link`（事后事件关联表）：只保存 `RETROSPECTIVE_CAUSE`（观察日之后确认的可能原因）；
 - `evaluation.market_anomaly_outcome`（异常观察后验结果表）：只保存未来客观表现；
 - `evaluation.scenario_result`（策略场景结果表）：保存带入场、执行、止盈、止损和费用假设的场景结果。
 
 子表统一通过不可变的 `observation_id` 引用主观察记录，不复制四字段联合业务键作为外键。
+行业确认表是附加证据表，不是个股主状态表；行业记录缺失不能阻止个股主表生成。
 
 ## 6. AS_OF 与 RETROSPECTIVE 证据
 
@@ -380,6 +443,8 @@ DRAFT → BUILDING → VALIDATED → FROZEN
 规则：
 
 - `FROZEN` 后观察主体、标签、`observation.event_link` 中的 AS_OF 证据和输入哈希不可更新、删除；
+- `FROZEN` 后行业确认及行业聚合证据同样不可更新、删除；行业数据后来升级为更高质量状态时，
+  必须生成新的观察发布批次，不能原地把 `UNKNOWN` 改为 `CONFIRMED`；
 - `evaluation.retrospective_event_link` 可以在未来追加 RETROSPECTIVE_CAUSE，但不得更新观察主体、标签、AS_OF 证据、`observation_hash` 或 `snapshot_hash`；
 - 算法变化、基线变化或输入修正必须创建新快照；
 - `VALIDATED` 也不能被静默重算；必须显式创建新的计算批次；
@@ -395,11 +460,13 @@ DRAFT → BUILDING → VALIDATED → FROZEN
 ```text
 日期小批次
  → 个股观察
- → 行业聚合
+ → 可用时执行行业聚合与行业确认
  → 事件证据
  → 小批次质量门禁
  → VALIDATED
 ```
+
+行业输入缺失时，个股观察仍必须完成；该批次只将行业确认置为 `UNKNOWN`，不能把缺失降级成 `NOT_CONFIRMED`。
 
 必须使用 `Checkpoint`（检查点）恢复，禁止跨五年日期的大事务。历史首次计算需要最大 252 个交易日暖机窗口；`days_since_first_anomaly` 只在同一方法论观察序列内累计。
 
@@ -425,15 +492,15 @@ DRAFT → BUILDING → VALIDATED → FROZEN
 
 1. 业务唯一键无重复；
 2. `observation_id` 与业务身份稳定映射；
-3. 日期、股票和行业覆盖率达到政策要求；
+3. 日期和股票核心观察覆盖率达到政策要求；行业覆盖率仅在行业确认状态不是 `UNKNOWN` 时作为行业门禁；
 4. 计算窗口满足最小有效样本数；
-5. 行业分母确实来自观察日 PIT 股票池；
+5. 行业确认启用时，行业分母确实来自观察日 PIT 股票池；行业不可用时必须存在 `UNKNOWN` 原因码；
 6. 事件可见时间没有晚于观察日的 `AS_OF_EVIDENCE`；
 7. `RETROSPECTIVE_CAUSE` 没有进入评分、标签和状态计算；
 8. 主状态满足优先级和原因码规则；
 9. 标签明细与主表记录一一对应；
 10. 输入基线、方法论、代码身份和字段哈希完整；
-11. 行业异常总数、广度和新增/持续/退出数量相互一致；
+11. 行业确认启用时，行业异常总数、广度和新增/持续/退出数量相互一致；
 12. 无跨日期大事务、N+1 查询或无边界全表扫描；
 13. 同一输入重复运行结果完全一致；
 14. `FROZEN` 后数据库层拒绝更新和删除。
@@ -446,6 +513,7 @@ DRAFT → BUILDING → VALIDATED → FROZEN
 
 - `StockAnomalyObservationRepository`（个股异常观察仓储）；
 - `SectorAnomalyObservationRepository`（行业异常观察仓储）；
+- `StockSectorConfirmationRepository`（个股行业确认仓储）；
 - `ObservationEventRepository`（观察事件仓储）；
 - `MarketAnomalyOutcomeRepository`（后验结果仓储）；
 - `ScenarioEvaluationRepository`（策略场景评估仓储）。
@@ -460,6 +528,8 @@ DRAFT → BUILDING → VALIDATED → FROZEN
 - 断点续跑、重试和幂等测试；
 - FROZEN 更新/删除拒绝测试；
 - 行业聚合一致性测试；
+- 行业缺失不阻断个股观察、`UNKNOWN` 与 `NOT_CONFIRMED` 区分测试；
+- `DAILY_CAPTURED` 不得直接升级为 `CONFIRMED` PIT 测试；
 - 后验窗口成熟前后测试；
 - 通用 Outcome 与 Scenario 语义隔离测试；
 - Repository → Kernel 数据访问契约扫描；
@@ -480,5 +550,8 @@ DRAFT → BUILDING → VALIDATED → FROZEN
  → 正式历史回填
  → 每日增量与成熟 Outcome 自动化
 ```
+
+当前正式方法论采用“个股主链路 + 行业可选确认”。行业历史 PIT 尚未闭环时，
+不得阻断个股历史回放；但也不得把没有 PIT 证据的行业字段标记为 `CONFIRMED`。
 
 在契约、表结构、Policy（策略）和测试完成前，不得启动五年历史回填。该观察域不得修改既有 `Research Snapshot` 契约，也不得把观察评分直接改造成策略买入信号。
