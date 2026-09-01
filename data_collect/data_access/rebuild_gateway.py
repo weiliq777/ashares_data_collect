@@ -376,6 +376,84 @@ class RebuildGateway:
     def run_scoped_merge(self, sql: str, plan: SqlPlan, context: RunContext, params=None) -> int:
         return self._run_set_based("run_scoped_merge", sql, plan, context, params)
 
+    def clear_observation_date(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        snapshot_id: str,
+        observation_date: date,
+        codes: Sequence[str],
+    ) -> int:
+        """Clear one mutable Observation date through the named DB operation.
+
+        Observation retries can produce a different tag set after an input
+        correction.  A plain UPSERT cannot remove a stale tag, while the
+        application role intentionally has no table-wide DELETE privilege.
+        The migration installs one fixed, snapshot-checked security-definer
+        function; this typed Gateway method is its only application entry
+        point.  It is bounded by one date and the explicit eligible code list.
+        """
+        if not isinstance(context, RunContext) or not isinstance(scope, WorkScope):
+            raise TypeError("clear_observation_date requires RunContext and WorkScope")
+        if scope.date_from != observation_date or scope.date_to != observation_date:
+            raise ValueError("Observation cleanup requires a one-day WorkScope")
+        if not str(snapshot_id).strip():
+            raise ValueError("snapshot_id is required")
+        scoped_snapshot_id = str(scope.dimensions.get("snapshot_id") or "").strip()
+        if scoped_snapshot_id != str(snapshot_id).strip():
+            raise ValueError("Observation cleanup scope snapshot_id does not match argument")
+        normalized_codes = tuple(dict.fromkeys(str(code) for code in codes if str(code).strip()))
+        if not normalized_codes:
+            return 0
+        # One stock row, one confirmation, up to seven governed tags and one
+        # sector aggregate can be removed for each code.  The DB function is
+        # deliberately called in small code batches, so a retry can never
+        # accumulate a date-wide DELETE transaction.
+        max_rows = self._kernel.transaction_manager.config.max_rows_per_tx
+        if max_rows < 10:
+            raise ValueError("Observation cleanup requires a transaction budget of at least 10 rows")
+        max_codes_per_tx = min(500, (max_rows - 1) // 10)
+        if max_codes_per_tx <= 0:
+            raise ValueError("Observation cleanup cannot fit within the transaction row budget")
+
+        total_deleted = 0
+        for offset in range(0, len(normalized_codes), max_codes_per_tx):
+            code_batch = normalized_codes[offset:offset + max_codes_per_tx]
+            # Delete sector aggregates exactly once for this date; all later
+            # batches are stock-scoped only.  The function itself remains
+            # idempotent, so a failed retry safely repeats earlier batches.
+            clear_sector = offset == 0
+            batch_scope = WorkScope(
+                date_from=scope.date_from,
+                date_to=scope.date_to,
+                codes=code_batch,
+                partition=scope.partition,
+                dimensions=scope.dimensions,
+            )
+            estimated_rows = len(code_batch) * 10 + (1 if clear_sector else 0)
+            plan = SqlPlan(
+                operation=Operation.REBUILD,
+                target="observation.stock_anomaly_daily",
+                scope=batch_scope,
+                expected_mode="SET_BASED",
+                estimated_rows=estimated_rows,
+                allow_delete=True,
+            )
+            self._kernel.query_guard.check(plan)
+
+            def clear() -> int:
+                conn = self._kernel._db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT observation.clear_snapshot_date_chunk(%s::uuid, %s::date, %s::text[], %s::boolean)",
+                        (snapshot_id, observation_date, list(code_batch), clear_sector),
+                    )
+                    row = cur.fetchone()
+                return int(row[0] or 0) if row else 0
+
+            total_deleted += self._kernel._run_chunk(clear, idempotent=False)
+        return total_deleted
+
     def run_scoped_merge_counted(
         self, sql: str, plan: SqlPlan, context: RunContext, params=None,
     ) -> tuple[int, int]:

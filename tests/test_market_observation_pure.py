@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -7,11 +7,14 @@ from data_collect.observation import (
     aggregate_sector_rows,
     calculate_scores,
     compute_outcome,
+    compute_stock_point,
     compute_stock_series,
     confirm_stock_sector,
     hash_rows,
     select_primary_state,
 )
+from data_collect.jobs.market_anomaly_observation import _calculation_status, _stable_run_id
+from data_collect.data_access.repository.observation_repository import ObservationEventRepository
 
 
 def _rows(count=400):
@@ -45,6 +48,38 @@ def test_stock_metrics_use_non_overlapping_amount_baseline_and_explicit_prices()
     assert result["return_20d"] < 0
     assert result["total_return_price"] is not None
     assert "MISSING_TOTAL_RETURN_PRICE" not in result["missing_reason_codes"]
+
+
+def test_target_point_optimizer_matches_series_semantics():
+    rows = _rows(300)
+    expected = compute_stock_series(rows)[-1]
+    actual = compute_stock_point(rows)
+    assert actual is not None
+    for key in (
+        "amount_ratio_5_60", "amount_ratio_20_60", "turnover_ratio_5_60",
+        "turnover_ratio_20_60", "amount_zscore_60", "amount_single_ratio_60",
+        "return_1d", "return_5d", "return_20d", "price_position_52w",
+        "distance_ma20", "distance_ma60", "max_drawdown_20d",
+        "up_volume_ratio_20", "down_volume_ratio_20", "up_down_volume_ratio",
+        "price_response_efficiency_20", "anomaly_frequency_20", "volatility_20d",
+    ):
+        assert actual[key] == pytest.approx(expected[key])
+    for key in (
+        "observation_date", "ts_code", "anomaly_flag", "anomaly_streak",
+        "days_since_first_anomaly", "abnormal_days_20", "missing_reason_codes",
+    ):
+        assert actual[key] == expected[key]
+
+
+def test_long_anomaly_streak_is_not_capped_at_frequency_window():
+    rows = _rows(420)
+    for row in rows[-30:]:
+        row["amount"] = 1_000.0
+    result = compute_stock_series(rows)[-1]
+
+    assert result["anomaly_streak"] >= 30
+    assert result["days_since_first_anomaly"] >= 29
+    assert 0.0 <= result["anomaly_frequency_20"] <= 1.0
 
 
 def test_insufficient_history_is_missing_not_zero():
@@ -96,6 +131,19 @@ def test_scores_do_not_impute_unknown_sector_as_positive_or_negative():
     assert scores["sector_confirmation_score"] is None
     assert "SECTOR_CONFIRMATION_MISSING" in missing
     assert priority is not None
+
+
+def test_optional_sector_missing_does_not_make_core_calculation_partial():
+    assert _calculation_status(("SECTOR_CONFIRMATION_MISSING",)) == "VALID"
+    assert _calculation_status(("INSUFFICIENT_AMOUNT_HISTORY",)) == "PARTIAL"
+
+
+def test_observation_default_run_identity_is_stable():
+    policy = ObservationPolicy()
+    first = _stable_run_id(date(2026, 8, 1), date(2026, 8, 31), "baseline", policy)
+    second = _stable_run_id(date(2026, 8, 1), date(2026, 8, 31), "baseline", policy)
+    assert first == second
+    assert first.startswith("observation-")
 
 
 def test_sector_unknown_is_distinct_from_not_confirmed():
@@ -160,3 +208,14 @@ def test_hash_is_streaming_and_order_deterministic():
     different, _ = hash_rows(reversed(rows), columns=("a", "b"))
     assert (digest, count) == (same, same_count)
     assert digest != different
+
+
+def test_event_visibility_validation_uses_asia_shanghai_business_date():
+    row = {
+        "observation_date": date(2026, 8, 30),
+        "event_visible_at": datetime(2026, 8, 30, 16, 30, tzinfo=timezone.utc),
+        "source_record_id": "event-1",
+        "source_hash": "hash-1",
+    }
+    with pytest.raises(ValueError, match="AS_OF event"):
+        ObservationEventRepository._validate_event(row, retrospective=False)

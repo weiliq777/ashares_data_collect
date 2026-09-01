@@ -261,6 +261,28 @@ def test_raw_standard_full_projection_uses_bounded_upserts(monkeypatch):
     assert "CREATE UNLOGGED" not in block
 
 
+def test_adj_factor_projection_accepts_a_bounded_range(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        tushare_raw_to_standard,
+        "_write_chunks",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or (5, 5),
+    )
+
+    result = tushare_raw_to_standard.rebuild_adj_factor(
+        start_date=date(2026, 8, 17), end_date=date(2026, 8, 21),
+    )
+
+    assert result == (5, 5)
+    assert calls[0][0][0] == "tushare_adj_factor_raw"
+    assert calls[0][1]["start_date"] == date(2026, 8, 17)
+    assert calls[0][1]["end_date"] == date(2026, 8, 21)
+    assert calls[0][1]["conflict_columns"] == (
+        "stock_code", "trade_date", "source",
+    )
+
+
 def test_bounded_standard_rebuild_deletes_only_requested_dates():
     conn = FakeConnection()
     kernel = DataAccessKernel(policy_registry=build_default_registry(), connection_factory=lambda: conn)

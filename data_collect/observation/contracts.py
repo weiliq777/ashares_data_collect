@@ -103,6 +103,7 @@ class ObservationPolicy:
     max_lookback: int = 252
     min_valid_fraction: float = 0.80
     min_universe_size: int = 30
+    min_observation_coverage: float = 0.80
     denominator_floor: float = 1e-12
 
     amount_ratio_threshold: float = 1.50
@@ -162,6 +163,8 @@ class ObservationPolicy:
                 raise ValueError(f"{name} must be positive")
         if not 0 < self.min_valid_fraction <= 1:
             raise ValueError("min_valid_fraction must be in (0, 1]")
+        if not 0 < self.min_observation_coverage <= 1:
+            raise ValueError("min_observation_coverage must be in (0, 1]")
         if self.max_lookback < self.position_window:
             raise ValueError("max_lookback must cover position_window")
         if self.score_clip_low >= self.score_clip_high:

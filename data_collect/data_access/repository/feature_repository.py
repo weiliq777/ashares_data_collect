@@ -221,7 +221,7 @@ WITH seed AS (
            COALESCE(SUM(stock_div), 0.0) AS stock_rate,
            COUNT(*)::integer AS event_count
       FROM std.dividend_event
-     WHERE implementation_status = '瀹炴柦' AND ex_date IS NOT NULL
+     WHERE implementation_status = '实施' AND ex_date IS NOT NULL
        AND COALESCE(implementation_announce_date, announce_date,
                     report_date, ex_date) <= ex_date
        AND ts_code=ANY(%s) AND ex_date <= %s
@@ -333,8 +333,9 @@ WITH prior AS (
            AVG(amount) OVER w20 AS amount_ma20_raw,
            AVG(volume) OVER w20 AS volume_ma20_raw,
            COALESCE(prior.prior_available,0) +
-             COUNT(asof_close) OVER (PARTITION BY returns.ts_code ORDER BY trade_date
-                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS available_observation_count,
+             COUNT(asof_close) FILTER (WHERE trade_date >= %s::date)
+             OVER (PARTITION BY returns.ts_code ORDER BY trade_date
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS available_observation_count,
            COUNT(asof_close) OVER w20 AS ma20_observation_count,
            COUNT(asof_close) OVER w60 AS ma60_observation_count,
            COUNT(asof_close) OVER w120 AS ma120_observation_count
@@ -388,60 +389,130 @@ ON CONFLICT (ts_code,trade_date) DO UPDATE SET
 
 
 class FeatureRepository(BaseRepository):
-    def rebuild_price_v2(self, scope: WorkScope, context: RunContext, codes=None) -> int:
-        """重建价格特征（复权因子 + price_daily_v2），按股票代码分批 scoped merge。"""
+    def rebuild_price_v2(
+        self, scope: WorkScope, context: RunContext, codes=None, *, batch_size: int = 5,
+    ) -> int:
+        """重建价格特征（复权因子 + price_daily_v2），按小股票批次执行。
+
+        The SQL window is bounded by date and stock scope, but a full history
+        still contains many rows per stock.  Keep the production default at a
+        deliberately small batch size so PostgreSQL's statement timeout is a
+        hard safety boundary, not something callers need to tune by guessing.
+        """
         if not isinstance(scope, WorkScope):
             raise TypeError("rebuild_price_v2 必须携带 WorkScope")
         if scope.date_from is None or scope.date_to is None:
             raise ValueError("rebuild_price_v2 需要 scope.date_from/date_to")
+        if not isinstance(batch_size, int) or not 0 < batch_size <= 10:
+            raise ValueError("rebuild_price_v2 batch_size 必须在 1..10")
         codes = list(codes or scope.codes or ())
         if not codes:
             raise ValueError("rebuild_price_v2 需要 codes 或 scope.codes")
         total = 0
-        for batch in self._batches(codes):
-            # params 顺序：DELETE price_daily_v2(3) + DELETE adj_factor(3) + event_sql(5) + feature_sql(4)
-            adjustment_params = (
-                batch, scope.date_from, scope.date_to,
-                batch, scope.date_from,
-                batch, scope.date_to,
-                batch, scope.date_from, scope.date_to,
-                scope.date_from, scope.date_to,
+        for batch_index, batch in enumerate(self._batches(codes, size=batch_size), start=1):
+            batch_scope = WorkScope(
+                date_from=scope.date_from,
+                date_to=scope.date_to,
+                codes=tuple(batch),
+                partition=scope.partition or "feature:price_daily_v2",
+                dimensions={**scope.dimensions, "code_batch": batch_index},
             )
-            feature_params = (
-                batch, scope.date_from, scope.date_to,
-                batch, scope.date_from,
-                batch, scope.date_from - timedelta(days=400), scope.date_to,
-                scope.date_from, scope.date_to,
+            checkpoint_key = (
+                f"price-v2:{scope.date_from.isoformat()}:{scope.date_to.isoformat()}"
+                f":batch:{batch_index}:{batch[0]}:{batch[-1]}"
             )
-            adjustment_plan = SqlPlan(
-                operation=Operation.REBUILD,
-                target="feature.price_adjustment_factor_asof",
-                scope=scope,
-                expected_mode="SET_BASED",
-                estimated_rows=0,
-                allow_insert_select=True,
-                allow_delete=True,
+            checkpoint = self.kernel.checkpoint.load(
+                context.run_id, context.job_name, checkpoint_key,
             )
-            feature_plan = SqlPlan(
-                operation=Operation.REBUILD,
-                target="feature.price_daily_v2",
-                scope=scope,
-                expected_mode="SET_BASED",
-                estimated_rows=0,
-                allow_insert_select=True,
-                allow_delete=True,
+            if checkpoint is not None and checkpoint.done:
+                continue
+            # A full-history adjustment window is still bounded by stock code,
+            # but it can exceed statement_timeout for a slow/large code group.
+            # Process chronological date windows instead.  The adjustment SQL
+            # seeds each window from the last committed row before its start;
+            # the feature SQL reads a bounded warm-up range for its rolling
+            # metrics.  This preserves the cumulative/rolling semantics while
+            # making every database transaction independently resumable.
+            for window_index, (window_start, window_end) in enumerate(
+                self._date_windows(scope.date_from, scope.date_to, days=365), start=1
+            ):
+                window_scope = WorkScope(
+                    date_from=window_start,
+                    date_to=window_end,
+                    codes=tuple(batch),
+                    partition=batch_scope.partition,
+                    dimensions={**batch_scope.dimensions, "date_window": window_index},
+                )
+                window_key = (
+                    f"{checkpoint_key}:window:{window_index}:"
+                    f"{window_start.isoformat()}:{window_end.isoformat()}"
+                )
+                window_checkpoint = self.kernel.checkpoint.load(
+                    context.run_id, context.job_name, window_key,
+                )
+                if window_checkpoint is not None and window_checkpoint.done:
+                    continue
+
+                # Parameters are explicit; the bounded feature SQL includes
+                # the additional start-date cut for cumulative availability.
+                adjustment_params = (
+                    batch, window_start, window_end,
+                    batch, window_start,
+                    batch, window_end,
+                    batch, window_start, window_end,
+                    window_start, window_end,
+                )
+                feature_params = (
+                    batch, window_start, window_end,
+                    batch, window_start,
+                    batch, window_start - timedelta(days=400), window_end,
+                    window_start, window_start, window_end,
+                )
+                adjustment_plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="feature.price_adjustment_factor_asof",
+                    scope=window_scope,
+                    expected_mode="SET_BASED",
+                    estimated_rows=0,
+                    allow_insert_select=True,
+                    allow_delete=True,
+                )
+                feature_plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="feature.price_daily_v2",
+                    scope=window_scope,
+                    expected_mode="SET_BASED",
+                    estimated_rows=0,
+                    allow_insert_select=True,
+                    allow_delete=True,
+                )
+                self.kernel.rebuild.run_scoped_merge(
+                    sql=_PRICE_V2_ADJUSTMENT_BOUNDED_SQL,
+                    plan=adjustment_plan,
+                    context=context,
+                    params=adjustment_params,
+                )
+                total += self.kernel.rebuild.run_scoped_merge(
+                    sql=_PRICE_V2_FEATURE_BOUNDED_SQL,
+                    plan=feature_plan,
+                    context=context,
+                    params=feature_params,
+                )
+                self.kernel.checkpoint.mark_progress(
+                    context.run_id, context.job_name, window_key, window_index,
+                )
+                self.kernel.checkpoint.mark_done(
+                    context.run_id, context.job_name, window_key,
+                )
+
+            # Retain the batch-level checkpoint as the cheap completion marker
+            # used by earlier runs; it is only marked after every date window
+            # has committed successfully.
+            self.kernel.checkpoint.mark_progress(
+                context.run_id, context.job_name, checkpoint_key, batch_index,
             )
-            self.kernel.rebuild.run_scoped_merge(
-                sql=_PRICE_V2_ADJUSTMENT_BOUNDED_SQL,
-                plan=adjustment_plan,
-                context=context,
-                params=adjustment_params,
-            )
-            total += self.kernel.rebuild.run_scoped_merge(
-                sql=_PRICE_V2_FEATURE_BOUNDED_SQL,
-                plan=feature_plan,
-                context=context,
-                params=feature_params,
+            self.kernel.checkpoint.mark_done(
+                context.run_id, context.job_name, checkpoint_key,
             )
         return total
 
@@ -450,19 +521,39 @@ class FeatureRepository(BaseRepository):
         for i in range(0, len(values), size):
             yield list(values[i : i + size])
 
+    @staticmethod
+    def _date_windows(start, end, *, days: int = 365):
+        """Yield inclusive chronological windows for resumable rebuilds."""
+        if start is None or end is None or start > end:
+            raise ValueError("date window requires start <= end")
+        if not isinstance(days, int) or days <= 0:
+            raise ValueError("date window days must be > 0")
+        current = start
+        while current <= end:
+            window_end = min(end, current + timedelta(days=days - 1))
+            yield current, window_end
+            current = window_end + timedelta(days=1)
+
     def load_codes_in_window(self, scope: WorkScope, context: RunContext) -> list:
         """读日期窗口内的股票代码列表（受控读，Python 去重）。"""
-        rows = self.kernel.read.query(
+        # A normal read.query applies its row ceiling to daily rows before
+        # de-duplication.  On a long history that silently truncates the code
+        # universe, so the job can report success after rebuilding only a
+        # prefix.  DISTINCT is kept inside the Repository boundary and the
+        # governed result ceiling remains a fail-closed protection.
+        rows = self.kernel.read._repository_query(
             context=context,
             source="std.daily_kline",
-            columns=["stock_code"],
-            where={
-                "trade_date__gte": scope.date_from,
-                "trade_date__lte": scope.date_to,
-            },
+            sql=(
+                "SELECT DISTINCT stock_code "
+                "FROM std.daily_kline "
+                "WHERE trade_date BETWEEN %s AND %s"
+            ),
+            params=(scope.date_from, scope.date_to),
             scope=scope,
+            max_rows=100_000,
         )
-        return sorted({r[0] for r in rows})
+        return sorted({row["stock_code"] for row in rows})
 
     def load_price_date_range(self, context: RunContext) -> tuple | None:
         """读取行情日期边界；Job 不直接拿 Kernel。"""

@@ -31,6 +31,7 @@ from data_collect.data_access.context import (
     WorkScope,
 )
 from data_collect.data_access.chunk_planner import ChunkConfig
+from data_collect.data_access.transaction_manager import TransactionConfig
 from data_collect.data_access.policy_catalog import build_default_registry
 from tests._fake_db import FakeConnection
 
@@ -257,6 +258,61 @@ def test_upsert_checkpoints_distinguish_batches_in_same_run_and_scope():
         if entry["sql"].startswith("INSERT INTO feature.price_daily_v2")
     ]
     assert len(publishes) == 2
+
+
+def test_upsert_restart_checkpoint_rewrites_a_physically_cleared_slice():
+    """A rebuild retry must not trust a done cursor for deleted rows."""
+    kernel, _ = make_kernel(max_rows=1)
+    rows = _feature_rows(2)
+    calls = []
+    original = kernel.write._upsert_chunk
+
+    def record(target, columns, chunk, key, update_columns, skip_noop):
+        calls.append(tuple(row["ts_code"] for row in chunk))
+        return original(target, columns, chunk, key, update_columns, skip_noop)
+
+    kernel.write._upsert_chunk = record
+    kernel.write.upsert(
+        ctx(), WorkScope(date_from=date(2026, 1, 1)), "feature.price_daily_v2",
+        rows, ("ts_code", "trade_date"), ("ma20", "ma60"),
+    )
+    kernel.write.upsert(
+        ctx(), WorkScope(date_from=date(2026, 1, 1)), "feature.price_daily_v2",
+        rows, ("ts_code", "trade_date"), ("ma20", "ma60"),
+        restart_checkpoint=True,
+    )
+
+    assert len(calls) == 4
+
+
+def test_observation_cleanup_splits_code_scope_and_deletes_sector_once():
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(),
+        transaction_config=TransactionConfig(max_rows_per_tx=100),
+        chunk_config=ChunkConfig(max_rows_per_tx=100),
+        connection_factory=lambda: conn,
+    )
+    snapshot_id = "00000000-0000-0000-0000-000000000001"
+    scope = WorkScope(
+        date_from=date(2026, 1, 1), date_to=date(2026, 1, 1),
+        codes=tuple(f"00000{i}.SZ" for i in range(11)),
+        dimensions={"snapshot_id": snapshot_id},
+    )
+
+    kernel.rebuild.clear_observation_date(
+        ctx(), scope, snapshot_id, date(2026, 1, 1), scope.codes,
+    )
+
+    calls = [
+        item for item in conn.executed
+        if "clear_snapshot_date_chunk" in item["sql"]
+    ]
+    assert len(calls) == 2
+    assert len(calls[0]["params"][2]) == 9
+    assert calls[0]["params"][3] is True
+    assert len(calls[1]["params"][2]) == 2
+    assert calls[1]["params"][3] is False
 
 
 def test_upsert_rejects_append_only_target():

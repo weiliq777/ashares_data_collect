@@ -469,6 +469,31 @@ def test_feature_repository_rebuild_price_v2_scoped_merge():
     assert not any("TRUNCATE" in s for s in sqls)
 
 
+def test_feature_repository_load_codes_deduplicates_before_read_ceiling(monkeypatch):
+    """Large history must not truncate the stock universe at daily-row limit."""
+    repo, kernel, _ = make_kernel_and_repo_feature()
+    calls = []
+
+    def fake_repository_query(**kwargs):
+        calls.append(kwargs)
+        return [
+            {"stock_code": "600001.SH"},
+            {"stock_code": "000001.SZ"},
+            {"stock_code": "600001.SH"},
+        ]
+
+    monkeypatch.setattr(kernel.read, "_repository_query", fake_repository_query)
+    codes = repo.load_codes_in_window(
+        WorkScope(date_from=date(2016, 8, 1), date_to=date(2026, 8, 21)), ctx()
+    )
+
+    assert codes == ["000001.SZ", "600001.SH"]
+    assert len(calls) == 1
+    assert "SELECT DISTINCT stock_code" in calls[0]["sql"]
+    assert calls[0]["params"] == (date(2016, 8, 1), date(2026, 8, 21))
+    assert calls[0]["max_rows"] == 100_000
+
+
 def make_kernel_and_repo_feature():
     from data_collect.data_access.repository.feature_repository import FeatureRepository
 

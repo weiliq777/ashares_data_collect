@@ -29,6 +29,7 @@ class WriteGateway:
         key: Sequence[str],
         update_columns: Sequence[str],
         skip_noop: bool = False,
+        restart_checkpoint: bool = False,
     ) -> int:
         if not isinstance(context, RunContext):
             raise TypeError("write.upsert 必须携带 RunContext")
@@ -73,6 +74,13 @@ class WriteGateway:
 
         chunks = self._kernel.chunk_planner.plan(list(rows))
         scope_key = self._kernel._checkpoint_batch_scope_key("upsert", t, scope, rows)
+        # A typed rebuild slice may have been physically cleared after a
+        # previous attempt. Its old per-batch checkpoint then describes data
+        # that no longer exists and must not suppress the rewrite. This flag
+        # is explicit and opt-in; ordinary incremental upserts retain normal
+        # resumability.
+        if restart_checkpoint:
+            self._kernel._checkpoint_clear(context, scope_key)
         resume_after, done = self._kernel._checkpoint_cursor(context, scope_key)
         if done:
             return 0

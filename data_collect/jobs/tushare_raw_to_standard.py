@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import time as time_module
-from datetime import datetime, time
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -161,7 +161,14 @@ def _rebuild_valuation_set_based(start_date, end_date, batch_trade_dates=1, thro
         kernel.close()
 
 
-def rebuild_adj_factor() -> tuple[int, int]:
+def rebuild_adj_factor(start_date: date | None = None, end_date: date | None = None) -> tuple[int, int]:
+    """Project only the requested Raw date range into Standard.
+
+    The default remains a full rebuild for the explicit maintenance command,
+    while bounded callers can repair a small missing interval without
+    rescanning the complete historical Raw table.  The lower and upper dates
+    are inclusive, matching ``rebuild_valuation`` and the CLI contract.
+    """
     def transform(frame):
         frame = frame.rename(columns={"ts_code": "stock_code"})
         frame["trade_date"] = pd.to_datetime(frame["trade_date"], format="%Y%m%d", errors="coerce").dt.date
@@ -170,7 +177,15 @@ def rebuild_adj_factor() -> tuple[int, int]:
         frame["source"], frame["fetched_at"] = "tushare", datetime.now()
         return frame
     transform.table_name = "std.adj_factor_daily"
-    return _write_chunks("tushare_adj_factor_raw", transform, version_dataset="adj_factor", conflict_columns=("stock_code", "trade_date", "source"))
+    if (start_date is None) != (end_date is None):
+        raise ValueError("adj_factor bounded rebuild requires both start_date and end_date")
+    if start_date is not None and start_date > end_date:
+        raise ValueError("adj_factor start_date must not be after end_date")
+    return _write_chunks(
+        "tushare_adj_factor_raw", transform,
+        version_dataset="adj_factor", conflict_columns=("stock_code", "trade_date", "source"),
+        start_date=start_date, end_date=end_date,
+    )
 
 
 def rebuild_calendar(start_date=None, end_date=None) -> tuple[int, int]:
@@ -231,8 +246,13 @@ def main() -> None:
             set_batch_trade_dates=args.batch_trade_dates,
             throttle_seconds=args.throttle_seconds,
         )}
+    elif args.table == "adj_factor" and args.start_date and args.end_date:
+        result = {"adj_factor": rebuild_adj_factor(
+            start_date=bounded_start,
+            end_date=bounded_end,
+        )}
     elif args.start_date or args.end_date:
-        parser.error("bounded dates are currently supported only for --table valuation")
+        parser.error("bounded dates are currently supported only for --table valuation or --table adj_factor")
     else:
         result = rebuild_all() if args.table == "all" else {args.table: globals()[f"rebuild_{args.table}"]()}
     print(json.dumps(result, ensure_ascii=False, indent=2))

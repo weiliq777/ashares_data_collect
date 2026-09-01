@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 from datetime import date, timedelta
@@ -32,7 +33,7 @@ if not logger.handlers:
 
 
 FEATURE_CODE_BATCH_SIZE = max(
-    1, int(os.getenv("ASHARES_FEATURE_CODE_BATCH_SIZE", "50"))
+    1, min(10, int(os.getenv("ASHARES_FEATURE_CODE_BATCH_SIZE", "5")))
 )
 
 
@@ -89,10 +90,29 @@ def rebuild_price_v2(start_date=None, end_date=None) -> int:
     kernel = DataAccessKernel(policy_registry=build_default_registry())
     try:
         repo = FeatureRepository(kernel)
-        context = build_run_context(_JOB_NAME)
+        base_context = build_run_context(_JOB_NAME)
+        # The interval and code identity make retries reuse the same
+        # per-batch checkpoint.  Include the code commit so a later code
+        # version cannot silently skip work completed by an older version.
+        run_identity = "|".join((
+            bounds[0].isoformat(), bounds[1].isoformat(),
+            base_context.code_version, base_context.config_hash,
+        ))
+        stable_run_id = "price-v2-" + hashlib.sha256(run_identity.encode("utf-8")).hexdigest()[:48]
+        from data_collect.data_access.context import RunContext
+
+        context = RunContext(
+            run_id=stable_run_id,
+            job_name=_JOB_NAME,
+            code_version=base_context.code_version,
+            config_hash=base_context.config_hash,
+            pipeline_version=base_context.pipeline_version,
+        )
         scope = WorkScope(date_from=bounds[0], date_to=bounds[1])
         codes = repo.load_codes_in_window(scope, context)
-        return repo.rebuild_price_v2(scope, context, codes)
+        return repo.rebuild_price_v2(
+            scope, context, codes, batch_size=FEATURE_CODE_BATCH_SIZE,
+        )
     finally:
         kernel.close()
 

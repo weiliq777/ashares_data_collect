@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from statistics import median
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -32,7 +33,7 @@ from data_collect.observation import (
     hash_rows,
     select_primary_state,
     build_tags,
-    compute_stock_series,
+    compute_stock_point,
 )
 from data_collect.observation.contracts import ObservationIdentity
 
@@ -43,24 +44,41 @@ BENCHMARK_LOOKBACK_CALENDAR_DAYS = 3
 INPUT_HASH_COLUMNS = (
     "trade_date", "ts_code", "eligible_by_market", "is_tradeable", "is_suspended",
     "raw_close", "volume", "amount", "turnover_rate_f", "free_share",
-    "adj_close_base", "total_return_price", "industry_system", "industry_level",
+    "free_share_unit", "adj_close_base", "total_return_price",
+    "price_coordinate_contract_version", "price_source_asof_date",
+    "universe_quality_status", "tradeability_quality_status",
+    "valuation_quality_status", "price_quality_status",
+    "industry_system", "industry_level",
     "industry_code", "industry_name", "industry_source_asof_date",
     "industry_data_available_timestamp", "industry_quality_status",
 )
+
+OPTIONAL_MISSING_CODES = frozenset({"SECTOR_CONFIRMATION_MISSING"})
 
 
 def _as_date(value: date | str) -> date:
     return value if isinstance(value, date) else date.fromisoformat(str(value))
 
 
-def _run_context(run_id: str | None = None) -> RunContext:
+def _stable_run_id(start: date, end: date, baseline_id: str, policy: ObservationPolicy) -> str:
+    identity = "|".join((start.isoformat(), end.isoformat(), baseline_id, policy.methodology_hash))
+    return "observation-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:48]
+
+
+def _run_context(run_id: str | None = None, policy: ObservationPolicy | None = None) -> RunContext:
+    policy = policy or ObservationPolicy()
     return RunContext(
         run_id=run_id or f"observation-{uuid.uuid4().hex}",
         job_name=JOB_NAME,
-        code_version="unknown",
-        config_hash="observation-default-policy",
+        code_version=CONTRACT_VERSION,
+        config_hash=policy.policy_hash,
         pipeline_version="data-access-v1",
     )
+
+
+def _calculation_status(missing: Iterable[str]) -> str:
+    """Classify core calculation completeness without treating optional sector data as core."""
+    return "VALID" if not (set(missing) - OPTIONAL_MISSING_CODES) else "PARTIAL"
 
 
 def _market_return_map(rows: Sequence[Mapping[str, Any]], horizon: int = 20) -> dict[date, float | None]:
@@ -86,7 +104,12 @@ def _sector_status(row: Mapping[str, Any]) -> str:
     # A daily membership capture is not automatically a validated five-year
     # PIT history.  It remains DAILY_CAPTURED until a separate continuity and
     # coverage gate promotes the input to CONFIRMED.
-    if row.get("industry_code") and str(row.get("industry_quality_status") or "").upper() == "VALID":
+    if (
+        row.get("industry_code")
+        and str(row.get("industry_quality_status") or "").upper() == "VALID"
+        and row.get("industry_source_asof_date") is not None
+        and row.get("industry_data_available_timestamp") is not None
+    ):
         return "DAILY_CAPTURED"
     return "MISSING"
 
@@ -144,6 +167,10 @@ def _prepare_metric(
         current["relative_return_20d"] = float(current["return_20d"]) - market_return
     else:
         current["relative_return_20d"] = None
+        if current.get("return_20d") is not None:
+            missing = set(current.get("missing_reason_codes") or ())
+            missing.add("MISSING_MARKET_BENCHMARK")
+            current["missing_reason_codes"] = tuple(sorted(missing))
     if relative_median is not None and current.get("amount_zscore_60") is not None:
         current["relative_volume_zscore"] = float(current["amount_zscore_60"]) - relative_median
     else:
@@ -183,7 +210,7 @@ def _prepare_metric(
         missing.add("STATE_UNDETERMINED")
     current["missing_reason_codes"] = tuple(sorted(missing))
     current["quality_status"] = _quality_status(current)
-    current["calculation_status"] = "VALID" if not missing else "PARTIAL"
+    current["calculation_status"] = _calculation_status(missing)
 
     observation_hash = _observation_hash(current)
     main = {
@@ -251,9 +278,17 @@ def run_observation(
     if start > end:
         raise ValueError("observation start must not be after end")
     policy = policy or ObservationPolicy()
+    if limit_codes is not None:
+        raise ValueError(
+            "正式 Observation 不允许 limit_codes；小样本必须使用隔离测试或不同方法论，避免污染正式快照"
+        )
     owns_kernel = kernel is None
     kernel = kernel or DataAccessKernel(policy_registry=build_default_registry())
-    context = context or _run_context(calculation_run_id)
+    if context is None:
+        calculation_run_id = calculation_run_id or _stable_run_id(
+            start, end, data_baseline_id, policy
+        )
+        context = _run_context(calculation_run_id, policy)
     calculation_run_id = calculation_run_id or context.run_id
     stock_repo = StockAnomalyObservationRepository(kernel)
     sector_repo = SectorAnomalyObservationRepository(kernel)
@@ -267,9 +302,15 @@ def run_observation(
         dates = stock_repo.observation_dates(start, end, context)
         if not dates:
             raise ValueError(f"no open trading dates in observation range: {start}..{end}")
+        contract_hash = hash_object({
+            "contract_version": CONTRACT_VERSION,
+            "policy_id": policy.policy_id,
+            "policy_hash": policy.policy_hash,
+            "input_hash_columns": INPUT_HASH_COLUMNS,
+        })
         snapshot = stock_repo.ensure_snapshot(
             dates[0], dates[-1], data_baseline_id, policy,
-            hash_object({"contract_version": CONTRACT_VERSION}), context,
+            contract_hash, context, calculation_run_id=calculation_run_id,
         )
         snapshot_id = str(snapshot["snapshot_id"])
         status = str(snapshot.get("status") or "DRAFT").upper()
@@ -292,13 +333,37 @@ def run_observation(
             checkpoint_key = f"observation-date:{snapshot_id}:{observation_date.isoformat()}"
             checkpoint = kernel.checkpoint.load(context.run_id, context.job_name, checkpoint_key)
             if checkpoint is not None and checkpoint.done:
+                codes = stock_repo.eligible_codes(observation_date, context, limit=10_000)
+                date_report = stock_repo.validate_date(snapshot_id, observation_date, context)
+                stored_report = {
+                    key: int(value or 0) if key.endswith("count") else value
+                    for key, value in date_report.items()
+                }
+                stored_report["expected_count"] = len(codes)
+                # A date checkpoint is valid only when the complete date slice
+                # still exists. Cleanup/retry and an interrupted child write
+                # must never turn a stale checkpoint into a silent skip.
+                if (
+                    stored_report.get("row_count") == len(codes)
+                    and stored_report.get("confirmation_count") == len(codes)
+                    and stored_report.get("invalid_count", 0) == 0
+                ):
+                    date_reports[observation_date.isoformat()] = stored_report
+                    previous_states = None
+                    continue
+                kernel.checkpoint.clear(context.run_id, context.job_name, checkpoint_key)
                 previous_states = None
-                continue
 
-            code_limit = limit_codes or 10_000
-            codes = stock_repo.eligible_codes(observation_date, context, limit=code_limit)
+            codes = stock_repo.eligible_codes(observation_date, context, limit=10_000)
             if previous_states is None:
-                previous_states = stock_repo.previous_states(snapshot_id, observation_date, codes, context)
+                previous_states = stock_repo.previous_states(
+                    snapshot_id,
+                    observation_date,
+                    codes,
+                    context,
+                    methodology_hash=policy.methodology_hash,
+                    data_baseline_id=data_baseline_id,
+                )
             warmup_start = observation_date - timedelta(days=policy.max_required_history * BENCHMARK_LOOKBACK_CALENDAR_DAYS)
             target_metrics: list[tuple[dict[str, Any], str, int]] = []
             with kernel.lock_manager.session_exclusive(
@@ -308,7 +373,7 @@ def run_observation(
                     code_batch = codes[offset:offset + policy.code_batch_size]
                     input_rows = stock_repo.input_rows(
                         warmup_start, observation_date, code_batch, context,
-                        max_rows=100_000, snapshot_id=snapshot_id,
+                        max_rows=policy.max_rows_per_tile, snapshot_id=snapshot_id,
                         industry_system=policy.industry_system,
                         industry_level=policy.industry_level,
                     )
@@ -317,11 +382,10 @@ def run_observation(
                         grouped[str(row["ts_code"])].append(row)
                     for code in code_batch:
                         code_rows = grouped.get(code, [])
-                        series = compute_stock_series(code_rows, policy)
-                        current = [item for item in series if _as_date(item["observation_date"]) == observation_date]
-                        if not current:
+                        point = compute_stock_point(code_rows, policy)
+                        if point is None or _as_date(point["observation_date"]) != observation_date:
                             continue
-                        target_metrics.append((current[-1], hash_rows(code_rows, columns=INPUT_HASH_COLUMNS)[0], len(code_rows)))
+                        target_metrics.append((point, hash_rows(code_rows, columns=INPUT_HASH_COLUMNS)[0], len(code_rows)))
 
                 zscores = [
                     float(metric.get("amount_zscore_60"))
@@ -358,7 +422,19 @@ def run_observation(
                         "observation_date": main["observation_date"],
                         "previous_anomaly_flag": (previous_states or {}).get(main["ts_code"], {}).get("anomaly_flag"),
                     })
-                sector_rows = aggregate_sector_rows(sector_input, policy)
+                # A partial industry mapping would bias the sector denominator
+                # toward the mapped subset. Until a complete PIT mapping is
+                # available for this date, preserve stock observations but do
+                # not publish a misleading sector aggregate.
+                sector_mapping_complete = all(
+                    row.get("sector_data_status") in {"DAILY_CAPTURED", "CONFIRMED"}
+                    and row.get("industry_code")
+                    for row in main_rows
+                )
+                sector_rows = (
+                    aggregate_sector_rows(sector_input, policy)
+                    if sector_mapping_complete else []
+                )
                 sector_index = {
                     (row["industry_system"], row["industry_level"], row["industry_code"]): row
                     for row in sector_rows
@@ -398,8 +474,51 @@ def run_observation(
                         missing.add("STATE_UNDETERMINED")
                     main["missing_reason_codes"] = tuple(sorted(missing))
                     main["quality_status"] = _quality_status(main)
-                    main["calculation_status"] = "VALID" if not missing else "PARTIAL"
+                    main["calculation_status"] = _calculation_status(missing)
                     main["observation_hash"] = _observation_hash(main)
+
+                expected_count = len(codes)
+                actual_count = len(main_rows)
+                valid_count = sum(
+                    row.get("calculation_status") == "VALID" for row in main_rows
+                )
+                if actual_count != expected_count:
+                    missing_codes = sorted(set(codes) - {str(row["ts_code"]) for row in main_rows})
+                    raise RuntimeError(json.dumps({
+                        "observation_date": observation_date.isoformat(),
+                        "expected_count": expected_count,
+                        "actual_count": actual_count,
+                        "missing_codes_sample": missing_codes[:20],
+                        "reason": "observation input did not produce one row per eligible stock",
+                    }, ensure_ascii=False))
+                coverage = valid_count / expected_count if expected_count else 0.0
+                if expected_count == 0 or coverage < policy.min_observation_coverage:
+                    missing_counts = Counter(
+                        code
+                        for row in main_rows
+                        for code in row.get("missing_reason_codes", ())
+                    )
+                    raise RuntimeError(json.dumps({
+                        "observation_date": observation_date.isoformat(),
+                        "expected_count": expected_count,
+                        "actual_count": actual_count,
+                        "valid_count": valid_count,
+                        "coverage": coverage,
+                        "min_observation_coverage": policy.min_observation_coverage,
+                        "missing_reason_counts": dict(sorted(missing_counts.items())),
+                        "reason": "observation core input coverage is below policy threshold",
+                    }, ensure_ascii=False))
+
+                # Rebuild the mutable date slice before writing.  This removes
+                # stale tags/confirmations left by a prior failed attempt while
+                # keeping the operation bounded to this date and code scope.
+                kernel.rebuild.clear_observation_date(
+                    context,
+                    _observation_scope(observation_date, observation_date, snapshot_id, codes),
+                    snapshot_id,
+                    observation_date,
+                    codes,
+                )
 
                 for main in main_rows:
                     if main["sector_confirmation_status"] == "CONFIRMED" and "SECTOR_CONFIRMATION" not in [
@@ -416,9 +535,15 @@ def run_observation(
                         tile_confirmations = [row for row in confirmation_rows if row["observation_id"] in ids]
                         tile_codes = [row["ts_code"] for row in main_tile]
                         tile_scope = _observation_scope(observation_date, observation_date, snapshot_id, tile_codes)
-                        stock_repo.write_stock_rows(main_tile, context, tile_scope)
-                        stock_repo.write_tags(tile_tags, context, tile_scope)
-                        stock_repo.write_confirmations(tile_confirmations, context, tile_scope)
+                        stock_repo.write_stock_rows(
+                            main_tile, context, tile_scope, restart_checkpoint=True
+                        )
+                        stock_repo.write_tags(
+                            tile_tags, context, tile_scope, restart_checkpoint=True
+                        )
+                        stock_repo.write_confirmations(
+                            tile_confirmations, context, tile_scope, restart_checkpoint=True
+                        )
                     sector_repo.write_rows(
                         [
                             {
@@ -436,13 +561,22 @@ def run_observation(
                         ],
                         context,
                         _observation_scope(observation_date, observation_date, snapshot_id),
+                        restart_checkpoint=True,
                     )
 
                 date_report = stock_repo.validate_date(snapshot_id, observation_date, context)
+                if int(date_report.get("confirmation_count") or 0) != actual_count:
+                    raise RuntimeError(
+                        "observation confirmation cardinality mismatch: "
+                        f"date={observation_date}, stocks={actual_count}, "
+                        f"confirmations={date_report.get('confirmation_count')}"
+                    )
                 date_reports[observation_date.isoformat()] = {
                     key: int(value or 0) if key.endswith("count") else value
                     for key, value in date_report.items()
                 }
+                date_reports[observation_date.isoformat()]["expected_count"] = expected_count
+                date_reports[observation_date.isoformat()]["coverage"] = coverage
                 kernel.checkpoint.mark_done(context.run_id, context.job_name, checkpoint_key)
                 previous_states = {
                     row["ts_code"]: {"primary_state": row.get("primary_state"), "anomaly_flag": row.get("anomaly_flag")}
@@ -456,12 +590,31 @@ def run_observation(
             "data_baseline_id": data_baseline_id,
             "snapshot_id": snapshot_id,
             "dates": date_reports,
+            "expected_date_count": len(dates),
             "summary": summary,
             "sector_mode": "OPTIONAL_DAILY_CAPTURED",
             "failures": {},
         }
         if int(summary.get("row_count") or 0) == 0:
             quality_report["failures"]["empty_observation"] = "no stock observations were written"
+        if len(date_reports) != len(dates):
+            quality_report["failures"]["date_coverage"] = {
+                "expected": len(dates), "reported": len(date_reports),
+            }
+        for date_key, item in date_reports.items():
+            expected = int(item.get("expected_count") or 0)
+            actual = int(item.get("row_count") or 0)
+            valid = int(item.get("valid_count") or 0)
+            if expected <= 0 or actual != expected:
+                quality_report["failures"][f"row_coverage:{date_key}"] = {
+                    "expected": expected, "actual": actual,
+                }
+            elif valid / expected < policy.min_observation_coverage:
+                quality_report["failures"][f"calculation_coverage:{date_key}"] = {
+                    "valid": valid, "expected": expected,
+                    "coverage": valid / expected,
+                    "minimum": policy.min_observation_coverage,
+                }
         if any(int(item.get("invalid_count") or 0) > 0 for item in date_reports.values()):
             quality_report["failures"]["invalid_calculation"] = "one or more observations have INVALID calculation status"
         input_stream = stock_repo.snapshot_hash_rows(snapshot_id, dates[0], dates[-1], context)

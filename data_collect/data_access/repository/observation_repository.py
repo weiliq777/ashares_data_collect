@@ -10,6 +10,7 @@ from datetime import date, datetime
 import json
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
 
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
@@ -37,6 +38,13 @@ def _date(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _visible_date(value: Any) -> date:
+    """Convert an aware event timestamp to the DB contract's local date."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    return _date(value)
 
 
 def _date_scope(start: date, end: date, *, codes: Sequence[str] | None = None, snapshot_id: str | None = None) -> WorkScope:
@@ -131,14 +139,22 @@ class StockAnomalyObservationRepository(BaseRepository):
             sql="""
                 SELECT DISTINCT ts_code
                   FROM pit.universe_daily
-                 WHERE trade_date=%s AND eligible_by_market IS TRUE
+                 WHERE trade_date=%s
+                   AND eligible_by_market IS TRUE
+                   AND quality_status='VALID'
+                   AND source_asof_date IS NOT NULL
+                   AND source_asof_date <= trade_date
                  ORDER BY ts_code
                  LIMIT %s
             """,
-            params=(observation_date, limit),
+            params=(observation_date, limit + 1),
             scope=_date_scope(observation_date, observation_date),
-            max_rows=limit,
+            max_rows=limit + 1,
         )
+        if len(rows) > limit:
+            raise ValueError(
+                f"eligible universe exceeds governed limit {limit}; refusing silent truncation"
+            )
         return tuple(str(row["ts_code"]) for row in rows)
 
     def input_rows(
@@ -148,7 +164,7 @@ class StockAnomalyObservationRepository(BaseRepository):
         codes: Sequence[str],
         context: RunContext,
         *,
-        max_rows: int = 100_000,
+        max_rows: int = 50_000,
         snapshot_id: str | None = None,
         industry_system: str = "SW2021",
         industry_level: int = 1,
@@ -158,8 +174,8 @@ class StockAnomalyObservationRepository(BaseRepository):
         normalized_codes = tuple(dict.fromkeys(str(code) for code in codes if str(code).strip()))
         if not normalized_codes:
             return []
-        if max_rows <= 0 or max_rows > 100_000:
-            raise ValueError("input max_rows must be in 1..100000")
+        if max_rows <= 0 or max_rows > 50_000:
+            raise ValueError("input max_rows must be in 1..50000")
         if not str(industry_system).strip() or int(industry_level) <= 0:
             raise ValueError("industry system and level must be valid")
         # The explicit date and code predicates are part of the contract.  The
@@ -173,9 +189,11 @@ class StockAnomalyObservationRepository(BaseRepository):
                    t.is_tradeable, t.can_buy, t.can_sell, t.is_suspended,
                    t.limit_status, t.quality_status AS tradeability_quality_status,
                    d.close AS raw_close, d.volume, d.amount,
-                   v.turnover_rate, v.turnover_rate_f, v.free_share,
+                   v.turnover_rate, v.turnover_rate_f, v.free_share, v.free_share_unit,
                    v.quality_status AS valuation_quality_status,
                    p.adj_close_base, p.total_return_price,
+                   p.price_coordinate_contract_version,
+                   p.source_asof_date AS price_source_asof_date,
                    p.quality_status AS price_quality_status,
                    im.industry_system, im.industry_level, im.industry_code,
                    im.industry_name, im.source_asof_date AS industry_source_asof_date,
@@ -184,18 +202,33 @@ class StockAnomalyObservationRepository(BaseRepository):
               FROM pit.universe_daily u
               LEFT JOIN pit.security_tradeability_daily t
                 ON t.trade_date=u.trade_date AND t.ts_code=u.ts_code
+               AND t.quality_status='VALID'
               LEFT JOIN std.daily_kline d
                 ON d.trade_date=u.trade_date AND d.stock_code=u.ts_code
               LEFT JOIN std.valuation_daily v
                 ON v.trade_date=u.trade_date AND v.stock_code=u.ts_code
-               AND v.source='tushare'
+               AND v.source='tushare' AND v.quality_status='VALID'
+               AND v.free_share_unit='shares'
               LEFT JOIN feature.price_daily_v2 p
                 ON p.trade_date=u.trade_date AND p.ts_code=u.ts_code
+               AND p.quality_status='VALID'
+               AND p.price_coordinate_contract_version='market-price-coordinate-v1'
+               AND p.source_asof_date <= u.trade_date
               LEFT JOIN pit.industry_membership_daily im
                 ON im.trade_date=u.trade_date AND im.ts_code=u.ts_code
                AND im.industry_system=%s AND im.industry_level=%s
+               AND im.quality_status='VALID'
+               AND (im.source_asof_date IS NULL OR im.source_asof_date <= u.trade_date)
+               AND (
+                    im.data_available_timestamp IS NULL
+                    OR (im.data_available_timestamp AT TIME ZONE 'Asia/Shanghai')::date <= u.trade_date
+               )
              WHERE u.trade_date BETWEEN %s AND %s
                AND u.ts_code=ANY(%s::text[])
+               AND u.eligible_by_market IS TRUE
+               AND u.quality_status='VALID'
+               AND u.source_asof_date IS NOT NULL
+               AND u.source_asof_date <= u.trade_date
              ORDER BY u.ts_code, u.trade_date
         """
         return self.kernel.read._repository_query(
@@ -267,22 +300,53 @@ class StockAnomalyObservationRepository(BaseRepository):
         before_date: date,
         codes: Sequence[str],
         context: RunContext,
+        *,
+        methodology_hash: str | None = None,
+        data_baseline_id: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         normalized_codes = tuple(dict.fromkeys(str(code) for code in codes if str(code).strip()))
         if not normalized_codes:
             return {}
-        rows = self.kernel.read._repository_query(
-            context=context,
-            source="observation.stock_anomaly_daily",
-            sql="""
+        if (methodology_hash is None) != (data_baseline_id is None):
+            raise ValueError("methodology_hash and data_baseline_id must be supplied together")
+        if methodology_hash is None:
+            # Narrow compatibility for callers that explicitly ask for
+            # same-snapshot history. The Observation job always supplies the
+            # complete identity below so daily incremental runs can inherit
+            # state from the previous frozen snapshot.
+            sql = """
                 SELECT DISTINCT ON (ts_code)
                        ts_code, observation_date, primary_state, anomaly_flag
                   FROM observation.stock_anomaly_daily
                  WHERE snapshot_id=%s AND observation_date < %s
                    AND ts_code=ANY(%s::text[])
                  ORDER BY ts_code, observation_date DESC
-            """,
-            params=(snapshot_id, before_date, list(normalized_codes)),
+            """
+            params = (snapshot_id, before_date, list(normalized_codes))
+        else:
+            sql = """
+                SELECT DISTINCT ON (d.ts_code)
+                       d.ts_code, d.observation_date, d.primary_state, d.anomaly_flag
+                  FROM observation.stock_anomaly_daily d
+                  JOIN observation.snapshot s ON s.snapshot_id=d.snapshot_id
+                 WHERE d.methodology_hash=%s
+                   AND d.data_baseline_id=%s
+                   AND d.observation_date < %s
+                   AND d.ts_code=ANY(%s::text[])
+                   AND (d.snapshot_id=%s OR s.status='FROZEN')
+                 ORDER BY d.ts_code, d.observation_date DESC,
+                          CASE WHEN d.snapshot_id=%s THEN 0 ELSE 1 END,
+                          d.snapshot_id
+            """
+            params = (
+                methodology_hash, data_baseline_id, before_date,
+                list(normalized_codes), snapshot_id, snapshot_id,
+            )
+        rows = self.kernel.read._repository_query(
+            context=context,
+            source="observation.stock_anomaly_daily",
+            sql=sql,
+            params=params,
             scope=_date_scope(before_date, before_date, codes=normalized_codes, snapshot_id=snapshot_id),
             max_rows=len(normalized_codes),
         )
@@ -309,6 +373,7 @@ class StockAnomalyObservationRepository(BaseRepository):
         policy: ObservationPolicy,
         contract_hash: str,
         context: RunContext,
+        calculation_run_id: str | None = None,
     ) -> dict[str, Any]:
         identity = f"observation-snapshot|{start.isoformat()}|{end.isoformat()}|{policy.methodology_hash}|{baseline_id}"
         snapshot_id = _stable_uuid(identity)
@@ -320,11 +385,16 @@ class StockAnomalyObservationRepository(BaseRepository):
             "data_baseline_id": baseline_id,
             "observation_policy_id": policy.policy_id,
             "contract_hash": contract_hash,
+            "calculation_run_id": calculation_run_id or context.run_id,
             "status": "DRAFT",
             "code_identity": _json({
                 "contract_version": CONTRACT_VERSION,
                 "methodology_id": METHODOLOGY_ID,
                 "pipeline_version": context.pipeline_version,
+                "code_version": context.code_version,
+                "config_hash": context.config_hash,
+                "calculation_run_id": calculation_run_id or context.run_id,
+                "observation_policy_hash": policy.policy_hash,
             }),
         }
         scope = _date_scope(start, end, snapshot_id=snapshot_id)
@@ -334,7 +404,19 @@ class StockAnomalyObservationRepository(BaseRepository):
             target="observation.snapshot",
             rows=[row],
         )
-        return self.get_snapshot(snapshot_id, context)
+        snapshot = self.get_snapshot(snapshot_id, context)
+        requested_run_id = str(calculation_run_id or context.run_id).strip()
+        stored_run_id = str(snapshot.get("calculation_run_id") or "").strip()
+        if not stored_run_id:
+            raise RuntimeError(
+                "observation snapshot has no calculation_run_id; refusing to mix un-audited lineage"
+            )
+        if stored_run_id != requested_run_id:
+            raise RuntimeError(
+                "observation snapshot calculation_run_id conflict; refusing to mix runs: "
+                f"stored={stored_run_id}, requested={requested_run_id}"
+            )
+        return snapshot
 
     def transition_snapshot(
         self,
@@ -360,6 +442,8 @@ class StockAnomalyObservationRepository(BaseRepository):
         rows: Sequence[Mapping[str, Any]],
         context: RunContext,
         scope: WorkScope,
+        *,
+        restart_checkpoint: bool = False,
     ) -> int:
         if not rows:
             return 0
@@ -380,6 +464,7 @@ class StockAnomalyObservationRepository(BaseRepository):
             key=("observation_id",),
             update_columns=updates,
             skip_noop=True,
+            restart_checkpoint=restart_checkpoint,
         )
 
     def write_tags(
@@ -387,6 +472,8 @@ class StockAnomalyObservationRepository(BaseRepository):
         rows: Sequence[Mapping[str, Any]],
         context: RunContext,
         scope: WorkScope,
+        *,
+        restart_checkpoint: bool = False,
     ) -> int:
         if not rows:
             return 0
@@ -402,6 +489,7 @@ class StockAnomalyObservationRepository(BaseRepository):
             context=context, scope=scope, target="observation.stock_anomaly_tag",
             rows=projected, key=("observation_id", "tag_code"),
             update_columns=("tag_payload",), skip_noop=True,
+            restart_checkpoint=restart_checkpoint,
         )
 
     def write_confirmations(
@@ -409,6 +497,8 @@ class StockAnomalyObservationRepository(BaseRepository):
         rows: Sequence[Mapping[str, Any]],
         context: RunContext,
         scope: WorkScope,
+        *,
+        restart_checkpoint: bool = False,
     ) -> int:
         if not rows:
             return 0
@@ -431,7 +521,7 @@ class StockAnomalyObservationRepository(BaseRepository):
             context=context, scope=scope, target="observation.stock_sector_confirmation",
             rows=projected, key=("observation_id",),
             update_columns=tuple(column for column in self.CONFIRMATION_COLUMNS if column not in {"confirmation_id", "observation_id"}),
-            skip_noop=True,
+            skip_noop=True, restart_checkpoint=restart_checkpoint,
         )
 
     def validate_date(self, snapshot_id: str, observation_date: date, context: RunContext) -> dict[str, Any]:
@@ -441,17 +531,40 @@ class StockAnomalyObservationRepository(BaseRepository):
             sql="""
                 SELECT COUNT(*) AS row_count,
                        COUNT(DISTINCT ts_code) AS stock_count,
+                       COUNT(*) FILTER (WHERE calculation_status='VALID') AS valid_count,
+                       COUNT(*) FILTER (WHERE calculation_status='PARTIAL') AS partial_count,
                        COUNT(*) FILTER (WHERE calculation_status='INVALID') AS invalid_count,
                        COUNT(*) FILTER (WHERE quality_status='INVALID') AS quality_invalid_count,
-                       COUNT(*) FILTER (WHERE sector_confirmation_status='UNKNOWN') AS sector_unknown_count
+                       COUNT(*) FILTER (WHERE sector_confirmation_status='UNKNOWN') AS sector_unknown_count,
+                       (SELECT COUNT(*)
+                          FROM observation.stock_sector_confirmation c
+                          JOIN observation.stock_anomaly_daily d2
+                            ON d2.observation_id=c.observation_id
+                         WHERE d2.snapshot_id=%s AND d2.observation_date=%s) AS confirmation_count,
+                       (SELECT COUNT(*)
+                          FROM observation.stock_anomaly_tag t
+                          JOIN observation.stock_anomaly_daily d3
+                            ON d3.observation_id=t.observation_id
+                         WHERE d3.snapshot_id=%s AND d3.observation_date=%s) AS tag_count,
+                       (SELECT COUNT(*)
+                          FROM observation.sector_anomaly_daily s
+                         WHERE s.snapshot_id=%s AND s.observation_date=%s) AS sector_row_count
                   FROM observation.stock_anomaly_daily
                  WHERE snapshot_id=%s AND observation_date=%s
             """,
-            params=(snapshot_id, observation_date),
+            params=(
+                snapshot_id, observation_date,
+                snapshot_id, observation_date,
+                snapshot_id, observation_date,
+                snapshot_id, observation_date,
+            ),
             scope=_date_scope(observation_date, observation_date, snapshot_id=snapshot_id),
             max_rows=1,
         )
-        return rows[0] if rows else {"row_count": 0, "stock_count": 0}
+        return rows[0] if rows else {
+            "row_count": 0, "stock_count": 0, "confirmation_count": 0,
+            "tag_count": 0, "sector_row_count": 0,
+        }
 
     def summarize_snapshot(self, snapshot_id: str, start: date, end: date, context: RunContext) -> dict[str, Any]:
         """One final bounded-by-snapshot summary; never called per tile/date."""
@@ -462,15 +575,33 @@ class StockAnomalyObservationRepository(BaseRepository):
                 SELECT COUNT(*) AS row_count,
                        COUNT(DISTINCT ts_code) AS stock_count,
                        COUNT(DISTINCT observation_date) AS date_count,
-                       COUNT(*) FILTER (WHERE sector_confirmation_status <> 'UNKNOWN') AS sector_count
+                       COUNT(*) FILTER (WHERE sector_confirmation_status <> 'UNKNOWN') AS sector_confirmation_count,
+                       (SELECT COUNT(*)
+                          FROM observation.sector_anomaly_daily s
+                         WHERE s.snapshot_id=%s
+                           AND s.observation_date BETWEEN %s AND %s) AS sector_count,
+                       (SELECT COUNT(*)
+                          FROM observation.stock_sector_confirmation c
+                          JOIN observation.stock_anomaly_daily d2
+                            ON d2.observation_id=c.observation_id
+                         WHERE d2.snapshot_id=%s
+                           AND d2.observation_date BETWEEN %s AND %s) AS confirmation_count
                   FROM observation.stock_anomaly_daily
                  WHERE snapshot_id=%s AND observation_date BETWEEN %s AND %s
             """,
-            params=(snapshot_id, start, end),
+            params=(
+                snapshot_id, start, end,
+                snapshot_id, start, end,
+                snapshot_id, start, end,
+            ),
             scope=_date_scope(start, end, snapshot_id=snapshot_id),
             max_rows=1,
         )
-        return rows[0] if rows else {"row_count": 0, "stock_count": 0, "date_count": 0, "sector_count": 0}
+        return rows[0] if rows else {
+            "row_count": 0, "stock_count": 0, "date_count": 0,
+            "sector_count": 0, "sector_confirmation_count": 0,
+            "confirmation_count": 0,
+        }
 
 
 class SectorAnomalyObservationRepository(BaseRepository):
@@ -485,7 +616,14 @@ class SectorAnomalyObservationRepository(BaseRepository):
         "quality_status", "input_manifest_hash",
     )
 
-    def write_rows(self, rows: Sequence[Mapping[str, Any]], context: RunContext, scope: WorkScope) -> int:
+    def write_rows(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        context: RunContext,
+        scope: WorkScope,
+        *,
+        restart_checkpoint: bool = False,
+    ) -> int:
         if not rows:
             return 0
         projected = [{column: source.get(column) for column in self.COLUMNS} for source in rows]
@@ -494,7 +632,7 @@ class SectorAnomalyObservationRepository(BaseRepository):
             rows=projected,
             key=("snapshot_id", "observation_date", "industry_system", "industry_level", "industry_code"),
             update_columns=tuple(column for column in self.COLUMNS if column != "sector_observation_id"),
-            skip_noop=True,
+            skip_noop=True, restart_checkpoint=restart_checkpoint,
         )
 
 
@@ -505,8 +643,17 @@ class StockSectorConfirmationRepository(BaseRepository):
         super().__init__(kernel)
         self._delegate = StockAnomalyObservationRepository(kernel)
 
-    def write_rows(self, rows: Sequence[Mapping[str, Any]], context: RunContext, scope: WorkScope) -> int:
-        return self._delegate.write_confirmations(rows, context, scope)
+    def write_rows(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        context: RunContext,
+        scope: WorkScope,
+        *,
+        restart_checkpoint: bool = False,
+    ) -> int:
+        return self._delegate.write_confirmations(
+            rows, context, scope, restart_checkpoint=restart_checkpoint
+        )
 
 
 class ObservationEventRepository(BaseRepository):
@@ -529,7 +676,7 @@ class ObservationEventRepository(BaseRepository):
             raise ValueError("event evidence requires visible time, source_record_id and source_hash")
         if observed is not None:
             observed_date = _date(observed)
-            visible_date = _date(visible)
+            visible_date = _visible_date(visible)
             if retrospective and visible_date <= observed_date:
                 raise ValueError("retrospective event must be visible after observation date")
             if not retrospective and visible_date > observed_date:
