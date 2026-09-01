@@ -602,8 +602,18 @@ class ResearchSnapshotRepository(BaseRepository):
             operation=Operation.REBUILD, target=target, scope=scope,
             expected_mode="SET_BASED", estimated_rows=0, allow_delete=True,
         )
-        sql = f"DELETE FROM {target} WHERE snapshot_id=%s"
-        return self.kernel.rebuild.run_scoped_merge(sql, plan, context, (snapshot_id,))
+        # ``stock_snapshot_daily`` is range-partitioned by research_date.  A
+        # snapshot_id-only delete forces PostgreSQL to inspect every yearly
+        # partition before the next rebuild and can exceed the governed
+        # statement deadline.  Lineage is not partitioned today, but the same
+        # date predicate keeps the delete bounded and matches the WorkScope.
+        if target in {"research.stock_snapshot_daily", "research.snapshot_lineage"}:
+            sql = f"DELETE FROM {target} WHERE snapshot_id=%s AND research_date=%s"
+            params = (snapshot_id, cutoff)
+        else:
+            sql = f"DELETE FROM {target} WHERE snapshot_id=%s"
+            params = (snapshot_id,)
+        return self.kernel.rebuild.run_scoped_merge(sql, plan, context, params)
 
     def _precompute_input_manifest(
         self,

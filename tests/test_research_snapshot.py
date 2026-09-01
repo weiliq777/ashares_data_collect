@@ -108,6 +108,37 @@ def test_snapshot_code_batches_stay_below_statement_deadline_budget():
     assert "SNAPSHOT_CODE_BATCH_SIZE = 100" in source
 
 
+def test_snapshot_cleanup_uses_cutoff_for_partitioned_children():
+    calls = []
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+
+    def fake_run(sql, plan, context, params):
+        calls.append((sql, params))
+        return 0
+
+    repository.kernel = SimpleNamespace(
+        rebuild=SimpleNamespace(run_scoped_merge=fake_run),
+    )
+    cutoff = date(2022, 12, 2)
+
+    repository._delete_snapshot_rows(
+        "snapshot-id", "context", "research.stock_snapshot_daily", cutoff
+    )
+    repository._delete_snapshot_rows(
+        "snapshot-id", "context", "research.snapshot_lineage", cutoff
+    )
+    repository._delete_snapshot_rows(
+        "snapshot-id", "context", "research.snapshot_input", cutoff
+    )
+
+    assert "research_date=%s" in calls[0][0]
+    assert calls[0][1] == ("snapshot-id", cutoff)
+    assert "research_date=%s" in calls[1][0]
+    assert calls[1][1] == ("snapshot-id", cutoff)
+    assert "research_date=%s" not in calls[2][0]
+    assert calls[2][1] == ("snapshot-id",)
+
+
 def test_snapshot_batch_sql_binds_code_scope_for_each_materialization_layer():
     stock_sql = ResearchSnapshotRepository.stock_snapshot_batch_sql()
     foundation_sql = ResearchSnapshotRepository.foundation_snapshot_batch_sql()
