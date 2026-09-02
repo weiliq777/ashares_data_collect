@@ -132,11 +132,37 @@ def test_snapshot_cleanup_uses_cutoff_for_partitioned_children():
     )
 
     assert "research_date=%s" in calls[0][0]
-    assert calls[0][1] == ("snapshot-id", cutoff)
+    assert "WITH victims AS" in calls[0][0]
+    assert calls[0][1][:2] == ("snapshot-id", cutoff)
+    assert calls[0][1][2] == repository.SNAPSHOT_DELETE_CHUNK_SIZE
     assert "research_date=%s" in calls[1][0]
-    assert calls[1][1] == ("snapshot-id", cutoff)
+    assert calls[1][1][:2] == ("snapshot-id", cutoff)
+    assert calls[1][1][2] == repository.SNAPSHOT_DELETE_CHUNK_SIZE
     assert "research_date=%s" not in calls[2][0]
     assert calls[2][1] == ("snapshot-id",)
+
+
+def test_snapshot_cleanup_repeats_short_delete_transactions_until_empty():
+    calls = []
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    repository.SNAPSHOT_DELETE_CHUNK_SIZE = 2
+    results = iter((2, 2, 1))
+
+    def fake_run(sql, plan, context, params):
+        calls.append((sql, params))
+        return next(results)
+
+    repository.kernel = SimpleNamespace(
+        rebuild=SimpleNamespace(run_scoped_merge=fake_run),
+    )
+
+    deleted = repository._delete_snapshot_rows(
+        "snapshot-id", "context", "research.snapshot_lineage", date(2022, 12, 2)
+    )
+
+    assert deleted == 5
+    assert len(calls) == 3
+    assert all(call[1][2] == 2 for call in calls)
 
 
 def test_snapshot_batch_sql_binds_code_scope_for_each_materialization_layer():

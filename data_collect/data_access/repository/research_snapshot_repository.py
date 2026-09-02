@@ -25,6 +25,12 @@ class ResearchSnapshotRepository(BaseRepository):
     # 100 codes keeps each stock/lineage INSERT ... SELECT below the governed
     # 30-second statement deadline even on the oldest, most expensive dates.
     SNAPSHOT_CODE_BATCH_SIZE = 100
+    # Rebuild retries must remove any partially materialized snapshot first.
+    # A complete snapshot has roughly 50k lineage rows; deleting all of them
+    # in one governed statement can exceed the 30-second statement deadline
+    # even when the lookup itself uses the snapshot/date index.  Keep each
+    # delete as its own short Kernel transaction.
+    SNAPSHOT_DELETE_CHUNK_SIZE = 2_000
     INPUT_STATS_BATCH_ROWS = 2_000
     # Input-manifest hashing must remain row-wise, but a single named cursor
     # over a wide historical feature table can still spend the whole statement
@@ -600,20 +606,68 @@ class ResearchSnapshotRepository(BaseRepository):
         scope = self._snapshot_scope(snapshot_id, cutoff)
         plan = SqlPlan(
             operation=Operation.REBUILD, target=target, scope=scope,
-            expected_mode="SET_BASED", estimated_rows=0, allow_delete=True,
+            expected_mode="SET_BASED", estimated_rows=self.SNAPSHOT_DELETE_CHUNK_SIZE,
+            allow_delete=True,
         )
         # ``stock_snapshot_daily`` is range-partitioned by research_date.  A
         # snapshot_id-only delete forces PostgreSQL to inspect every yearly
         # partition before the next rebuild and can exceed the governed
         # statement deadline.  Lineage is not partitioned today, but the same
         # date predicate keeps the delete bounded and matches the WorkScope.
-        if target in {"research.stock_snapshot_daily", "research.snapshot_lineage"}:
-            sql = f"DELETE FROM {target} WHERE snapshot_id=%s AND research_date=%s"
-            params = (snapshot_id, cutoff)
+        if target == "research.snapshot_lineage":
+            # Delete by the physical primary key selected from the bounded
+            # snapshot/date slice.  This avoids one long DELETE that must
+            # remove tens of thousands of index entries and fire a large
+            # transition-table trigger in one statement.
+            sql = f"""
+                WITH victims AS (
+                    SELECT lineage_id
+                      FROM {target}
+                     WHERE snapshot_id=%s AND research_date=%s
+                     ORDER BY lineage_id
+                     LIMIT %s
+                )
+                DELETE FROM {target} AS target_rows
+                 USING victims
+                 WHERE target_rows.lineage_id=victims.lineage_id
+            """
+            params = (snapshot_id, cutoff, self.SNAPSHOT_DELETE_CHUNK_SIZE)
+        elif target == "research.stock_snapshot_daily":
+            # The parent is range-partitioned by research_date.  Select only
+            # the current partition's business keys, then delete that small
+            # key set through the parent so partition pruning remains active.
+            sql = f"""
+                WITH victims AS (
+                    SELECT ts_code
+                      FROM {target}
+                     WHERE snapshot_id=%s AND research_date=%s
+                     ORDER BY ts_code
+                     LIMIT %s
+                )
+                DELETE FROM {target} AS target_rows
+                 USING victims
+                 WHERE target_rows.snapshot_id=%s
+                   AND target_rows.research_date=%s
+                   AND target_rows.ts_code=victims.ts_code
+            """
+            params = (
+                snapshot_id, cutoff, self.SNAPSHOT_DELETE_CHUNK_SIZE,
+                snapshot_id, cutoff,
+            )
         else:
+            # snapshot_input is a small, one-row-per-source summary table and
+            # does not need chunking, but it remains fully scoped by ID.
             sql = f"DELETE FROM {target} WHERE snapshot_id=%s"
             params = (snapshot_id,)
-        return self.kernel.rebuild.run_scoped_merge(sql, plan, context, params)
+
+        total_deleted = 0
+        while True:
+            deleted = self.kernel.rebuild.run_scoped_merge(
+                sql, plan, context, params,
+            )
+            total_deleted += deleted
+            if target == "research.snapshot_input" or deleted < self.SNAPSHOT_DELETE_CHUNK_SIZE:
+                return total_deleted
 
     def _precompute_input_manifest(
         self,
