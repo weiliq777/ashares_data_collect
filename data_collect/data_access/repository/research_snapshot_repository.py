@@ -224,8 +224,8 @@ class ResearchSnapshotRepository(BaseRepository):
         """
 
     @staticmethod
-    def lineage_sql():
-        return """
+    def lineage_sql(*, foundation: bool = False):
+        sql = """
         INSERT INTO research.snapshot_lineage
           (snapshot_id, research_date, ts_code, field_group, source_table,
            source_record_key, source_record_version, source_payload_hash)
@@ -393,6 +393,18 @@ class ResearchSnapshotRepository(BaseRepository):
                          AND r.ts_code=g.ts_code AND r.field_group=g.field_group
         ON CONFLICT DO NOTHING
         """
+        if foundation:
+            # Foundation-v2's formal financial values are enriched from
+            # company_financial_v2.  The base statement still retains the
+            # V1 compatibility fields and those are declared in the input
+            # manifest; the single financial lineage record must therefore
+            # point to the V2 record selected by the enrichment statement.
+            sql = sql.replace(
+                "'feature.company_financial_v1', COALESCE(s.financial_source_record_key,",
+                "'feature.company_financial_v2', COALESCE(s.financial_source_record_key,",
+                1,
+            )
+        return sql
 
     @staticmethod
     def stock_snapshot_batch_sql():
@@ -442,9 +454,9 @@ class ResearchSnapshotRepository(BaseRepository):
         return sql
 
     @staticmethod
-    def lineage_batch_sql():
+    def lineage_batch_sql(*, foundation: bool = False):
         """Return the lineage SQL with a UUID array instead of one UUID."""
-        sql = ResearchSnapshotRepository.lineage_sql()
+        sql = ResearchSnapshotRepository.lineage_sql(foundation=foundation)
         marker = "WITH params AS (SELECT %s::uuid AS snapshot_id), groups AS ("
         if marker not in sql:
             raise RuntimeError("单日 lineage SQL 结构已变化，无法生成批量 SQL")
@@ -497,6 +509,29 @@ class ResearchSnapshotRepository(BaseRepository):
                     "order": "ts_code, report_date, data_available_timestamp, feature_id",
                     "date_column": "report_date",
                 })
+                # The base materialization intentionally keeps the legacy V1
+                # compatibility fields (roe/roa/vendor growth and the
+                # fundamental-history summary).  They are a real read
+                # dependency and must be present in snapshot_input instead of
+                # being hidden behind the Foundation-v2 enrichment pass.
+                result.append({
+                    "schema": "feature", "table": "company_financial_v1",
+                    "columns": (
+                        "feature_id", "ts_code", "report_date",
+                        "effective_announce_date", "version_available_date",
+                        "vintage_quality", "source_observed_at",
+                        "record_version", "source_record_key", "roe", "roa",
+                        "debt_to_assets", "revenue_yoy", "tr_yoy",
+                        "q_sales_yoy", "netprofit_yoy",
+                        "operating_cashflow", "net_profit", "quality_status",
+                        "payload_hash",
+                    ),
+                    "predicate": "latest version_available_date before cutoff",
+                    "where": "version_available_date IS NOT NULL AND version_available_date <= %s",
+                    "params": lambda cutoff: (cutoff,),
+                    "order": "ts_code, report_date, version_available_date, record_version, feature_id",
+                    "date_column": "report_date",
+                })
             else:
                 result.append(definition)
         return tuple(result)
@@ -513,6 +548,11 @@ class ResearchSnapshotRepository(BaseRepository):
         return """
         INSERT INTO research.stock_snapshot_daily
             (snapshot_id, research_date, ts_code,
+             report_date, effective_announce_date,
+             financial_record_version, financial_source_record_key,
+             financial_payload_hash, financial_source_fingerprint,
+             financial_vintage_quality,
+             financial_source_observed_at,
              financial_feature_contract_version, financial_data_available_timestamp,
              net_profit_consolidated_ttm, net_profit_parent_ttm,
              operating_cashflow_ttm, roe_ttm, gross_margin_ttm,
@@ -521,6 +561,12 @@ class ResearchSnapshotRepository(BaseRepository):
              dv_window_end, dv_observation_days, dv_window_complete,
              financial_component_lineage, quality_status)
         SELECT %s, s.research_date, s.ts_code,
+               f.report_date, f.effective_announce_date,
+               f.feature_id,
+               CASE WHEN f.feature_id IS NULL THEN NULL
+                    ELSE f.ts_code || ':' || f.report_date::text || ':' || f.feature_id::text END,
+               f.source_fingerprint, f.source_fingerprint,
+               f.pit_evidence_level, f.source_observed_at,
                COALESCE(f.feature_contract_version, 'feature-contract-v2.0'),
                f.data_available_timestamp, f.net_profit_consolidated_ttm,
                f.net_profit_parent_ttm, f.operating_cashflow_ttm, f.roe_ttm,
@@ -547,6 +593,14 @@ class ResearchSnapshotRepository(BaseRepository):
             ON v.ts_code=s.ts_code AND v.trade_date=s.research_date
          WHERE s.snapshot_id=%s
         ON CONFLICT (snapshot_id, research_date, ts_code) DO UPDATE SET
+            report_date=EXCLUDED.report_date,
+            effective_announce_date=EXCLUDED.effective_announce_date,
+            financial_record_version=EXCLUDED.financial_record_version,
+            financial_source_record_key=EXCLUDED.financial_source_record_key,
+            financial_payload_hash=EXCLUDED.financial_payload_hash,
+            financial_source_fingerprint=EXCLUDED.financial_source_fingerprint,
+            financial_vintage_quality=EXCLUDED.financial_vintage_quality,
+            financial_source_observed_at=EXCLUDED.financial_source_observed_at,
             financial_feature_contract_version=EXCLUDED.financial_feature_contract_version,
             financial_data_available_timestamp=EXCLUDED.financial_data_available_timestamp,
             net_profit_consolidated_ttm=EXCLUDED.net_profit_consolidated_ttm,
@@ -786,7 +840,9 @@ class ResearchSnapshotRepository(BaseRepository):
                     operation=Operation.REBUILD, target="research.snapshot_lineage", scope=scope,
                     expected_mode="SET_BASED", allow_insert_select=True,
                 )
-                lineage_sql = self.lineage_sql().replace(
+                lineage_sql = self.lineage_sql(
+                    foundation=is_foundation_schema(manifest["schema_version"])
+                ).replace(
                     "WITH params AS (SELECT %s::uuid AS snapshot_id),",
                     "WITH params AS (SELECT %s::uuid AS snapshot_id, %s::date AS research_date, %s::text[] AS codes),",
                     1,
@@ -1004,7 +1060,9 @@ class ResearchSnapshotRepository(BaseRepository):
                         expected_mode="SET_BASED",
                         allow_insert_select=True,
                     )
-                    lineage_sql = self.lineage_sql().replace(
+                    lineage_sql = self.lineage_sql(
+                        foundation=is_foundation_schema(schema_version)
+                    ).replace(
                         "WITH params AS (SELECT %s::uuid AS snapshot_id),",
                         "WITH params AS (SELECT %s::uuid AS snapshot_id, "
                         "%s::date AS research_date, %s::text[] AS codes),",
@@ -1129,7 +1187,29 @@ class ResearchSnapshotRepository(BaseRepository):
         min_date = None
         max_date = None
         keyset_column = self.INPUT_STATS_KEYSET_COLUMNS.get(source)
-        if keyset_column:
+        if source == "feature.company_financial_v1":
+            # The base materialization selects one latest PIT-visible V1 row
+            # per stock.  Hash that exact selected set rather than every
+            # historical V1 row, otherwise each snapshot would perform a
+            # much larger and semantically different input scan.
+            batches = self._paged_input_rows(
+                context=context,
+                source=source,
+                sql=(
+                    f'SELECT DISTINCT ON ("ts_code") {selected} FROM {source} '
+                    'WHERE "version_available_date" IS NOT NULL '
+                    'AND "version_available_date" <= %s '
+                    'AND "ts_code" > %s '
+                    'ORDER BY "ts_code", "report_date" DESC, '
+                    '"version_available_date" DESC, "record_version" DESC, '
+                    '"feature_id" DESC LIMIT %s'
+                ),
+                params_prefix=(cutoff,),
+                page_rows=self.INPUT_STATS_PAGE_ROWS,
+                cutoff=cutoff,
+                scope_partition=f"snapshot-input:{source}",
+            )
+        elif keyset_column:
             batches = self._paged_input_rows(
                 context=context,
                 source=source,

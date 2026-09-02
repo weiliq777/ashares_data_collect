@@ -749,6 +749,10 @@ Raw 与交易日历可支持的截止日为 `2026-08-06`。
   失败时，下一次任务仍会重算，不依赖“本次新增 Raw 行数大于 0”。
 - `feature.company_financial_v2` 的五年事实共用最新利润年锚点；非工商业 OCF 比率为空并标记
   `NOT_APPLICABLE`。`pit.security_tradeability_daily` 对涨停/跌停分别封锁买入/卖出。
+- Foundation-v2 Research Snapshot 显式声明 `feature.company_financial_v2` 与
+  `feature.company_financial_v1` 两个财务输入：前者为正式 V2 财务增强字段及其
+  `financial` 血缘，后者仅提供仍保留的兼容字段与 `fundamental_history` 汇总，不能作为
+  未登记的隐藏输入。
 - Snapshot 批量质量报告保存真实扫描截止日；历史 Snapshot 可绑定覆盖其截止日的 V2 正式运行，
   但不能把较晚扫描伪装成较早日期的独立质量证据。
 → backtest.dataset_manifest / dataset_member / dataset_execution_bar / dataset_rule_snapshot

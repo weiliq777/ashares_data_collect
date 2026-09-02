@@ -10,6 +10,7 @@ from data_collect.jobs.research_snapshot import (
     _manifest_hash,
     _row_bytes,
     _lineage_sql,
+    _inputs_for_schema,
     _stock_snapshot_sql,
 )
 from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
@@ -311,6 +312,33 @@ def test_snapshot_input_definitions_are_explicit_and_unique():
     names = [(item["schema"], item["table"]) for item in INPUTS]
     assert len(names) == len(set(names))
     assert all(item["predicate"] and item["columns"] and item["order"] for item in INPUTS)
+
+
+def test_foundation_inputs_declare_v1_compatibility_and_v2_financial_sources():
+    definitions = _inputs_for_schema("research-v2.0")
+    names = [(item["schema"], item["table"]) for item in definitions]
+    assert ("feature", "company_financial_v2") in names
+    assert ("feature", "company_financial_v1") in names
+    assert len(names) == len(set(names))
+    # The base materialization still reads V1 compatibility fields; keeping
+    # that source in the manifest prevents a hidden input dependency.
+    assert "FROM feature.company_financial_v1 c" in _stock_snapshot_sql()
+
+
+def test_foundation_lineage_points_financial_group_to_selected_v2_record():
+    sql = ResearchSnapshotRepository.lineage_sql(foundation=True)
+    assert "'feature.company_financial_v2', COALESCE" in sql
+    assert "'feature.company_financial_v1', COALESCE" not in sql
+    # The historical-summary compatibility group remains explicitly V1.
+    assert "feature.company_financial_v1:pit-visible-summary" in sql
+    enrichment = ResearchSnapshotRepository.foundation_snapshot_sql()
+    for column in (
+        "financial_record_version", "financial_source_record_key",
+        "financial_payload_hash", "financial_source_fingerprint",
+        "financial_vintage_quality",
+        "financial_source_observed_at",
+    ):
+        assert column in enrichment
 
 
 def test_lineage_contract_has_all_required_groups():
