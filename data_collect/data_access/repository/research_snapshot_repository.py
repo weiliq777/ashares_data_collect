@@ -95,7 +95,7 @@ class ResearchSnapshotRepository(BaseRepository):
                t.is_tradeable, t.can_buy, t.can_sell, t.limit_status,
                d.open, d.high, d.low, p.raw_close, d.volume, d.amount,
                st.up_limit, st.down_limit,
-                p.asof_close, p.feature_set_version, p.adjustment_mode,
+                p.adj_close_base, p.feature_set_version, p.adjustment_mode,
                 p.return_1d, p.return_20d, p.return_60d,
                p.ma20, p.ma60, p.ma120, p.volume_ratio_20d,
                p.available_observation_count, p.ma20_observation_count,
@@ -277,8 +277,7 @@ class ResearchSnapshotRepository(BaseRepository):
                    1::bigint,
                    encode(digest(convert_to(jsonb_build_object(
                        'ts_code', p.ts_code, 'trade_date', p.trade_date,
-                        'raw_close', p.raw_close, 'asof_close', p.asof_close,
-                        'asof_adjustment_factor', p.asof_adjustment_factor,
+                        'raw_close', p.raw_close, 'adj_close_base', p.adj_close_base,
                        'return_1d', p.return_1d, 'return_20d', p.return_20d,
                        'return_60d', p.return_60d, 'ma20', p.ma20, 'ma60', p.ma60,
                        'ma120', p.ma120, 'volume_ratio_20d', p.volume_ratio_20d,

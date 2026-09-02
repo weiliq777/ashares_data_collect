@@ -108,6 +108,21 @@ def test_snapshot_code_batches_stay_below_statement_deadline_budget():
     assert "SNAPSHOT_CODE_BATCH_SIZE = 100" in source
 
 
+def test_snapshot_uses_contract_base_adjusted_price_and_lineage_hash():
+    repository_source = __import__("pathlib").Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    job_source = __import__("pathlib").Path(
+        "data_collect/jobs/research_snapshot.py"
+    ).read_text(encoding="utf-8")
+
+    assert "p.adj_close_base, p.feature_set_version" in repository_source
+    assert "p.asof_close, p.feature_set_version" not in repository_source
+    assert "'adj_close_base', p.adj_close_base" in repository_source
+    assert '"raw_close", "adj_close_base"' in job_source
+    assert '"asof_close"' not in job_source
+
+
 def test_snapshot_cleanup_uses_cutoff_for_partitioned_children():
     calls = []
     repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)

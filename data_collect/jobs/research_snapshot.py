@@ -70,7 +70,7 @@ INPUTS = (
     },
     {
         "schema": "feature", "table": "price_daily_v2",
-        "columns": ("ts_code", "trade_date", "raw_close", "asof_close", "asof_adjustment_factor", "return_1d", "return_20d", "return_60d", "ma20", "ma60", "ma120", "volume_ratio_20d", "available_observation_count", "ma20_observation_count", "ma60_observation_count", "ma120_observation_count", "feature_set_version", "adjustment_mode", "quality_status", "source_asof_date"),
+        "columns": ("ts_code", "trade_date", "raw_close", "adj_close_base", "return_1d", "return_20d", "return_60d", "ma20", "ma60", "ma120", "volume_ratio_20d", "available_observation_count", "ma20_observation_count", "ma60_observation_count", "ma120_observation_count", "feature_set_version", "adjustment_mode", "quality_status", "source_asof_date"),
         "predicate": "trade_date = :research_cutoff_date",
         "where": "trade_date = %s", "params": lambda cutoff: (cutoff,),
         "order": "trade_date, ts_code", "date_column": "trade_date",
