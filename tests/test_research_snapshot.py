@@ -197,6 +197,16 @@ def test_snapshot_batch_sql_binds_code_scope_for_each_materialization_layer():
     assert lineage_sql.count("AND s.ts_code IN (SELECT ts_code FROM codes)") == 11
 
 
+def test_snapshot_batch_marks_building_manifest_for_recovery_before_cleanup():
+    source = __import__("inspect").getsource(
+        ResearchSnapshotRepository.build_snapshots_batch
+    )
+    building_transition = source.index('("DRAFT", "FAILED"), "BUILDING"')
+    recovery_registration = source.index("started.append(item)")
+    cleanup = source.index('"research.snapshot_lineage"', recovery_registration)
+    assert building_transition < recovery_registration < cleanup
+
+
 def test_snapshot_validation_reuses_persisted_input_evidence():
     source = __import__("pathlib").Path(
         "data_collect/data_access/repository/research_snapshot_repository.py"

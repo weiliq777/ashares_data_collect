@@ -979,13 +979,19 @@ class ResearchSnapshotRepository(BaseRepository):
                     )
                     if changed != 1:
                         raise RuntimeError(f"Snapshot 状态在构建期间发生变化: {snapshot_id}")
+                    # The manifest is now BUILDING, so register it for
+                    # failure recovery before any child cleanup starts. If a
+                    # delete times out or the connection is lost, leaving a
+                    # BUILDING row outside ``started`` could make the next
+                    # resume validate stale child rows instead of rebuilding
+                    # them.
+                    started.append(item)
                     for target in (
                         "research.snapshot_lineage",
                         "research.stock_snapshot_daily",
                         "research.snapshot_input",
                     ):
                         self._delete_snapshot_rows(snapshot_id, context, target, manifest["cutoff"])
-                    started.append(item)
 
                 high_water = baseline[5]["append_only_sources"][
                     "tushare_stock_basic_raw_version"
