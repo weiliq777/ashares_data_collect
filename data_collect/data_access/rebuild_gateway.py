@@ -173,6 +173,65 @@ class RebuildGateway:
     def run_insert_select(self, sql: str, plan: SqlPlan, context: RunContext, params=None) -> int:
         return self._run_set_based("run_insert_select", sql, plan, context, params)
 
+    def run_snapshot_lineage_bundle(
+        self, sql: str, plan: SqlPlan, context: RunContext, params=None,
+    ) -> int:
+        """Materialize one bounded compact lineage bundle.
+
+        The statement has two deliberately fixed write targets: the
+        content-addressed source dictionary and the per-stock bundle table.
+        This named operation is the narrow exception to the ordinary
+        single-target ``run_insert_select`` parser; it is not a general SQL
+        escape hatch. Both targets are checked against concrete policies and
+        the operation remains one statement/one short Kernel transaction.
+        """
+        if not isinstance(plan, SqlPlan):
+            raise TypeError("run_snapshot_lineage_bundle requires SqlPlan")
+        if plan.target != "research.snapshot_lineage_bundle":
+            raise ValueError(
+                "run_snapshot_lineage_bundle target must be "
+                "research.snapshot_lineage_bundle"
+            )
+        if plan.operation != Operation.REBUILD or plan.expected_mode != "SET_BASED":
+            raise ValueError(
+                "run_snapshot_lineage_bundle requires REBUILD/SET_BASED"
+            )
+        if not isinstance(context, RunContext):
+            raise TypeError("run_snapshot_lineage_bundle requires RunContext")
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("run_snapshot_lineage_bundle SQL must not be empty")
+
+        source_plan = SqlPlan(
+            operation=Operation.REBUILD,
+            target="research.lineage_source_record",
+            scope=plan.scope,
+            expected_mode="SET_BASED",
+            estimated_rows=max(0, int(plan.estimated_rows or 0) * 10),
+            allow_insert_select=True,
+        )
+        self._kernel.query_guard.check(plan)
+        self._kernel.query_guard.check(source_plan)
+        self._validate_snapshot_lineage_bundle_sql(sql)
+
+        def run_sql() -> int:
+            # The dictionary is shared by every snapshot series.  A unique
+            # conflict that races another transaction can wait, then remain
+            # invisible to the current statement snapshot; the subsequent
+            # bundle FK write would otherwise see a NULL source_ref_id.  A
+            # transaction-scoped advisory lock makes the fixed two-target
+            # statement deterministic without widening its data scope.
+            self._kernel.lock_manager.acquire_exclusive(
+                "research.lineage_source_record", "content-addressed-dictionary"
+            )
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params) if params else ())
+                return int(cur.rowcount or 0)
+
+        # Both writes are replay-safe: source rows use DO NOTHING and bundle
+        # rows use a deterministic scoped upsert.
+        return self._kernel._run_chunk(run_sql, idempotent=True)
+
     def swap_partitioned_table(
         self, context: RunContext, scope: WorkScope,
         legacy_table: str, partitioned_table: str, final_table: str,
@@ -767,6 +826,50 @@ class RebuildGateway:
             raise ValueError(f"未知 SET-based 方法: {method}")
 
     # ---- 内部 ----
+
+    @staticmethod
+    def _validate_snapshot_lineage_bundle_sql(sql: str) -> None:
+        """Accept only the fixed two-target lineage bundle statement."""
+        normalized = re.sub(r"--[^\n]*|/\*.*?\*/", " ", sql, flags=re.S).strip()
+        statements = [part.strip() for part in normalized.split(";") if part.strip()]
+        if len(statements) != 1:
+            raise ValueError("snapshot lineage bundle must be one statement")
+        # The fixed bundle statement legitimately uses ``ON CONFLICT DO
+        # UPDATE`` for replay-safe replacement of the same stock/date row.
+        # Remove only that clause keyword before rejecting any standalone
+        # UPDATE/DELETE/DDL escape hatch.
+        forbidden_scan = re.sub(
+            r"\bON\s+CONFLICT\b(?:(?!\bINSERT\s+INTO\b).)*?\bDO\s+UPDATE\b",
+            "ON CONFLICT DO ", normalized, flags=re.I | re.S,
+        )
+        if re.search(
+            r"\b(DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|VACUUM|UPDATE|DELETE)\b",
+            forbidden_scan,
+            re.I,
+        ):
+            raise ValueError("snapshot lineage bundle forbids DDL/UPDATE/DELETE")
+        if not re.match(r"^WITH\b", normalized, re.I):
+            raise ValueError("snapshot lineage bundle must use a WITH statement")
+        targets = {
+            relation.lower()
+            for relation in re.findall(
+                r"\bINSERT\s+INTO\s+"
+                r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+                normalized,
+                re.I,
+            )
+        }
+        expected = {
+            "research.lineage_source_record",
+            "research.snapshot_lineage_bundle",
+        }
+        if targets != expected:
+            raise ValueError(
+                "snapshot lineage bundle DML targets must equal "
+                f"{sorted(expected)}; found={sorted(targets)}"
+            )
+        if not re.search(r"\bON\s+CONFLICT\b", normalized, re.I):
+            raise ValueError("snapshot lineage bundle must be replay-safe")
 
     @staticmethod
     def _validate_table_fill_sql(sql: str, staging: str) -> None:

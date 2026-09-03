@@ -752,6 +752,92 @@ def test_run_insert_select_allows_single_with_insert_select():
     assert any("WITH source" in e["sql"] for e in conn.executed)
 
 
+def test_snapshot_lineage_bundle_is_a_named_two_target_replay_safe_operation():
+    kernel, conn = make_kernel(build_default_registry())
+    scope = WorkScope(
+        date_from=date(2026, 1, 1), date_to=date(2026, 1, 1),
+        partition="snapshot-lineage-bundle",
+        dimensions={"snapshot_id": "snapshot-id"},
+    )
+    plan = SqlPlan(
+        operation=Operation.REBUILD,
+        target="research.snapshot_lineage_bundle",
+        scope=scope,
+        expected_mode="SET_BASED",
+        estimated_rows=1,
+        allow_insert_select=True,
+    )
+    sql = """
+        WITH inserted_source AS (
+            INSERT INTO research.lineage_source_record
+                (source_identity_hash, source_table, source_record_key)
+            VALUES (decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'hex'), 'x', 'y')
+            ON CONFLICT DO NOTHING
+            RETURNING source_ref_id
+        )
+        INSERT INTO research.snapshot_lineage_bundle
+            (snapshot_id, research_date, ts_code,
+             universe_source_ref_id, tradeability_source_ref_id,
+             price_source_ref_id, valuation_source_ref_id,
+             financial_source_ref_id, shareholder_return_source_ref_id,
+             lifecycle_source_ref_id, instrument_source_ref_id,
+             market_facts_source_ref_id, fundamental_history_source_ref_id,
+             source_bundle_hash)
+        SELECT '00000000-0000-0000-0000-000000000000'::uuid, DATE '2026-01-01', '000001.SZ',
+               source_ref_id, source_ref_id, source_ref_id, source_ref_id,
+               source_ref_id, source_ref_id, source_ref_id, source_ref_id,
+               source_ref_id, source_ref_id, repeat('a', 64)::char(64)
+          FROM inserted_source
+        ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE
+            SET source_bundle_hash=EXCLUDED.source_bundle_hash
+    """
+
+    kernel.rebuild.run_snapshot_lineage_bundle(sql, plan, ctx())
+
+    assert conn.committed == 1
+    assert any("pg_advisory_xact_lock" in e["sql"] for e in conn.executed)
+    assert any("research.lineage_source_record" in e["sql"] for e in conn.executed)
+    assert any("research.snapshot_lineage_bundle" in e["sql"] for e in conn.executed)
+
+
+def test_snapshot_lineage_bundle_rejects_unapproved_dml_target():
+    kernel, _ = make_kernel(build_default_registry())
+    plan = SqlPlan(
+        operation=Operation.REBUILD,
+        target="research.snapshot_lineage_bundle",
+        scope=WorkScope(date_from=date(2026, 1, 1), dimensions={"snapshot_id": "id"}),
+        expected_mode="SET_BASED",
+        allow_insert_select=True,
+    )
+    with pytest.raises(ValueError, match="one statement|forbids"):
+        kernel.rebuild.run_snapshot_lineage_bundle(
+            "WITH x AS (SELECT 1) INSERT INTO research.snapshot_lineage_bundle SELECT 1; UPDATE research.snapshot_lineage_bundle SET source_bundle_hash='x'",
+            plan,
+            ctx(),
+        )
+
+
+def test_lineage_v2_prepare_is_a_bounded_named_manifest_operation():
+    kernel, conn = make_kernel(build_default_registry())
+    scope = WorkScope(
+        date_from=date(2026, 1, 1), date_to=date(2026, 1, 1),
+        partition="snapshot-lineage-v2-rebuild",
+        dimensions={"snapshot_ids": ("id-1",)},
+    )
+
+    assert kernel.write.prepare_snapshot_lineage_v2_rebuild(
+        ctx(), scope, ["id-1"], "repair compact lineage"
+    ) == 0
+
+    statement = next(
+        entry["sql"] for entry in conn.executed
+        if "lineage_storage_version='v2'" in entry["sql"]
+    )
+    assert "status='FAILED'" in statement
+    assert "status <> 'FROZEN'" in statement
+    assert conn.committed == 1
+
+
 def test_set_based_rebuild_does_not_enter_automatic_retry_boundary():
     kernel, conn = make_kernel()
     kernel.retry_policy.run = lambda *_args, **_kwargs: pytest.fail(

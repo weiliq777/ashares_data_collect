@@ -3,6 +3,35 @@ services:
     image: postgres:16
     container_name: ashares-postgres
     restart: unless-stopped
+    # Keep the WSL2 host cap at 15 GiB, while giving PostgreSQL enough cache
+    # and WAL headroom for the production-sized Research Snapshot rebuild.
+    # These are database settings, not an application-side memory escape.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - autovacuum_work_mem=256MB
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - wal_compression=on
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - min_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - effective_io_concurrency=32
     environment:
       POSTGRES_USER: ashares
       POSTGRES_PASSWORD: ashares_password

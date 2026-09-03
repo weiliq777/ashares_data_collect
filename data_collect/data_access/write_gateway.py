@@ -540,6 +540,101 @@ class WriteGateway:
             from_statuses, to_status,
         )
 
+    def set_snapshot_lineage_storage_version(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        snapshot_ids: Sequence[str],
+        from_version: str = "v1",
+        to_version: str = "v2",
+    ) -> int:
+        """Switch a bounded set of pre-freeze manifests to lineage v2.
+
+        This is a named metadata migration, not a general UPDATE surface. It
+        cannot touch FROZEN manifests and only changes the explicit lineage
+        storage selector. The caller must validate the selected series before
+        invoking it and may safely replay the operation.
+        """
+        if not isinstance(context, RunContext) or not isinstance(scope, WorkScope):
+            raise TypeError(
+                "set_snapshot_lineage_storage_version requires RunContext and WorkScope"
+            )
+        ids = tuple(str(snapshot_id) for snapshot_id in snapshot_ids)
+        if not ids or len(ids) > self._kernel.transaction_manager.config.max_rows_per_tx:
+            raise ValueError("snapshot lineage version migration batch is out of bounds")
+        if from_version not in {"v1", "v2"} or to_version not in {"v1", "v2"}:
+            raise ValueError("unsupported snapshot lineage storage version")
+        if from_version == to_version:
+            raise ValueError("snapshot lineage storage version must change")
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="research.snapshot_manifest",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=len(ids),
+        )
+        self._kernel.query_guard.check(plan)
+        sql = """
+            UPDATE research.snapshot_manifest
+               SET lineage_storage_version=%s
+             WHERE snapshot_id=ANY(%s::uuid[])
+               AND lineage_storage_version=%s
+               AND status <> 'FROZEN'
+        """
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(
+                sql, (to_version, list(ids), from_version)
+            )
+        )
+
+    def prepare_snapshot_lineage_v2_rebuild(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        snapshot_ids: Sequence[str],
+        reason: str,
+    ) -> int:
+        """Atomically switch and reopen a bounded pre-freeze snapshot set.
+
+        The first v2 migration step must not leave a half-switched series if
+        the process exits between metadata and lifecycle updates.  This named
+        operation changes only v1, non-FROZEN manifests and moves them to
+        FAILED with an auditable PRE_FREEZE_REPAIR reason.  It is idempotent:
+        replay after the commit sees no v1 rows and leaves already rebuilt
+        VALIDATED snapshots untouched.
+        """
+        if not isinstance(context, RunContext) or not isinstance(scope, WorkScope):
+            raise TypeError(
+                "prepare_snapshot_lineage_v2_rebuild requires RunContext and WorkScope"
+            )
+        ids = tuple(str(snapshot_id) for snapshot_id in snapshot_ids)
+        if not ids or len(ids) > self._kernel.transaction_manager.config.max_rows_per_tx:
+            raise ValueError("snapshot lineage v2 rebuild batch is out of bounds")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("snapshot lineage v2 rebuild reason must not be blank")
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="research.snapshot_manifest",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=len(ids),
+        )
+        self._kernel.query_guard.check(plan)
+        sql = """
+            UPDATE research.snapshot_manifest
+               SET lineage_storage_version='v2',
+                   status='FAILED',
+                   failure_reason=%s
+             WHERE snapshot_id=ANY(%s::uuid[])
+               AND lineage_storage_version='v1'
+               AND status <> 'FROZEN'
+        """
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(
+                sql, (f"PRE_FREEZE_REPAIR: {reason[:1980]}", list(ids))
+            )
+        )
+
     def transition_observation_snapshot(
         self,
         context: RunContext,

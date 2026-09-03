@@ -74,8 +74,14 @@ DO $$
 DECLARE table_name TEXT;
 BEGIN
     FOREACH table_name IN ARRAY ARRAY[
-        'snapshot_input', 'stock_snapshot_daily', 'snapshot_lineage'
+        'snapshot_input', 'stock_snapshot_daily', 'snapshot_lineage',
+        'snapshot_lineage_bundle'
     ] LOOP
+        -- This migration predates lineage v2.  Keep replay idempotent in an
+        -- isolated database where the v2 table has not been provisioned yet.
+        IF to_regclass('research.' || table_name) IS NULL THEN
+            CONTINUE;
+        END IF;
         EXECUTE format(
             'DROP TRIGGER IF EXISTS %I ON research.%I',
             'trg_research_' || table_name || '_mutable', table_name

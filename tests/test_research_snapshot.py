@@ -106,7 +106,8 @@ def test_snapshot_code_batches_stay_below_statement_deadline_budget():
     source = __import__("pathlib").Path(
         "data_collect/data_access/repository/research_snapshot_repository.py"
     ).read_text(encoding="utf-8")
-    assert "SNAPSHOT_CODE_BATCH_SIZE = 100" in source
+    assert "SNAPSHOT_CODE_BATCH_SIZE = 500" in source
+    assert "LINEAGE_CODE_BATCH_SIZE = 1_000" in source
 
 
 def test_snapshot_uses_contract_base_adjusted_price_and_lineage_hash():
@@ -144,6 +145,9 @@ def test_snapshot_cleanup_uses_cutoff_for_partitioned_children():
         "snapshot-id", "context", "research.snapshot_lineage", cutoff
     )
     repository._delete_snapshot_rows(
+        "snapshot-id", "context", "research.snapshot_lineage_bundle", cutoff
+    )
+    repository._delete_snapshot_rows(
         "snapshot-id", "context", "research.snapshot_input", cutoff
     )
 
@@ -154,8 +158,11 @@ def test_snapshot_cleanup_uses_cutoff_for_partitioned_children():
     assert "research_date=%s" in calls[1][0]
     assert calls[1][1][:2] == ("snapshot-id", cutoff)
     assert calls[1][1][2] == repository.SNAPSHOT_DELETE_CHUNK_SIZE
-    assert "research_date=%s" not in calls[2][0]
-    assert calls[2][1] == ("snapshot-id",)
+    assert "research_date=%s" in calls[2][0]
+    assert calls[2][1][:2] == ("snapshot-id", cutoff)
+    assert calls[2][1][2] == repository.SNAPSHOT_DELETE_CHUNK_SIZE
+    assert "research_date=%s" not in calls[3][0]
+    assert calls[3][1] == ("snapshot-id",)
 
 
 def test_snapshot_cleanup_repeats_short_delete_transactions_until_empty():
@@ -203,7 +210,7 @@ def test_snapshot_batch_marks_building_manifest_for_recovery_before_cleanup():
     )
     building_transition = source.index('("DRAFT", "FAILED"), "BUILDING"')
     recovery_registration = source.index("started.append(item)")
-    cleanup = source.index('"research.snapshot_lineage"', recovery_registration)
+    cleanup = source.index("lineage_target,", recovery_registration)
     assert building_transition < recovery_registration < cleanup
 
 
@@ -372,6 +379,24 @@ def test_lineage_sql_uses_real_source_metadata_for_derived_groups():
     assert "source_record_version" in sql
     assert "source_payload_hash" in sql
     assert "digest(" in sql
+
+
+def test_lineage_bundle_preserves_ten_groups_and_is_replay_safe():
+    sql = ResearchSnapshotRepository.lineage_bundle_sql(foundation=True)
+    assert "research.lineage_source_record" in sql
+    assert "research.snapshot_lineage_bundle" in sql
+    assert "source_bundle_hash" in sql
+    assert sql.count("_source_ref_id") >= 10
+    assert "ON CONFLICT (source_identity_hash) DO NOTHING" in sql
+    assert "encode(universe_identity_hash, 'hex')" in sql
+    assert "ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE" in sql
+    assert "INSERT INTO research.snapshot_lineage\n" not in sql
+
+
+def test_lineage_target_defaults_legacy_and_selects_v2_manifest():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    assert repository.lineage_target({}) == repository.LEGACY_LINEAGE_TARGET
+    assert repository.lineage_target({"lineage_storage_version": "v2"}) == repository.BUNDLE_LINEAGE_TARGET
 
 
 def test_snapshot_uses_asof_lifecycle_and_not_current_status_for_history():

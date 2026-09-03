@@ -93,6 +93,7 @@ class SnapshotRecord:
     frozen_at: datetime | None = None
     failed_at: datetime | None = None
     failure_reason: str | None = None
+    lineage_storage_version: str = "v1"
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "SnapshotRecord":
@@ -114,6 +115,7 @@ class SnapshotRecord:
             frozen_at=row.get("frozen_at"),
             failed_at=row.get("failed_at"),
             failure_reason=row.get("failure_reason"),
+            lineage_storage_version=str(row.get("lineage_storage_version") or "v1"),
         )
 
 

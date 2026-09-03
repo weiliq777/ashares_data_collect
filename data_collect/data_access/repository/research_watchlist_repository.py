@@ -136,20 +136,57 @@ class ResearchWatchlistRepository(BaseRepository):
 
     def add_snapshot_lineage_evidence(self, watchlist_id: str, context: RunContext) -> int:
         parent_rows = self.kernel.read._repository_query(context, "research.watchlist",
-            """SELECT w.snapshot_id, w.status, m.status AS snapshot_status, m.research_cutoff_date
+            """SELECT w.snapshot_id, w.status, m.status AS snapshot_status,
+                              m.research_cutoff_date, m.lineage_storage_version
                  FROM research.watchlist w JOIN research.snapshot_manifest m ON m.snapshot_id=w.snapshot_id
                 WHERE w.watchlist_id=%s""", (watchlist_id,), WorkScope(partition=str(watchlist_id)), 2)
         if not parent_rows or parent_rows[0]["status"] != "ACTIVE" or parent_rows[0]["snapshot_status"] != "FROZEN":
             raise RuntimeError("快照事实引用要求 ACTIVE 观察池和 FROZEN 快照")
         parent = parent_rows[0]
-        rows = self.kernel.read._repository_query(context, "research.snapshot_lineage",
-            """SELECT m.ts_code, l.field_group, l.source_table, l.source_record_key,
-                      l.source_record_version, l.source_payload_hash
-                 FROM research.watchlist_member m JOIN research.snapshot_lineage l
-                   ON l.snapshot_id=m.snapshot_id AND l.research_date=m.research_date AND l.ts_code=m.ts_code
-                WHERE m.watchlist_id=%s AND l.field_group IN ('financial','price','valuation')
-                  AND l.source_record_key NOT LIKE '%%:missing' AND l.source_payload_hash IS NOT NULL""",
-            (watchlist_id,), WorkScope(partition=str(watchlist_id), dimensions={"snapshot_id": str(parent["snapshot_id"])}), 100_000)
+        if parent.get("lineage_storage_version") == "v2":
+            rows = self.kernel.read._repository_query(
+                context, "research.snapshot_lineage_bundle",
+                """SELECT m.ts_code, refs.field_group, d.source_table,
+                          d.source_record_key, d.source_record_version,
+                          d.source_payload_hash
+                     FROM research.watchlist_member m
+                     JOIN research.snapshot_lineage_bundle l
+                       ON l.snapshot_id=m.snapshot_id
+                      AND l.research_date=m.research_date
+                      AND l.ts_code=m.ts_code
+                     CROSS JOIN LATERAL (VALUES
+                       ('financial', l.financial_source_ref_id),
+                       ('price', l.price_source_ref_id),
+                       ('valuation', l.valuation_source_ref_id)
+                     ) refs(field_group, source_ref_id)
+                     JOIN research.lineage_source_record d
+                       ON d.source_ref_id=refs.source_ref_id
+                    WHERE m.watchlist_id=%s
+                      AND d.source_record_key NOT LIKE '%%:missing'
+                      AND d.source_payload_hash IS NOT NULL""",
+                (watchlist_id,),
+                WorkScope(
+                    partition=str(watchlist_id),
+                    dimensions={"snapshot_id": str(parent["snapshot_id"])}
+                ),
+                100_000,
+            )
+        else:
+            rows = self.kernel.read._repository_query(
+                context, "research.snapshot_lineage",
+                """SELECT m.ts_code, l.field_group, l.source_table, l.source_record_key,
+                          l.source_record_version, l.source_payload_hash
+                     FROM research.watchlist_member m JOIN research.snapshot_lineage l
+                       ON l.snapshot_id=m.snapshot_id AND l.research_date=m.research_date AND l.ts_code=m.ts_code
+                    WHERE m.watchlist_id=%s AND l.field_group IN ('financial','price','valuation')
+                      AND l.source_record_key NOT LIKE '%%:missing' AND l.source_payload_hash IS NOT NULL""",
+                (watchlist_id,),
+                WorkScope(
+                    partition=str(watchlist_id),
+                    dimensions={"snapshot_id": str(parent["snapshot_id"])}
+                ),
+                100_000,
+            )
         evidence = [{
             "evidence_id": str(uuid.uuid4()), "watchlist_id": watchlist_id, "snapshot_id": parent["snapshot_id"],
             "ts_code": row["ts_code"], "source_system": "postgres", "source_type": "snapshot_lineage",

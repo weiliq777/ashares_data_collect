@@ -14,7 +14,10 @@ def test_snapshot_child_guards_are_statement_level_and_preserve_frozen_gate():
     assert "REFERENCING OLD TABLE AS old_rows" in sql
     assert "FOR EACH STATEMENT" in sql
     assert "FOR EACH ROW EXECUTE FUNCTION research.assert_snapshot_child_mutable" not in sql
-    for table_name in ("snapshot_input", "stock_snapshot_daily", "snapshot_lineage"):
+    for table_name in (
+        "snapshot_input", "stock_snapshot_daily", "snapshot_lineage",
+        "snapshot_lineage_bundle",
+    ):
         assert f"'{table_name}'" in sql
 
 

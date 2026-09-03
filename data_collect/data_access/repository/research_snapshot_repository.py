@@ -20,11 +20,20 @@ _IMMUTABLE_INPUT_STATS_CACHE: dict[tuple, dict[str, Any]] = {}
 
 
 class ResearchSnapshotRepository(BaseRepository):
+    LEGACY_LINEAGE_TARGET = "research.snapshot_lineage"
+    BUNDLE_LINEAGE_TARGET = "research.snapshot_lineage_bundle"
+    SOURCE_LINEAGE_TARGET = "research.lineage_source_record"
+    LINEAGE_STORAGE_V2 = "v2"
     # Snapshot SQL is set-based, but one code batch must also remain below the
     # governed 30-second statement deadline on the oldest/highest-cost dates.
-    # 100 codes keeps each stock/lineage INSERT ... SELECT below the governed
-    # 30-second statement deadline even on the oldest, most expensive dates.
-    SNAPSHOT_CODE_BATCH_SIZE = 100
+    # 500 codes keeps the stock INSERT ... SELECT below the governed
+    # 30-second statement deadline while cutting per-batch planning and
+    # trigger overhead.  Stock rows remain bounded by the transaction policy.
+    SNAPSHOT_CODE_BATCH_SIZE = 500
+    # The compact lineage statement writes one row per stock and uses
+    # statement-level guards, so it can safely use a larger independent batch.
+    # Its source dictionary is still bounded to roughly ten records per code.
+    LINEAGE_CODE_BATCH_SIZE = 1_000
     # Rebuild retries must remove any partially materialized snapshot first.
     # A complete snapshot has roughly 50k lineage rows; deleting all of them
     # in one governed statement can exceed the 30-second statement deadline
@@ -45,6 +54,13 @@ class ResearchSnapshotRepository(BaseRepository):
         "std.security_status_daily": "ts_code",
         "feature.shareholder_return_v1": "ts_code",
     }
+
+    @classmethod
+    def lineage_target(cls, manifest: dict[str, Any]) -> str:
+        """Select the physical lineage target recorded by the manifest."""
+        if manifest.get("lineage_storage_version") == cls.LINEAGE_STORAGE_V2:
+            return cls.BUNDLE_LINEAGE_TARGET
+        return cls.LEGACY_LINEAGE_TARGET
 
     @staticmethod
     def stock_snapshot_sql():
@@ -407,6 +423,151 @@ class ResearchSnapshotRepository(BaseRepository):
         return sql
 
     @staticmethod
+    def lineage_bundle_sql(*, foundation: bool = False) -> str:
+        """Return the compact lineage bundle statement for one snapshot.
+
+        The logical lineage contract is unchanged from ``lineage_sql``: ten
+        field groups are resolved for every stock.  The physical write stores
+        one row per stock and puts the verbose source metadata in a global,
+        content-addressed dictionary.  The resulting statement is deliberately
+        accepted only by the named RebuildGateway lineage operation.
+        """
+        sql = ResearchSnapshotRepository.lineage_sql(foundation=foundation)
+        header = (
+            "        INSERT INTO research.snapshot_lineage\n"
+            "          (snapshot_id, research_date, ts_code, field_group, source_table,\n"
+            "           source_record_key, source_record_version, source_payload_hash)\n"
+        )
+        if header not in sql:
+            raise RuntimeError("legacy lineage SQL header changed; cannot build bundle SQL")
+        sql = sql.replace(header, "", 1)
+        final_select = (
+            "        SELECT g.snapshot_id, g.research_date, g.ts_code, g.field_group,\n"
+            "               COALESCE(r.source_table, g.field_group || ':missing'),\n"
+            "               COALESCE(r.source_record_key, g.ts_code || ':' || g.research_date::text || ':missing'),\n"
+            "               r.source_record_version, r.source_payload_hash\n"
+            "        FROM groups g\n"
+            "        LEFT JOIN refs r ON r.snapshot_id=g.snapshot_id AND r.research_date=g.research_date\n"
+            "                         AND r.ts_code=g.ts_code AND r.field_group=g.field_group\n"
+            "        ON CONFLICT DO NOTHING\n"
+        )
+        if final_select not in sql:
+            raise RuntimeError("legacy lineage SQL final projection changed; cannot build bundle SQL")
+        bundle_select = """        , normalized_refs AS (
+            SELECT g.snapshot_id, g.research_date, g.ts_code, g.field_group,
+                   COALESCE(r.source_table, g.field_group || ':missing') AS source_table,
+                   COALESCE(r.source_record_key, g.ts_code || ':' || g.research_date::text || ':missing') AS source_record_key,
+                   r.source_record_version,
+                   r.source_payload_hash,
+                   digest(convert_to(jsonb_build_object(
+                       'source_table', COALESCE(r.source_table, g.field_group || ':missing'),
+                       'source_record_key', COALESCE(r.source_record_key, g.ts_code || ':' || g.research_date::text || ':missing'),
+                       'source_record_version', r.source_record_version,
+                       'source_payload_hash', r.source_payload_hash
+                   )::text, 'UTF8'), 'sha256') AS source_identity_hash
+            FROM groups g
+            LEFT JOIN refs r ON r.snapshot_id=g.snapshot_id AND r.research_date=g.research_date
+                             AND r.ts_code=g.ts_code AND r.field_group=g.field_group
+        ), source_rows AS (
+            SELECT DISTINCT source_table, source_record_key, source_record_version,
+                            source_payload_hash, source_identity_hash
+            FROM normalized_refs
+        ), inserted_source AS (
+            INSERT INTO research.lineage_source_record
+                (source_identity_hash, source_table, source_record_key,
+                 source_record_version, source_payload_hash)
+            SELECT source_identity_hash, source_table, source_record_key,
+                   source_record_version, source_payload_hash
+              FROM source_rows
+            ON CONFLICT (source_identity_hash) DO NOTHING
+            RETURNING source_ref_id, source_identity_hash
+        ), resolved_refs AS (
+            SELECT n.snapshot_id, n.research_date, n.ts_code, n.field_group,
+                   n.source_identity_hash,
+                   COALESCE(i.source_ref_id, d.source_ref_id) AS source_ref_id
+              FROM normalized_refs n
+              LEFT JOIN inserted_source i ON i.source_identity_hash=n.source_identity_hash
+              LEFT JOIN research.lineage_source_record d
+                ON d.source_identity_hash=n.source_identity_hash
+        ), bundles AS (
+            SELECT snapshot_id, research_date, ts_code,
+                   MAX(source_ref_id) FILTER (WHERE field_group='universe') AS universe_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='tradeability') AS tradeability_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='price') AS price_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='valuation') AS valuation_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='financial') AS financial_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='shareholder_return') AS shareholder_return_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='lifecycle') AS lifecycle_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='instrument') AS instrument_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='market_facts') AS market_facts_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='fundamental_history') AS fundamental_history_source_ref_id,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='universe'))[1] AS universe_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='tradeability'))[1] AS tradeability_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='price'))[1] AS price_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='valuation'))[1] AS valuation_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='financial'))[1] AS financial_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='shareholder_return'))[1] AS shareholder_return_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='lifecycle'))[1] AS lifecycle_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='instrument'))[1] AS instrument_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='market_facts'))[1] AS market_facts_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='fundamental_history'))[1] AS fundamental_history_identity_hash
+              FROM resolved_refs
+             GROUP BY snapshot_id, research_date, ts_code
+            HAVING COUNT(DISTINCT field_group)=10
+        )
+        INSERT INTO research.snapshot_lineage_bundle
+            (snapshot_id, research_date, ts_code,
+             universe_source_ref_id, tradeability_source_ref_id,
+             price_source_ref_id, valuation_source_ref_id,
+             financial_source_ref_id, shareholder_return_source_ref_id,
+             lifecycle_source_ref_id, instrument_source_ref_id,
+             market_facts_source_ref_id, fundamental_history_source_ref_id,
+             source_bundle_hash)
+        SELECT snapshot_id, research_date, ts_code,
+               universe_source_ref_id, tradeability_source_ref_id,
+               price_source_ref_id, valuation_source_ref_id,
+               financial_source_ref_id, shareholder_return_source_ref_id,
+               lifecycle_source_ref_id, instrument_source_ref_id,
+               market_facts_source_ref_id, fundamental_history_source_ref_id,
+               encode(digest(convert_to(jsonb_build_object(
+                   'universe', encode(universe_identity_hash, 'hex'),
+                   'tradeability', encode(tradeability_identity_hash, 'hex'),
+                   'price', encode(price_identity_hash, 'hex'),
+                   'valuation', encode(valuation_identity_hash, 'hex'),
+                   'financial', encode(financial_identity_hash, 'hex'),
+                   'shareholder_return', encode(shareholder_return_identity_hash, 'hex'),
+                   'lifecycle', encode(lifecycle_identity_hash, 'hex'),
+                   'instrument', encode(instrument_identity_hash, 'hex'),
+                   'market_facts', encode(market_facts_identity_hash, 'hex'),
+                   'fundamental_history', encode(fundamental_history_identity_hash, 'hex')
+               )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
+          FROM bundles
+        ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE SET
+            universe_source_ref_id=EXCLUDED.universe_source_ref_id,
+            tradeability_source_ref_id=EXCLUDED.tradeability_source_ref_id,
+            price_source_ref_id=EXCLUDED.price_source_ref_id,
+            valuation_source_ref_id=EXCLUDED.valuation_source_ref_id,
+            financial_source_ref_id=EXCLUDED.financial_source_ref_id,
+            shareholder_return_source_ref_id=EXCLUDED.shareholder_return_source_ref_id,
+            lifecycle_source_ref_id=EXCLUDED.lifecycle_source_ref_id,
+            instrument_source_ref_id=EXCLUDED.instrument_source_ref_id,
+            market_facts_source_ref_id=EXCLUDED.market_facts_source_ref_id,
+            fundamental_history_source_ref_id=EXCLUDED.fundamental_history_source_ref_id,
+            source_bundle_hash=EXCLUDED.source_bundle_hash
+        """
+        return sql.replace(final_select, bundle_select, 1)
+
+    @staticmethod
     def stock_snapshot_batch_sql():
         """Return the set-based materialization SQL for several cutoff dates."""
         sql = ResearchSnapshotRepository.stock_snapshot_sql()
@@ -635,6 +796,8 @@ class ResearchSnapshotRepository(BaseRepository):
             "baseline_source_manifest_hash": baseline_source_manifest_hash,
             "quality_report": json.dumps(quality_report, ensure_ascii=False, default=str),
             "status": "DRAFT", "notes": notes,
+            "lineage_storage_version": self.LINEAGE_STORAGE_V2
+            if is_foundation_schema(schema_version) else "v1",
             "feature_contract_version": "feature-contract-v2.0"
             if is_foundation_schema(schema_version) else None,
             "decision_timestamp": cutoff,
@@ -667,7 +830,7 @@ class ResearchSnapshotRepository(BaseRepository):
         # partition before the next rebuild and can exceed the governed
         # statement deadline.  Lineage is not partitioned today, but the same
         # date predicate keeps the delete bounded and matches the WorkScope.
-        if target == "research.snapshot_lineage":
+        if target == self.LEGACY_LINEAGE_TARGET:
             # Delete by the physical primary key selected from the bounded
             # snapshot/date slice.  This avoids one long DELETE that must
             # remove tens of thousands of index entries and fire a large
@@ -685,6 +848,28 @@ class ResearchSnapshotRepository(BaseRepository):
                  WHERE target_rows.lineage_id=victims.lineage_id
             """
             params = (snapshot_id, cutoff, self.SNAPSHOT_DELETE_CHUNK_SIZE)
+        elif target == self.BUNDLE_LINEAGE_TARGET:
+            # Bundle lineage has one row per stock and is partitioned by
+            # research_date.  Delete only a bounded code slice so retries do
+            # not create a long transaction or a transition-table spike.
+            sql = f"""
+                WITH victims AS (
+                    SELECT ts_code
+                      FROM {target}
+                     WHERE snapshot_id=%s AND research_date=%s
+                     ORDER BY ts_code
+                     LIMIT %s
+                )
+                DELETE FROM {target} AS target_rows
+                 USING victims
+                 WHERE target_rows.snapshot_id=%s
+                   AND target_rows.research_date=%s
+                   AND target_rows.ts_code=victims.ts_code
+            """
+            params = (
+                snapshot_id, cutoff, self.SNAPSHOT_DELETE_CHUNK_SIZE,
+                snapshot_id, cutoff,
+            )
         elif target == "research.stock_snapshot_daily":
             # The parent is range-partitioned by research_date.  Select only
             # the current partition's business keys, then delete that small
@@ -759,6 +944,7 @@ class ResearchSnapshotRepository(BaseRepository):
         """Materialize one snapshot through typed rebuild/write operations."""
         cutoff = manifest["cutoff"]
         scope = self._snapshot_scope(snapshot_id, cutoff)
+        lineage_target = self.lineage_target(manifest)
         try:
             stats, input_manifest_hash = self._precompute_input_manifest(
                 definitions, cutoff, baseline[5], context, row_bytes, manifest_hash,
@@ -787,7 +973,7 @@ class ResearchSnapshotRepository(BaseRepository):
                 if changed != 1:
                     raise RuntimeError("Snapshot 状态在构建期间发生变化")
                 for target in (
-                    "research.snapshot_lineage", "research.stock_snapshot_daily", "research.snapshot_input",
+                    lineage_target, "research.stock_snapshot_daily", "research.snapshot_input",
                 ):
                     self._delete_snapshot_rows(snapshot_id, context, target, cutoff)
                 high_water = baseline[5]["append_only_sources"]["tushare_stock_basic_raw_version"]["max_record_id"]
@@ -837,10 +1023,16 @@ class ResearchSnapshotRepository(BaseRepository):
                             (snapshot_id, snapshot_id, cutoff, code_batch),
                         )
                 lineage_plan = SqlPlan(
-                    operation=Operation.REBUILD, target="research.snapshot_lineage", scope=scope,
+                    operation=Operation.REBUILD, target=lineage_target, scope=scope,
                     expected_mode="SET_BASED", allow_insert_select=True,
+                    estimated_rows=self.LINEAGE_CODE_BATCH_SIZE,
                 )
-                lineage_sql = self.lineage_sql(
+                lineage_builder = (
+                    self.lineage_bundle_sql
+                    if lineage_target == self.BUNDLE_LINEAGE_TARGET
+                    else self.lineage_sql
+                )
+                lineage_sql = lineage_builder(
                     foundation=is_foundation_schema(manifest["schema_version"])
                 ).replace(
                     "WITH params AS (SELECT %s::uuid AS snapshot_id),",
@@ -852,11 +1044,18 @@ class ResearchSnapshotRepository(BaseRepository):
                     "AND s.research_date=(SELECT research_date FROM params) "
                     "AND s.ts_code IN (SELECT unnest(codes) FROM params)",
                 )
-                for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
-                    code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
-                    self.kernel.rebuild.run_insert_select(
-                        lineage_sql, lineage_plan, context, (snapshot_id, cutoff, code_batch)
-                    )
+                for offset in range(0, len(codes), self.LINEAGE_CODE_BATCH_SIZE):
+                    code_batch = codes[offset:offset + self.LINEAGE_CODE_BATCH_SIZE]
+                    if lineage_target == self.BUNDLE_LINEAGE_TARGET:
+                        self.kernel.rebuild.run_snapshot_lineage_bundle(
+                            lineage_sql, lineage_plan, context,
+                            (snapshot_id, cutoff, code_batch),
+                        )
+                    else:
+                        self.kernel.rebuild.run_insert_select(
+                            lineage_sql, lineage_plan, context,
+                            (snapshot_id, cutoff, code_batch),
+                        )
                 self.kernel.write.bulk_insert(context, scope, "research.snapshot_input", input_rows)
                 changed = self.kernel.write.transition_snapshot_manifest(
                     context, scope, snapshot_id, ("BUILDING",), "BUILDING",
@@ -905,6 +1104,10 @@ class ResearchSnapshotRepository(BaseRepository):
         if len(baseline_tags) != 1 or len(schema_versions) != 1:
             raise ValueError("同一批次必须使用同一 baseline_tag/schema_version")
         schema_version = next(iter(schema_versions))
+        lineage_targets = {self.lineage_target(item) for item in manifests}
+        if len(lineage_targets) != 1:
+            raise ValueError("snapshot build batch must use one lineage storage version")
+        lineage_target = next(iter(lineage_targets))
 
         prepared: list[dict[str, Any]] = []
         for manifest in manifests:
@@ -987,7 +1190,7 @@ class ResearchSnapshotRepository(BaseRepository):
                     # them.
                     started.append(item)
                     for target in (
-                        "research.snapshot_lineage",
+                        lineage_target,
                         "research.stock_snapshot_daily",
                         "research.snapshot_input",
                     ):
@@ -1061,12 +1264,18 @@ class ResearchSnapshotRepository(BaseRepository):
                     cutoff = manifest["cutoff"]
                     lineage_plan = SqlPlan(
                         operation=Operation.REBUILD,
-                        target="research.snapshot_lineage",
+                        target=lineage_target,
                         scope=self._snapshot_scope(snapshot_id, cutoff),
                         expected_mode="SET_BASED",
                         allow_insert_select=True,
+                        estimated_rows=self.LINEAGE_CODE_BATCH_SIZE,
                     )
-                    lineage_sql = self.lineage_sql(
+                    lineage_builder = (
+                        self.lineage_bundle_sql
+                        if lineage_target == self.BUNDLE_LINEAGE_TARGET
+                        else self.lineage_sql
+                    )
+                    lineage_sql = lineage_builder(
                         foundation=is_foundation_schema(schema_version)
                     ).replace(
                         "WITH params AS (SELECT %s::uuid AS snapshot_id),",
@@ -1079,12 +1288,18 @@ class ResearchSnapshotRepository(BaseRepository):
                         "AND s.research_date=(SELECT research_date FROM params) "
                         "AND s.ts_code IN (SELECT unnest(codes) FROM params)",
                     )
-                    for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
-                        code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
-                        self.kernel.rebuild.run_insert_select(
-                            lineage_sql, lineage_plan, context,
-                            (snapshot_id, cutoff, list(code_batch)),
-                        )
+                    for offset in range(0, len(codes), self.LINEAGE_CODE_BATCH_SIZE):
+                        code_batch = codes[offset:offset + self.LINEAGE_CODE_BATCH_SIZE]
+                        if lineage_target == self.BUNDLE_LINEAGE_TARGET:
+                            self.kernel.rebuild.run_snapshot_lineage_bundle(
+                                lineage_sql, lineage_plan, context,
+                                (snapshot_id, cutoff, list(code_batch)),
+                            )
+                        else:
+                            self.kernel.rebuild.run_insert_select(
+                                lineage_sql, lineage_plan, context,
+                                (snapshot_id, cutoff, list(code_batch)),
+                            )
 
                 all_input_rows = [
                     row for item in prepared for row in item["input_rows"]
@@ -1401,6 +1616,7 @@ class ResearchSnapshotRepository(BaseRepository):
             context, "research.snapshot_manifest",
             """SELECT snapshot_id, research_cutoff_date AS cutoff,
                        data_baseline_tag AS baseline, schema_version, status,
+                       lineage_storage_version,
                        code_version, git_commit, git_dirty, diff_hash,
                        code_archive_path, code_archive_sha256,
                        code_archive_size_bytes AS code_archive_size,
@@ -1501,28 +1717,77 @@ class ResearchSnapshotRepository(BaseRepository):
         )[0]["value"]
         if rows["row_count"] != expected:
             issues.append({"snapshot_universe_row_mismatch": {"snapshot_rows": rows["row_count"], "universe_rows": expected}})
-        missing = self.kernel.read._repository_query(
-            context, "research.snapshot_lineage",
-            """SELECT COUNT(*) AS value FROM (
-                SELECT snapshot_id,research_date,ts_code FROM research.snapshot_lineage
-                 WHERE snapshot_id=%s AND research_date=%s
-                 GROUP BY snapshot_id,research_date,ts_code
-                 HAVING COUNT(DISTINCT field_group)<>%s) x""",
-            (snapshot_id, cutoff, required_lineage_groups), scope, 2,
-        )[0]["value"]
-        if missing:
-            issues.append({"rows_with_incomplete_lineage": missing})
-        incomplete = self.kernel.read._repository_query(
-            context, "research.snapshot_lineage",
-            """SELECT field_group, COUNT(*) AS value FROM research.snapshot_lineage
-                 WHERE snapshot_id=%s AND research_date=%s
-                   AND source_record_key NOT LIKE '%%:missing'
-                   AND (source_record_version IS NULL OR source_payload_hash IS NULL)
-                 GROUP BY field_group ORDER BY field_group""",
-            (snapshot_id, cutoff), scope, 100,
-        )
+        lineage_target = self.lineage_target(manifest)
+        if lineage_target == self.BUNDLE_LINEAGE_TARGET:
+            bundle_rows = self.kernel.read._repository_query(
+                context, lineage_target,
+                """SELECT COUNT(*) AS value
+                     FROM research.snapshot_lineage_bundle
+                    WHERE snapshot_id=%s AND research_date=%s""",
+                (snapshot_id, cutoff), scope, 2,
+            )[0]["value"]
+            if bundle_rows != rows["row_count"]:
+                issues.append({
+                    "snapshot_lineage_row_mismatch": {
+                        "snapshot_rows": rows["row_count"],
+                        "lineage_bundle_rows": bundle_rows,
+                    }
+                })
+            incomplete = self.kernel.read._repository_query(
+                context, lineage_target,
+                """WITH refs AS (
+                         SELECT b.snapshot_id, b.research_date, b.ts_code,
+                                v.field_group, v.source_ref_id
+                           FROM research.snapshot_lineage_bundle b
+                           CROSS JOIN LATERAL (VALUES
+                             ('universe', b.universe_source_ref_id),
+                             ('tradeability', b.tradeability_source_ref_id),
+                             ('price', b.price_source_ref_id),
+                             ('valuation', b.valuation_source_ref_id),
+                             ('financial', b.financial_source_ref_id),
+                             ('shareholder_return', b.shareholder_return_source_ref_id),
+                             ('lifecycle', b.lifecycle_source_ref_id),
+                             ('instrument', b.instrument_source_ref_id),
+                             ('market_facts', b.market_facts_source_ref_id),
+                             ('fundamental_history', b.fundamental_history_source_ref_id)
+                           ) v(field_group, source_ref_id)
+                          WHERE b.snapshot_id=%s AND b.research_date=%s
+                       )
+                       SELECT r.field_group, COUNT(*) AS value
+                         FROM refs r
+                         JOIN research.lineage_source_record d
+                           ON d.source_ref_id=r.source_ref_id
+                        WHERE d.source_record_key NOT LIKE '%%:missing'
+                          AND (d.source_record_version IS NULL OR d.source_payload_hash IS NULL)
+                        GROUP BY r.field_group ORDER BY r.field_group""",
+                (snapshot_id, cutoff), scope, 100,
+            )
+        else:
+            missing = self.kernel.read._repository_query(
+                context, lineage_target,
+                """SELECT COUNT(*) AS value FROM (
+                    SELECT snapshot_id,research_date,ts_code
+                      FROM research.snapshot_lineage
+                     WHERE snapshot_id=%s AND research_date=%s
+                     GROUP BY snapshot_id,research_date,ts_code
+                    HAVING COUNT(DISTINCT field_group)<>%s) x""",
+                (snapshot_id, cutoff, required_lineage_groups), scope, 2,
+            )[0]["value"]
+            if missing:
+                issues.append({"rows_with_incomplete_lineage": missing})
+            incomplete = self.kernel.read._repository_query(
+                context, lineage_target,
+                """SELECT field_group, COUNT(*) AS value FROM research.snapshot_lineage
+                     WHERE snapshot_id=%s AND research_date=%s
+                       AND source_record_key NOT LIKE '%%:missing'
+                       AND (source_record_version IS NULL OR source_payload_hash IS NULL)
+                     GROUP BY field_group ORDER BY field_group""",
+                (snapshot_id, cutoff), scope, 100,
+            )
         if incomplete:
-            issues.append({"lineage_refs_without_version_or_hash": [(row["field_group"], row["value"]) for row in incomplete]})
+            issues.append({"lineage_refs_without_version_or_hash": [
+                (row["field_group"], row["value"]) for row in incomplete
+            ]})
         stored_inputs = self.kernel.read._repository_query(
             context, "research.snapshot_input",
             """SELECT schema_name, table_name, selection_predicate, selected_columns,
@@ -1588,6 +1853,10 @@ class ResearchSnapshotRepository(BaseRepository):
             raise ValueError("snapshot inspection batches are limited to 100")
         ids = [str(item["snapshot_id"]) for item in manifests]
         cutoffs = [item["cutoff"] for item in manifests]
+        lineage_targets = {self.lineage_target(item) for item in manifests}
+        if len(lineage_targets) != 1:
+            raise ValueError("snapshot inspection batch must use one lineage storage version")
+        lineage_target = next(iter(lineage_targets))
         scope = WorkScope(
             date_from=min(cutoffs), date_to=max(cutoffs),
             partition="snapshot-check-batch",
@@ -1639,35 +1908,91 @@ class ResearchSnapshotRepository(BaseRepository):
                     }
                 })
 
-        incomplete_lineage = self.kernel.read._repository_query(
-            context, "research.snapshot_lineage",
-            """SELECT snapshot_id, COUNT(*) AS value FROM (
-                    SELECT snapshot_id, research_date, ts_code
+        if lineage_target == self.BUNDLE_LINEAGE_TARGET:
+            bundle_rows = self.kernel.read._repository_query(
+                context, lineage_target,
+                """SELECT snapshot_id, research_date, COUNT(*) AS value
+                       FROM research.snapshot_lineage_bundle
+                      WHERE snapshot_id=ANY(%s::uuid[])
+                        AND research_date=ANY(%s::date[])
+                      GROUP BY snapshot_id, research_date""",
+                (ids, cutoffs), scope,
+                max_rows=max(2, len(ids) + 1),
+            )
+            bundle_by_id = {str(row["snapshot_id"]): row["value"] for row in bundle_rows}
+            for manifest in manifests:
+                snapshot_id = str(manifest["snapshot_id"])
+                expected_rows = stock_by_id.get(snapshot_id, {}).get("row_count", 0)
+                actual_rows = bundle_by_id.get(snapshot_id, 0)
+                if actual_rows != expected_rows:
+                    add(snapshot_id, {
+                        "snapshot_lineage_row_mismatch": {
+                            "snapshot_rows": expected_rows,
+                            "lineage_bundle_rows": actual_rows,
+                        }
+                    })
+            missing_refs = self.kernel.read._repository_query(
+                context, lineage_target,
+                """WITH refs AS (
+                         SELECT b.snapshot_id, b.research_date, v.field_group,
+                                v.source_ref_id
+                           FROM research.snapshot_lineage_bundle b
+                           CROSS JOIN LATERAL (VALUES
+                             ('universe', b.universe_source_ref_id),
+                             ('tradeability', b.tradeability_source_ref_id),
+                             ('price', b.price_source_ref_id),
+                             ('valuation', b.valuation_source_ref_id),
+                             ('financial', b.financial_source_ref_id),
+                             ('shareholder_return', b.shareholder_return_source_ref_id),
+                             ('lifecycle', b.lifecycle_source_ref_id),
+                             ('instrument', b.instrument_source_ref_id),
+                             ('market_facts', b.market_facts_source_ref_id),
+                             ('fundamental_history', b.fundamental_history_source_ref_id)
+                           ) v(field_group, source_ref_id)
+                          WHERE b.snapshot_id=ANY(%s::uuid[])
+                            AND b.research_date=ANY(%s::date[])
+                       )
+                       SELECT r.snapshot_id, r.field_group, COUNT(*) AS value
+                         FROM refs r
+                         JOIN research.lineage_source_record d
+                           ON d.source_ref_id=r.source_ref_id
+                        WHERE d.source_record_key NOT LIKE '%%:missing'
+                          AND (d.source_record_version IS NULL OR d.source_payload_hash IS NULL)
+                        GROUP BY r.snapshot_id, r.field_group
+                        ORDER BY r.snapshot_id, r.field_group""",
+                (ids, cutoffs), scope,
+                max_rows=max(2, len(ids) * required_lineage_groups + 1),
+            )
+        else:
+            incomplete_lineage = self.kernel.read._repository_query(
+                context, lineage_target,
+                """SELECT snapshot_id, COUNT(*) AS value FROM (
+                        SELECT snapshot_id, research_date, ts_code
+                          FROM research.snapshot_lineage
+                         WHERE snapshot_id=ANY(%s::uuid[])
+                           AND research_date=ANY(%s::date[])
+                         GROUP BY snapshot_id, research_date, ts_code
+                        HAVING COUNT(DISTINCT field_group)<>%s
+                    ) x GROUP BY snapshot_id""",
+                (ids, cutoffs, required_lineage_groups), scope,
+                max_rows=max(2, len(ids) + 1),
+            )
+            for row in incomplete_lineage:
+                add(str(row["snapshot_id"]), {"rows_with_incomplete_lineage": row["value"]})
+
+            missing_refs = self.kernel.read._repository_query(
+                context, lineage_target,
+                """SELECT snapshot_id, field_group, COUNT(*) AS value
                       FROM research.snapshot_lineage
                      WHERE snapshot_id=ANY(%s::uuid[])
                        AND research_date=ANY(%s::date[])
-                     GROUP BY snapshot_id, research_date, ts_code
-                    HAVING COUNT(DISTINCT field_group)<>%s
-                ) x GROUP BY snapshot_id""",
-            (ids, cutoffs, required_lineage_groups), scope,
-            max_rows=max(2, len(ids) + 1),
-        )
-        for row in incomplete_lineage:
-            add(str(row["snapshot_id"]), {"rows_with_incomplete_lineage": row["value"]})
-
-        missing_refs = self.kernel.read._repository_query(
-            context, "research.snapshot_lineage",
-            """SELECT snapshot_id, field_group, COUNT(*) AS value
-                  FROM research.snapshot_lineage
-                 WHERE snapshot_id=ANY(%s::uuid[])
-                   AND research_date=ANY(%s::date[])
-                   AND source_record_key NOT LIKE '%%:missing'
-                   AND (source_record_version IS NULL OR source_payload_hash IS NULL)
-                 GROUP BY snapshot_id, field_group
-                 ORDER BY snapshot_id, field_group""",
-            (ids, cutoffs), scope,
-            max_rows=max(2, len(ids) * required_lineage_groups + 1),
-        )
+                       AND source_record_key NOT LIKE '%%:missing'
+                       AND (source_record_version IS NULL OR source_payload_hash IS NULL)
+                     GROUP BY snapshot_id, field_group
+                     ORDER BY snapshot_id, field_group""",
+                (ids, cutoffs), scope,
+                max_rows=max(2, len(ids) * required_lineage_groups + 1),
+            )
         missing_by_id: dict[str, list[tuple[str, Any]]] = {}
         for row in missing_refs:
             missing_by_id.setdefault(str(row["snapshot_id"]), []).append(

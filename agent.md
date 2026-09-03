@@ -93,3 +93,10 @@ uv run python tools/check_data_access_contract.py
 - `data_collect/backtest/`、`data_collect/portfolio/`：不直接访问数据库/券商的纯 Python 模型。
 - `data_collect/jobs/`：任务编排和受控入库入口；不得在任务中绕过 Repository。
 - `sql/`：版本化数据库迁移；修改模型时同步更新当前数据模型文档和测试。
+
+## 2026-09 Research Snapshot 血缘优化规则
+
+- Research Snapshot（研究快照）血缘逻辑仍固定为十个字段组；Foundation-v2 新快照使用按月分区的 `research.snapshot_lineage_bundle`（紧凑血缘包）和 `research.lineage_source_record`（来源记录字典），旧 `research.snapshot_lineage`（旧血缘表）仅作兼容读取。
+- v2 血缘包哈希必须基于十个来源内容身份哈希，不得依赖自增 `source_ref_id`；来源字典写入使用事务级互斥，保证不同快照系列并发构建时引用解析稳定。
+- 紧凑血缘切换只重建 Research Snapshot 子表；Raw（原始层）、Standard（标准层）、PIT（时点层）和 Feature（特征层）是只读输入，不得因快照物理优化而重跑。
+- 任何大表优化先做有界分批、短事务、Explain（执行计划）和等价性校验；不可因速度问题绕过 Repository（仓储）→ DataAccessKernel（数据访问内核）、冻结保护或输入哈希。

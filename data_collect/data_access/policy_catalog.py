@@ -514,6 +514,30 @@ def build_default_registry() -> DatasetPolicyRegistry:
                 scan_policy=ScanPolicy.SCOPE_REQUIRED,
             ),
             DatasetPolicy(
+                name="research.lineage_source_record",
+                # Source records are content-addressed and append-only.  The
+                # REBUILD mode is reserved for the named lineage-bundle
+                # gateway, which may insert missing dictionary entries while
+                # materializing one bounded snapshot/code slice.
+                write_modes=frozenset([WriteMode.REBUILD, WriteMode.BULK_INSERT]),
+                primary_key=("source_ref_id",),
+                require_scope=True,
+                require_snapshot_id=False,
+                update_allowed=False,
+                delete_allowed=False,
+                scan_policy=ScanPolicy.SCOPE_REQUIRED,
+            ),
+            DatasetPolicy(
+                name="research.snapshot_lineage_bundle",
+                write_modes=frozenset([WriteMode.REBUILD, WriteMode.BULK_INSERT]),
+                primary_key=("research_date", "snapshot_id", "ts_code"),
+                partition_key=("research_date",),
+                require_scope=True,
+                require_snapshot_id=True,
+                delete_allowed=True,
+                scan_policy=ScanPolicy.SCOPE_REQUIRED,
+            ),
+            DatasetPolicy(
                 name="research.snapshot_input",
                 write_modes=frozenset([WriteMode.REBUILD, WriteMode.BULK_INSERT]),
                 require_scope=True,

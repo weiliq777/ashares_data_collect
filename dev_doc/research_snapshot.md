@@ -25,7 +25,9 @@ PIT/Feature，Research 分析和 Backtest 只允许读取 `FROZEN` 快照。
 | `research.snapshot_manifest` | 快照身份、基线、代码、质量和状态 |
 | `research.snapshot_input` | 本次实际使用的表切片、字段、行数、日期范围和内容哈希 |
 | `research.stock_snapshot_daily` | 指定截止日的统一个股研究输入，含 PIT `eligible_by_market` |
-| `research.snapshot_lineage` | 快照字段组到 PIT/Feature/Standard 记录的来源血缘 |
+| `research.snapshot_lineage` | v1 兼容血缘存储 |
+| `research.snapshot_lineage_bundle` | v2 按月分区的紧凑血缘包：每个快照日期/股票一行，引用十个字段组来源 |
+| `research.lineage_source_record` | v2 内容寻址来源记录字典，去重保存来源表、业务键、版本和内容哈希 |
 
 `stock_snapshot_daily.research_date` 必须等于 Manifest 的
 `research_cutoff_date`，数据库触发器负责强制约束。
@@ -128,9 +130,11 @@ financial
 shareholder_return
 lifecycle
 instrument
+market_facts
+fundamental_history
 ```
 
-每条血缘记录保存：
+v1 每条血缘记录保存：
 
 ```text
 source_table
@@ -140,6 +144,12 @@ source_payload_hash
 ```
 
 当上游缺失时仍保存 `:missing` 占位键，并由快照质量状态标记缺失，不能伪造来源记录。
+
+Foundation-v2 快照默认使用 `research.snapshot_lineage_bundle`。它保持上述十个逻辑字段组不变，
+只是把每组的来源元数据放入 `research.lineage_source_record` 字典，通过 `*_source_ref_id`
+引用；表按 `research_date` 月分区，写入和校验仍由 `ResearchSnapshotRepository → DataAccessKernel`
+执行。`source_bundle_hash` 基于十个来源内容身份哈希而不是自增引用号；字典写入使用事务级互斥。
+旧 v1 快照继续只读保留，未完成等价性验收前不得删除。
 
 ## 7. 命令
 
@@ -166,7 +176,7 @@ source_payload_hash
 - 相同输入切片生成相同 `content_hash`；字段或筛选条件变化会改变哈希；
 - 截止日、基线截止日和股票快照日期约束通过；
 - 输入统计覆盖所有实际使用表；
-- 每个快照个股具备 8 个血缘字段组；
+- 每个快照个股具备 10 个逻辑血缘字段组；
 - 质量门禁失败不能创建可用快照；
 - `DRAFT/BUILDING/VALIDATED/FROZEN/FAILED` 状态流转符合规则；
 - `FROZEN` 后 Manifest、输入统计、股票快照和血缘的更新/删除均失败；
@@ -257,3 +267,22 @@ Snapshot 基础代码此前生成过三份 `research-v1.1` FROZEN 日快照（20
 `code_version/git_commit/git_dirty/diff_hash`。若任何待冻结 Snapshot 是 dirty build，必须
 提供对应代码归档；归档文件只在 Finalize 启动时计算一次 SHA-256，后续批次复用该证据，
 避免对同一大文件重复读取数百次。
+
+## 紧凑血缘 v2 一次性切换
+
+对于已有的 Foundation-v2 快照系列，使用专用迁移入口切换血缘物理存储并重建
+Research Snapshot 子表；该入口只读 Raw/Standard/PIT/Feature，绝不重跑或改写上游层：
+
+```powershell
+\.venv\Scripts\python.exe -m data_collect.jobs.migrate_research_snapshot_lineage_v2 `
+  --start-date 2021-08-02 `
+  --end-date 2026-08-21 `
+  --baseline-tag foundation_v2_20260821 `
+  --schema-version research-v2.0 `
+  --expected-snapshots 1226 `
+  --batch-size 2
+```
+
+首次执行以一个原子元数据/生命周期操作把旧的非冻结快照置为 `FAILED` 并切到 v2；
+之后断点续跑只处理 `DRAFT/FAILED`，已经 `VALIDATED` 的 v2 快照不会因重启而从头重建。
+旧 `research.snapshot_lineage` 只有在新系列全量校验、冻结并完成引用审计后才允许归档或删除。

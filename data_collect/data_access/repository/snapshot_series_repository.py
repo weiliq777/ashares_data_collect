@@ -34,6 +34,7 @@ class SnapshotSeriesRepository(BaseRepository):
             context,
             "research.snapshot_manifest",
             """SELECT snapshot_id, research_cutoff_date, status,
+                       lineage_storage_version,
                        input_manifest_hash, quality_report_hash,
                        baseline_quality_report_hash,
                        baseline_source_manifest_hash,
@@ -196,3 +197,25 @@ class SnapshotSeriesRepository(BaseRepository):
                 f"reopen VALIDATED snapshot count mismatch: expected {len(ids)}, got {changed}"
             )
         return changed
+
+    def prepare_lineage_v2_rebuild(
+        self, snapshot_ids: Iterable[str], reason: str, context: RunContext,
+    ) -> int:
+        """Atomically switch a selected pre-freeze series to compact lineage.
+
+        The named WriteGateway operation also reopens all v1 manifests in the
+        same transaction, so a crash cannot leave a manifest claiming v2
+        while its children still belong to the legacy representation.
+        """
+        ids = tuple(str(value) for value in snapshot_ids)
+        if not ids:
+            return 0
+        if not reason.strip():
+            raise ValueError("lineage v2 rebuild reason must not be blank")
+        scope = WorkScope(
+            partition="snapshot:lineage-v2-rebuild",
+            dimensions={"snapshot_ids": ids},
+        )
+        return self.kernel.write.prepare_snapshot_lineage_v2_rebuild(
+            context=context, scope=scope, snapshot_ids=ids, reason=reason,
+        )
