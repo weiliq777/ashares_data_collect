@@ -20,7 +20,11 @@ from data_collect.backtest.strategy.value_trend import ValueTrendStrategy as Pur
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
-from data_collect.jobs.backtest_dataset import _git_metadata, load_frozen_dataset
+from data_collect.jobs.backtest_dataset import (
+    _git_metadata,
+    load_frozen_dataset,
+    open_streaming_frozen_dataset,
+)
 from data_collect.jobs.research_snapshot import _sha256_file
 
 _CONTRACT_NOTES = (
@@ -261,7 +265,8 @@ def run_frozen_backtest(dataset_id: str, config: BacktestConfig | None = None,
                         reuse_existing_strategy_definition: bool = False,
                         *, evaluation_config: EvaluationConfig | None = None,
                         approval_evidence_hash: str | None = None,
-                        approved_by: str | None = None):
+                        approved_by: str | None = None,
+                        streaming: bool = True):
     strategy = strategy or FundamentalValueGrowthTrendStrategy()
     if config is None:
         if isinstance(strategy, QualityTrendRotationV1):
@@ -297,12 +302,19 @@ def run_frozen_backtest(dataset_id: str, config: BacktestConfig | None = None,
         strategy_version=strategy.strategy_version,
         evaluation_config=evaluation_config,
     )
+    dataset = None
     try:
         required_columns = getattr(strategy, "required_observation_columns", None)
-        dataset = load_frozen_dataset(
-            dataset_id, observation_columns=required_columns,
-            evaluation_config=evaluation_config,
-        )
+        if streaming:
+            dataset = open_streaming_frozen_dataset(
+                dataset_id, observation_columns=required_columns,
+                evaluation_config=evaluation_config,
+            )
+        else:
+            dataset = load_frozen_dataset(
+                dataset_id, observation_columns=required_columns,
+                evaluation_config=evaluation_config,
+            )
         result = BacktestEngine(config).run(dataset, strategy, run_id=run_id)
         persist_result(run_id, result)
         return run_id, result
@@ -313,6 +325,10 @@ def run_frozen_backtest(dataset_id: str, config: BacktestConfig | None = None,
         finally:
             kernel.close()
         raise
+    finally:
+        close = getattr(dataset, "close", None)
+        if callable(close):
+            close()
 
 
 def main(argv=None):
@@ -337,6 +353,20 @@ def main(argv=None):
     parser.add_argument("--reuse-existing-strategy-definition", action="store_true")
     parser.add_argument("--approval-evidence-hash")
     parser.add_argument("--approved-by")
+    streaming = parser.add_mutually_exclusive_group()
+    streaming.add_argument(
+        "--stream",
+        dest="streaming",
+        action="store_true",
+        help="按交易日分页读取 Frozen Dataset（正式回测默认行为）",
+    )
+    streaming.add_argument(
+        "--materialized",
+        dest="streaming",
+        action="store_false",
+        help="一次性物化 Dataset；仅适用于受控的小样本调试",
+    )
+    parser.set_defaults(streaming=True)
     args = parser.parse_args(argv)
     strategy = {"quality-trend-rotation-v1": QualityTrendRotationV1,
                 "fundamental-v2": FundamentalValueGrowthTrendStrategy,
@@ -358,7 +388,8 @@ def main(argv=None):
     ), args.run_version,
         args.code_archive_path, strategy, args.reuse_existing_strategy_definition,
         approval_evidence_hash=args.approval_evidence_hash,
-        approved_by=args.approved_by)
+        approved_by=args.approved_by,
+        streaming=args.streaming)
     print(json.dumps({"run_id": run_id, "metrics": result.metrics, "warnings": result.warnings}, ensure_ascii=True, default=str))
 
 

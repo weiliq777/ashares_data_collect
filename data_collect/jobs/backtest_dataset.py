@@ -7,6 +7,7 @@ Research 快照。生产回测必须先通过本模块的 ``freeze``，再调用
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -790,6 +791,341 @@ def _dividend_event_from_materialized_row(row: Sequence[Any]) -> DividendEvent:
     )
 
 
+_BAR_COLUMNS = (
+    "trade_date", "ts_code", "raw_open", "raw_high", "raw_low", "raw_close",
+    "volume", "amount", "up_limit", "down_limit", "is_suspended", "can_buy",
+    "can_sell", "limit_status", "market",
+)
+
+
+def _market_bar_from_row(row: dict[str, Any]) -> MarketBar:
+    return MarketBar(**{key: row[key] for key in _BAR_COLUMNS})
+
+
+def _selected_observation_columns(
+    observation_columns: Sequence[str] | None,
+) -> list[str]:
+    all_columns = tuple(SELECTED_COLUMNS["research"])
+    selected = list(observation_columns or all_columns[2:])
+    unknown = set(selected) - set(all_columns[2:])
+    if unknown:
+        raise ValueError(f"unknown frozen observation columns: {sorted(unknown)}")
+    return ["research_date", "ts_code", *selected]
+
+
+def _resolve_frozen_window(
+    repository: DatasetRepository,
+    dataset_id: str,
+    context: RunContext,
+    evaluation_config=None,
+):
+    """Resolve the immutable Dataset boundaries for every reader.
+
+    只有 FROZEN Dataset 可以用于正式回测；这个检查对内存版和流式版共用。
+    Evaluation 边界必须是 FROZEN Dataset 开市日。
+    """
+    manifest = repository.manifest(dataset_id, context)
+    if manifest["status"] != "FROZEN":
+        raise RuntimeError(f"鍙湁 FROZEN Dataset 鍙互鐢ㄤ簬姝ｅ紡鍥炴祴: {manifest['status']}")
+    effective_warmup_start = manifest["warmup_start"]
+    effective_evaluation_start = manifest["evaluation_start"]
+    effective_evaluation_end = manifest["evaluation_end"]
+    if evaluation_config is not None:
+        effective_warmup_start = evaluation_config.warmup_start
+        effective_evaluation_start = evaluation_config.evaluation_start
+        effective_evaluation_end = evaluation_config.evaluation_end
+        if not (
+            manifest["warmup_start"] <= effective_warmup_start
+            <= effective_evaluation_start <= effective_evaluation_end
+            <= manifest["evaluation_end"]
+        ):
+            raise RuntimeError(
+                "Evaluation 璇勪环鍖洪棿蹇呴』瀹屽叏浣嶄簬 FROZEN Dataset 鐨勫喕缁撹寖鍥村唴"
+            )
+    source_calendar = repository.open_calendar(dataset_id, context)
+    required_boundaries = {
+        effective_warmup_start,
+        effective_evaluation_start,
+        effective_evaluation_end,
+    }
+    missing_boundaries = sorted(required_boundaries - set(source_calendar))
+    if missing_boundaries:
+        raise RuntimeError(
+            f"Evaluation 杈圭晫蹇呴』鏄?FROZEN Dataset 寮€甯傛棩: {missing_boundaries}"
+        )
+    calendar = tuple(
+        day for day in source_calendar
+        if effective_warmup_start <= day <= effective_evaluation_end
+    )
+    source_oos_start = manifest["out_of_sample_start"] or effective_evaluation_start
+    effective_oos_start = min(
+        max(source_oos_start, effective_evaluation_start),
+        effective_evaluation_end,
+    )
+    return (
+        manifest, calendar, effective_warmup_start, effective_evaluation_start,
+        effective_evaluation_end, effective_oos_start,
+    )
+
+
+def _rules_for_calendar(calendar: Sequence[date], rows: Iterable[Sequence[Any]]):
+    rules = {}
+    for row in rows:
+        (*_, parameters, _rule_hash) = row
+        effective_from, effective_to, market = row[3], row[4], row[5]
+        market_rule = MarketRule(
+            market=market, min_buy_lot=row[6], allow_sell_odd_lot=row[7],
+            t_plus_one=row[8], price_tick=row[9], cash_settlement_days=row[10],
+            max_volume_participation_pct=float(
+                (parameters or {}).get("max_volume_participation_pct", 1.0)
+            ),
+            liquidity_policy=str(
+                (parameters or {}).get("liquidity_policy", "reject_full_order")
+            ),
+        )
+        fee_rule = FeeRule(
+            commission_rate=row[12], min_commission=row[13],
+            stamp_duty_sell_rate=row[14], transfer_fee_rate=row[15],
+            slippage_bps=row[16],
+        )
+        for day in calendar:
+            if effective_from <= day and (effective_to is None or day <= effective_to):
+                rules[(day, None if market in {"ALL", "*"} else market)] = (
+                    market_rule, fee_rule,
+                )
+    return rules
+
+
+class StreamingFrozenDataset:
+    """Bounded read-only Dataset view for long formal backtests.
+
+    Bars and observations are fetched through Repository page methods once
+    per trade date and retained only in small LRU caches.  The engine receives
+    the same behavioral methods as ``BacktestDataset`` and never sees SQL or
+    a database handle.  Auxiliary inputs are small enough to materialize.
+    """
+
+    __slots__ = (
+        "dataset_id", "calendar", "evaluation_start", "evaluation_end",
+        "warmup_start", "out_of_sample_start", "input_hash", "benchmark_code",
+        "benchmark_closes", "member_roles", "snapshot_ids", "require_explicit_rules",
+        "_repository", "_context", "_page_size", "_bar_cache_limit",
+        "_observation_cache_limit", "_bar_cache", "_observation_cache",
+        "_dividends", "_rules", "_delist_dates", "_next_by_date", "_closed",
+        "_observation_columns",
+    )
+
+    def __init__(
+        self, *, dataset_id: str, repository: DatasetRepository,
+        context: RunContext, manifest: dict[str, Any], calendar: tuple[date, ...],
+        evaluation_start: date, evaluation_end: date, warmup_start: date,
+        out_of_sample_start: date, observation_columns: Sequence[str] | None = None,
+        page_size: int = 10_000, bar_cache_days: int = 3,
+        observation_cache_days: int = 2,
+    ):
+        if not 1 <= page_size <= 50_000:
+            raise ValueError("streaming page_size must be between 1 and 50000")
+        if bar_cache_days < 2 or observation_cache_days < 1:
+            raise ValueError("streaming cache windows are too small for engine lookback")
+        self.dataset_id = dataset_id
+        self.calendar = tuple(calendar)
+        self.evaluation_start = evaluation_start
+        self.evaluation_end = evaluation_end
+        self.warmup_start = warmup_start
+        self.out_of_sample_start = out_of_sample_start
+        self.input_hash = manifest["input_manifest_hash"]
+        self.benchmark_code = manifest["benchmark_code"]
+        self.require_explicit_rules = True
+        self._repository = repository
+        self._context = context
+        self._page_size = page_size
+        self._bar_cache_limit = bar_cache_days
+        self._observation_cache_limit = observation_cache_days
+        self._bar_cache = OrderedDict()
+        self._observation_cache = OrderedDict()
+        self._closed = False
+        self._observation_columns = _selected_observation_columns(observation_columns)
+        self._next_by_date = {
+            day: self.calendar[index + 1] if index + 1 < len(self.calendar) else None
+            for index, day in enumerate(self.calendar)
+        }
+        self._dividends = {}
+        for row in repository.load_dividends(dataset_id, context):
+            event = _dividend_event_from_materialized_row(row)
+            self._dividends.setdefault(event.ex_date, []).append(event)
+        self._dividends = {
+            day: tuple(events) for day, events in self._dividends.items()
+        }
+        self._rules = _rules_for_calendar(
+            self.calendar, repository.load_rules(dataset_id, context)
+        )
+        self.member_roles, self.snapshot_ids = repository.member_roles_and_snapshots(
+            dataset_id, context
+        )
+        self.benchmark_closes = repository.load_benchmark_closes(
+            dataset_id, self.benchmark_code, context
+        )
+        self._delist_dates = {}
+
+    @property
+    def evaluation_dates(self) -> tuple[date, ...]:
+        return tuple(
+            day for day in self.calendar
+            if self.evaluation_start <= day <= self.evaluation_end
+        )
+
+    def _ensure_open(self):
+        if self._closed:
+            raise RuntimeError("streaming Frozen Dataset has already been closed")
+
+    @staticmethod
+    def _cache_put(cache, key, value, limit: int):
+        cache.pop(key, None)
+        cache[key] = value
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+    def _load_bars(self, day: date) -> dict[str, MarketBar]:
+        self._ensure_open()
+        cached = self._bar_cache.get(day)
+        if cached is not None:
+            self._bar_cache.move_to_end(day)
+            return cached
+        result: dict[str, MarketBar] = {}
+        last_key = None
+        while True:
+            page = self._repository.bar_page(
+                self.dataset_id, self._context, last_key, self._page_size,
+                date_from=day, date_to=day,
+            )
+            if not page:
+                break
+            page_key = (page[-1]["trade_date"], page[-1]["ts_code"])
+            if last_key is not None and page_key <= last_key:
+                raise RuntimeError(f"execution page did not advance for {day}")
+            for row in page:
+                bar = _market_bar_from_row(row)
+                if bar.ts_code in result:
+                    raise RuntimeError(f"duplicate execution bar in Dataset: {day}/{bar.ts_code}")
+                result[bar.ts_code] = bar
+            if len(page) < self._page_size:
+                break
+            last_key = page_key
+        self._cache_put(self._bar_cache, day, result, self._bar_cache_limit)
+        return result
+
+    def _load_observations(self, day: date) -> tuple[Observation, ...]:
+        self._ensure_open()
+        cached = self._observation_cache.get(day)
+        if cached is not None:
+            self._observation_cache.move_to_end(day)
+            return cached
+        result: list[Observation] = []
+        seen_codes: set[str] = set()
+        last_key = None
+        while True:
+            page = self._repository.observation_page(
+                self.dataset_id, self._observation_columns, self._context,
+                last_key, self._page_size, date_from=day, date_to=day,
+            )
+            if not page:
+                break
+            page_key = (page[-1]["research_date"], page[-1]["ts_code"])
+            if last_key is not None and page_key <= last_key:
+                raise RuntimeError(f"observation page did not advance for {day}")
+            for row in page:
+                values = {column: row[column] for column in self._observation_columns}
+                row_day, code = values.pop("research_date"), values.pop("ts_code")
+                if row_day != day:
+                    raise RuntimeError(
+                        f"observation page escaped requested date: {row_day} != {day}"
+                    )
+                if code in seen_codes:
+                    raise RuntimeError(f"duplicate observation in Dataset: {day}/{code}")
+                seen_codes.add(code)
+                delist = values.get("delist_date")
+                if delist is not None:
+                    existing = self._delist_dates.get(code)
+                    if existing is not None and existing != delist:
+                        raise RuntimeError(f"inconsistent delist_date in Dataset: {code}")
+                    self._delist_dates[code] = delist
+                else:
+                    self._delist_dates.setdefault(code, None)
+                result.append(Observation(day, code, values))
+            if len(page) < self._page_size:
+                break
+            last_key = page_key
+        value = tuple(result)
+        self._cache_put(self._observation_cache, day, value, self._observation_cache_limit)
+        return value
+
+    def next_trade_date(self, day: date) -> date | None:
+        self._ensure_open()
+        return self._next_by_date.get(day)
+
+    def bar(self, day: date, ts_code: str) -> MarketBar | None:
+        return self._load_bars(day).get(ts_code)
+
+    def observations_for(self, day: date) -> tuple[Observation, ...]:
+        return self._load_observations(day)
+
+    def dividend_events_for(self, day: date) -> tuple[DividendEvent, ...]:
+        self._ensure_open()
+        return self._dividends.get(day, ())
+
+    def delist_date_for(self, ts_code: str) -> date | None:
+        self._ensure_open()
+        return self._delist_dates.get(ts_code)
+
+    def rules_for(self, day: date, market: str | None = None):
+        self._ensure_open()
+        return self._rules.get((day, market)) or self._rules.get((day, None))
+
+    def close(self):
+        if not self._closed:
+            self._bar_cache.clear()
+            self._observation_cache.clear()
+            self._closed = True
+            self._repository.kernel.close()
+
+    def __enter__(self):
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+def open_streaming_frozen_dataset(
+    dataset_id: str,
+    observation_columns: Sequence[str] | None = None,
+    *,
+    evaluation_config=None,
+    page_size: int = 10_000,
+    bar_cache_days: int = 3,
+    observation_cache_days: int = 2,
+) -> StreamingFrozenDataset:
+    """Open a bounded reader; the caller owns and must close it."""
+    kernel, repository, context = _read_service("stream")
+    try:
+        (
+            manifest, calendar, warmup_start, evaluation_start,
+            evaluation_end, out_of_sample_start,
+        ) = _resolve_frozen_window(repository, dataset_id, context, evaluation_config)
+        return StreamingFrozenDataset(
+            dataset_id=dataset_id, repository=repository, context=context,
+            manifest=manifest, calendar=calendar,
+            evaluation_start=evaluation_start, evaluation_end=evaluation_end,
+            warmup_start=warmup_start, out_of_sample_start=out_of_sample_start,
+            observation_columns=observation_columns, page_size=page_size,
+            bar_cache_days=bar_cache_days,
+            observation_cache_days=observation_cache_days,
+        )
+    except Exception:
+        kernel.close()
+        raise
+
+
 def load_frozen_dataset(
     dataset_id: str,
     observation_columns: Sequence[str] | None = None,
@@ -798,39 +1134,10 @@ def load_frozen_dataset(
 ) -> BacktestDataset:
     kernel, repository, context = _read_service("load")
     try:
-        manifest = repository.manifest(dataset_id, context)
-        if manifest["status"] != "FROZEN":
-            raise RuntimeError(f"只有 FROZEN Dataset 可以用于正式回测: {manifest['status']}")
-        effective_warmup_start = manifest["warmup_start"]
-        effective_evaluation_start = manifest["evaluation_start"]
-        effective_evaluation_end = manifest["evaluation_end"]
-        if evaluation_config is not None:
-            effective_warmup_start = evaluation_config.warmup_start
-            effective_evaluation_start = evaluation_config.evaluation_start
-            effective_evaluation_end = evaluation_config.evaluation_end
-            if not (
-                manifest["warmup_start"] <= effective_warmup_start
-                <= effective_evaluation_start <= effective_evaluation_end
-                <= manifest["evaluation_end"]
-            ):
-                raise RuntimeError(
-                    "Evaluation 评价区间必须完全位于 FROZEN Dataset 的冻结范围内"
-                )
-        source_calendar = repository.open_calendar(dataset_id, context)
-        required_boundaries = {
-            effective_warmup_start,
-            effective_evaluation_start,
-            effective_evaluation_end,
-        }
-        missing_boundaries = sorted(required_boundaries - set(source_calendar))
-        if missing_boundaries:
-            raise RuntimeError(
-                f"Evaluation 边界必须是 FROZEN Dataset 开市日: {missing_boundaries}"
-            )
-        calendar = tuple(
-            day for day in source_calendar
-            if effective_warmup_start <= day <= effective_evaluation_end
-        )
+        (
+            manifest, calendar, effective_warmup_start, effective_evaluation_start,
+            effective_evaluation_end, effective_oos_start,
+        ) = _resolve_frozen_window(repository, dataset_id, context, evaluation_config)
         bars: dict[date, dict[str, MarketBar]] = {}
         last_key = None
         while True:
@@ -842,15 +1149,10 @@ def load_frozen_dataset(
             if not page:
                 break
             for row in page:
-                values = {key: row[key] for key in ("trade_date", "ts_code", "raw_open", "raw_high", "raw_low", "raw_close", "volume", "amount", "up_limit", "down_limit", "is_suspended", "can_buy", "can_sell", "limit_status", "market")}
-                bar = MarketBar(**values)
+                bar = _market_bar_from_row(row)
                 bars.setdefault(bar.trade_date, {})[bar.ts_code] = bar
             last_key = (page[-1]["trade_date"], page[-1]["ts_code"])
-        all_columns = tuple(SELECTED_COLUMNS["research"])
-        selected = list(observation_columns or all_columns[2:])
-        if set(selected) - set(all_columns[2:]):
-            raise ValueError(f"unknown frozen observation columns: {sorted(set(selected) - set(all_columns[2:]))}")
-        selected_columns = ["research_date", "ts_code", *selected]
+        selected_columns = _selected_observation_columns(observation_columns)
         observations: dict[date, list[Observation]] = {}
         delist_dates: dict[str, date | None] = {}
         last_key = None
@@ -872,21 +1174,8 @@ def load_frozen_dataset(
         for row in repository.load_dividends(dataset_id, context):
             event = _dividend_event_from_materialized_row(row)
             dividends.setdefault(event.ex_date, []).append(event)
-        rules = {}
-        for row in repository.load_rules(dataset_id, context):
-            (*_, parameters, _rule_hash) = row
-            effective_from, effective_to, market = row[3], row[4], row[5]
-            market_rule = MarketRule(market=market, min_buy_lot=row[6], allow_sell_odd_lot=row[7], t_plus_one=row[8], price_tick=row[9], cash_settlement_days=row[10], max_volume_participation_pct=float((parameters or {}).get("max_volume_participation_pct", 1.0)), liquidity_policy=str((parameters or {}).get("liquidity_policy", "reject_full_order")))
-            fee_rule = FeeRule(commission_rate=row[12], min_commission=row[13], stamp_duty_sell_rate=row[14], transfer_fee_rate=row[15], slippage_bps=row[16])
-            for day in calendar:
-                if effective_from <= day and (effective_to is None or day <= effective_to):
-                    rules[(day, None if market in {"ALL", "*"} else market)] = (market_rule, fee_rule)
+        rules = _rules_for_calendar(calendar, repository.load_rules(dataset_id, context))
         member_roles, snapshot_ids = repository.member_roles_and_snapshots(dataset_id, context)
-        source_oos_start = manifest["out_of_sample_start"] or effective_evaluation_start
-        effective_oos_start = min(
-            max(source_oos_start, effective_evaluation_start),
-            effective_evaluation_end,
-        )
         return BacktestDataset(dataset_id=dataset_id, calendar=calendar, evaluation_start=effective_evaluation_start, evaluation_end=effective_evaluation_end, warmup_start=effective_warmup_start, observations={day: tuple(rows) for day, rows in observations.items()}, bars=bars, dividends={day: tuple(rows) for day, rows in dividends.items()}, member_roles=member_roles, snapshot_ids=snapshot_ids, rules=rules, delist_dates=delist_dates, benchmark_code=manifest["benchmark_code"], benchmark_closes=repository.load_benchmark_closes(dataset_id, manifest["benchmark_code"], context), out_of_sample_start=effective_oos_start, input_hash=manifest["input_manifest_hash"], require_explicit_rules=True)
     finally:
         kernel.close()
