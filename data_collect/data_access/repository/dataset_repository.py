@@ -879,11 +879,11 @@ class DatasetRepository(BaseRepository):
         return self.kernel.read._repository_query(
             context, "backtest.dataset_member",
             f"""SELECT {selected}
-                       FROM research.stock_snapshot_daily s
-                      WHERE s.snapshot_id IN (
-                            SELECT research_snapshot_id FROM backtest.dataset_member
-                             WHERE dataset_id=%s
-                      ){bounds}{keyset}
+                       FROM backtest.dataset_member m
+                       JOIN research.stock_snapshot_daily s
+                         ON s.snapshot_id=m.research_snapshot_id
+                        AND s.research_date=m.research_date
+                      WHERE m.dataset_id=%s{bounds}{keyset}
                       ORDER BY s.research_date, s.ts_code LIMIT {int(limit)}""",
             params, WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to), limit,
         )

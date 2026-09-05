@@ -172,6 +172,8 @@ def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
     )
     assert "s.research_date >= %s" in observation_query["sql"]
     assert "s.research_date <= %s" in observation_query["sql"]
+    assert "s.research_date=m.research_date" in observation_query["sql"]
+    assert "snapshot_id IN" not in observation_query["sql"]
     assert observation_query["params"] == (
         "dataset-1", start, end, date(2025, 1, 31), "000001.SZ",
     )

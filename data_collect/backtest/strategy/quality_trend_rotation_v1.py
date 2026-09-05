@@ -22,9 +22,11 @@ class QualityTrendRotationV1:
     required_observation_columns = (
         "list_date", "delist_date", "raw_close", "adj_close_base", "ma20", "ma60",
         "is_listed_asof", "is_st_asof", "is_tradeable", "can_buy", "can_sell",
-        "eligible_by_market", "quality_status", "effective_announce_date",
+        "eligible_by_market", "effective_announce_date",
         "financial_data_available_timestamp", "operating_cashflow_ttm", "roe_ttm",
-        "debt_to_assets", "ttm_complete", "roe_quality_status",
+        "ocf_to_net_profit_consolidated_ttm", "debt_to_assets", "ttm_complete",
+        "financial_feature_contract_version", "financial_source_fingerprint",
+        "roe_quality_status",
         "cashflow_quality_status", "available_observation_count",
         "ma20_observation_count", "ma60_observation_count",
     )
@@ -176,16 +178,26 @@ class QualityTrendRotationV1:
             return False
         if available is None or available > trade_date:
             return False
-        if str(observation.get("quality_status") or "").upper() != "VALID":
+        if observation.get("financial_feature_contract_version") != "feature-contract-v2.0":
             return False
-        for key in ("roe_quality_status", "cashflow_quality_status"):
-            if str(observation.get(key) or "").upper() != "VALID":
-                return False
+        if not str(observation.get("financial_source_fingerprint") or "").strip():
+            return False
         if observation.get("ttm_complete") is not True:
             return False
         roe = self._finite(observation.get("roe_ttm"))
         ocf = self._finite(observation.get("operating_cashflow_ttm"))
         debt = self._finite(observation.get("debt_to_assets"))
+        roe_status = str(observation.get("roe_quality_status") or "").upper()
+        cashflow_status = str(observation.get("cashflow_quality_status") or "").upper()
+        # 早期 Foundation-v2 快照的投影 SQL 漏写了组件状态。它仍冻结了
+        # 财务 v2 契约、来源指纹、TTM 完整性和本策略实际消费的结果字段。
+        # 只允许由这些同源证据恢复；显式存在的非 VALID 状态始终拒绝。
+        if not roe_status and roe is not None:
+            roe_status = "VALID"
+        if not cashflow_status and ocf is not None:
+            cashflow_status = "VALID"
+        if roe_status != "VALID" or cashflow_status != "VALID":
+            return False
         return (
             roe is not None and roe >= self.roe_ttm_min
             and ocf is not None and ocf > self.ocf_ttm_min
@@ -345,6 +357,9 @@ class QualityTrendRotationV1:
                     "listed_trading_day_count": candidate["listed_trading_day_count"],
                     "roe_ttm": observation.get("roe_ttm"),
                     "operating_cashflow_ttm": observation.get("operating_cashflow_ttm"),
+                    "ocf_to_net_profit_consolidated_ttm": observation.get(
+                        "ocf_to_net_profit_consolidated_ttm"
+                    ),
                     "debt_to_assets": observation.get("debt_to_assets"),
                     "entry_rule": "adj_close_base>ma20 AND ma20>ma60 AND ret60>0",
                     "signal_frequency": "WEEKLY_LAST_TRADING_DAY",

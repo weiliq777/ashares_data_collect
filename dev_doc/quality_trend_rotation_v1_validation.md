@@ -20,7 +20,7 @@ SHA-256 作为 `approval_evidence_hash` 写入不可变策略登记，不代表�
 
 ```text
 pytest -q
-1147 passed, 1 skipped, 8 deselected
+1149 passed, 1 skipped, 8 deselected
 
 python tools/check_data_access_contract.py
 scanned 209 files; violations: 0

@@ -33,8 +33,9 @@
 - `is_tradeable = TRUE` 且 `can_buy = TRUE`（观察日可交易且可买）；
 - `is_st_asof = FALSE`（非 ST/风险状态，V1 不允许 ST）；
 - `listed_trading_day_count(T) >= 250`（含上市首个有效交易日和信号日）；
-- `quality_status = VALID`、`roe_quality_status = VALID`、
-  `cashflow_quality_status = VALID` 且 `ttm_complete = TRUE`；
+- `financial_feature_contract_version = feature-contract-v2.0`、财务来源指纹非空且
+  `ttm_complete = TRUE`；
+- `roe_quality_status` 与 `cashflow_quality_status` 若已物化则必须为 `VALID`；
 - 财务记录的 `effective_announce_date`（有效公告日）和
   `financial_data_available_timestamp`（财务数据可用时间）均不晚于 `T`；
 - `roe_ttm >= 0.08`（TTM 净资产收益率不低于 8%，底层使用比例而不是百分数）；
@@ -46,6 +47,13 @@
 `listed_trading_day_count` 的实现必须读取冻结快照中的
 `available_observation_count`（证券自身累计有效价格观测数），不能从 Dataset 的
 `warmup_start` 重新从零累计，否则会把早已上市的证券错误地当成次新股。
+
+早期 `foundation-v2` 冻结快照的物化投影遗漏了财务组件质量状态列，但同时冻结了
+财务 v2 契约版本、来源指纹、TTM 完整性及本策略消费的结果字段。兼容读取只允许：
+非空 `roe_ttm` 恢复 ROE 可计算状态；`ttm_complete = TRUE` 且非空
+`operating_cashflow_ttm` 恢复经营现金流可计算状态。显式存在的非 `VALID` 状态仍然
+拒绝，其他 NULL 一律 fail-closed。快照聚合 `quality_status` 混合了估值等无关字段，
+不得冒充本策略的财务字段质量门禁。新快照必须直接物化组件状态和现金流比率。
 
 ## 4. 趋势、排序和持仓退出
 

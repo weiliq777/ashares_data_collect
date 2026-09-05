@@ -73,6 +73,7 @@ def test_backtest_dataset_job_rejects_non_frozen_snapshot_in_source():
     assert "assert_market_coverage_range_publishable" in source
     assert 'manifest["warmup_start"]' in source
     assert 'manifest["evaluation_end"]' in source
+    assert "Evaluation 边界必须是 FROZEN Dataset 开市日" in source
     assert "NULL source_record_version" in source
     assert "dataset_execution_bar" in source
     assert "mv.dataset='trade_cal'" in source

@@ -762,6 +762,34 @@ def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
         kernel.close()
 
 
+def _dividend_event_from_materialized_row(row: Sequence[Any]) -> DividendEvent:
+    """把冻结 Dataset 的持久化列显式映射到领域事件。
+
+    持久化记录包含用于审计的 ``report_date``，而撮合领域模型不消费该字段。
+    禁止使用位置展开，避免数据库列新增或排序差异静默错配金额和日期。
+    """
+    if len(row) != 17:
+        raise RuntimeError(f"冻结分红事件字段数异常: expected=17, actual={len(row)}")
+    return DividendEvent(
+        ts_code=row[0],
+        ex_date=row[10],
+        cash_div=row[7],
+        stock_div=row[4],
+        stock_bonus_rate=row[5],
+        stock_conversion_rate=row[6],
+        pay_date=row[11],
+        record_date=row[9],
+        implementation_status=row[3],
+        source_record_key=row[14],
+        source_record_version=row[15],
+        source_payload_hash=row[16],
+        announce_date=row[2],
+        implementation_announce_date=row[13],
+        div_list_date=row[12],
+        cash_div_tax=row[8],
+    )
+
+
 def load_frozen_dataset(
     dataset_id: str,
     observation_columns: Sequence[str] | None = None,
@@ -788,8 +816,19 @@ def load_frozen_dataset(
                 raise RuntimeError(
                     "Evaluation 评价区间必须完全位于 FROZEN Dataset 的冻结范围内"
                 )
+        source_calendar = repository.open_calendar(dataset_id, context)
+        required_boundaries = {
+            effective_warmup_start,
+            effective_evaluation_start,
+            effective_evaluation_end,
+        }
+        missing_boundaries = sorted(required_boundaries - set(source_calendar))
+        if missing_boundaries:
+            raise RuntimeError(
+                f"Evaluation 边界必须是 FROZEN Dataset 开市日: {missing_boundaries}"
+            )
         calendar = tuple(
-            day for day in repository.open_calendar(dataset_id, context)
+            day for day in source_calendar
             if effective_warmup_start <= day <= effective_evaluation_end
         )
         bars: dict[date, dict[str, MarketBar]] = {}
@@ -831,7 +870,7 @@ def load_frozen_dataset(
             last_key = (page[-1]["research_date"], page[-1]["ts_code"])
         dividends: dict[date, list[DividendEvent]] = {}
         for row in repository.load_dividends(dataset_id, context):
-            event = DividendEvent(*row)
+            event = _dividend_event_from_materialized_row(row)
             dividends.setdefault(event.ex_date, []).append(event)
         rules = {}
         for row in repository.load_rules(dataset_id, context):
@@ -843,9 +882,10 @@ def load_frozen_dataset(
                 if effective_from <= day and (effective_to is None or day <= effective_to):
                     rules[(day, None if market in {"ALL", "*"} else market)] = (market_rule, fee_rule)
         member_roles, snapshot_ids = repository.member_roles_and_snapshots(dataset_id, context)
-        effective_oos_start = max(
-            manifest["out_of_sample_start"] or effective_evaluation_start,
-            effective_evaluation_start,
+        source_oos_start = manifest["out_of_sample_start"] or effective_evaluation_start
+        effective_oos_start = min(
+            max(source_oos_start, effective_evaluation_start),
+            effective_evaluation_end,
         )
         return BacktestDataset(dataset_id=dataset_id, calendar=calendar, evaluation_start=effective_evaluation_start, evaluation_end=effective_evaluation_end, warmup_start=effective_warmup_start, observations={day: tuple(rows) for day, rows in observations.items()}, bars=bars, dividends={day: tuple(rows) for day, rows in dividends.items()}, member_roles=member_roles, snapshot_ids=snapshot_ids, rules=rules, delist_dates=delist_dates, benchmark_code=manifest["benchmark_code"], benchmark_closes=repository.load_benchmark_closes(dataset_id, manifest["benchmark_code"], context), out_of_sample_start=effective_oos_start, input_hash=manifest["input_manifest_hash"], require_explicit_rules=True)
     finally:

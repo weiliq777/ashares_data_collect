@@ -17,6 +17,7 @@ from data_collect.backtest import (
     backtest_fingerprint,
     size_target_position,
 )
+from data_collect.jobs.backtest_dataset import _dividend_event_from_materialized_row
 
 
 def _values(day, *, close=12.0, ma20=11.0, ma60=10.0, amount_ok=True, **overrides):
@@ -35,11 +36,14 @@ def _values(day, *, close=12.0, ma20=11.0, ma60=10.0, amount_ok=True, **override
         "effective_announce_date": day,
         "financial_data_available_timestamp": day,
         "operating_cashflow_ttm": 100.0,
+        "ocf_to_net_profit_consolidated_ttm": 1.2,
         "roe_ttm": 0.10,
         "debt_to_assets": 30.0,
         "ttm_complete": True,
         "roe_quality_status": "VALID",
         "cashflow_quality_status": "VALID",
+        "financial_feature_contract_version": "feature-contract-v2.0",
+        "financial_source_fingerprint": "f" * 64,
         "ma20_observation_count": 20,
         "ma60_observation_count": 60,
         "available_observation_count": 300,
@@ -156,6 +160,24 @@ def test_missing_st_status_is_fail_closed_for_entry_and_existing_holding():
         day, (observation,), {"000001.SZ": {"hold_shares": 100}}
     )
     assert signals[0].reason["rule"] == "missing_st_status"
+
+
+def test_legacy_frozen_financial_statuses_use_only_provable_equivalent_fields():
+    day = date(2026, 8, 21)
+    strategy = QualityTrendRotationV1()
+    compatible = Observation(day, "000001.SZ", _values(
+        day, roe_quality_status=None, cashflow_quality_status=None,
+    ))
+    assert strategy._financial_quality_ok(compatible, day) is True
+    unprovable_cashflow = Observation(day, "000001.SZ", _values(
+        day, roe_quality_status=None, cashflow_quality_status=None,
+        operating_cashflow_ttm=None,
+    ))
+    assert strategy._financial_quality_ok(unprovable_cashflow, day) is False
+    explicit_invalid = Observation(day, "000001.SZ", _values(
+        day, roe_quality_status="NEGATIVE_OR_ZERO_EQUITY",
+    ))
+    assert strategy._financial_quality_ok(explicit_invalid, day) is False
 
 
 def test_listing_day_count_is_inclusive_at_exactly_250_days():
@@ -297,3 +319,18 @@ def test_strategy_scenario_evaluation_and_backtest_hashes_are_separate_and_stabl
     ) == backtest_fingerprint(
         spec.strategy_hash, scenario.scenario_hash, "dataset-hash", "engine-v1"
     )
+
+
+def test_materialized_dividend_row_is_explicitly_mapped_not_positionally_unpacked():
+    event = _dividend_event_from_materialized_row((
+        "000001.SZ", date(2025, 12, 31), date(2026, 4, 1), "实施",
+        0.3, 0.1, 0.2, 0.5, 0.4, date(2026, 5, 1),
+        date(2026, 5, 2), date(2026, 5, 8), date(2026, 5, 9),
+        date(2026, 4, 20), "event-key", 7, "payload-hash",
+    ))
+    assert event.ts_code == "000001.SZ"
+    assert event.ex_date == date(2026, 5, 2)
+    assert event.cash_div == 0.5
+    assert event.cash_div_tax == 0.4
+    assert event.stock_rate == pytest.approx(0.3)
+    assert event.source_record_version == 7

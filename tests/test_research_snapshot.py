@@ -413,6 +413,10 @@ def test_foundation_lineage_points_financial_group_to_selected_v2_record():
         "financial_payload_hash", "financial_source_fingerprint",
         "financial_vintage_quality",
         "financial_source_observed_at",
+        "cashflow_quality_status",
+        "roe_quality_status",
+        "growth_quality_status",
+        "ocf_to_net_profit_consolidated_ttm",
     ):
         assert column in enrichment
 
