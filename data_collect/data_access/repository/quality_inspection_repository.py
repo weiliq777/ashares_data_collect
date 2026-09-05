@@ -13,6 +13,16 @@ from data_collect.data_access.repository.base import BaseRepository
 
 
 class QualityInspectionRepository(BaseRepository):
+    # These are historical logical labels kept for callers of the legacy
+    # quality CLI.  They must resolve to the canonical Standard relations
+    # after the physical cutover; otherwise a quality run can accidentally
+    # probe a removed public.* table (or fail before reaching PostgreSQL).
+    CANONICAL_TABLES = {
+        "daily_kline": "std.daily_kline",
+        "valuation_daily": "std.valuation_daily",
+        "adj_factor_daily": "std.adj_factor_daily",
+    }
+
     DATE_COLUMNS = {
         "std.stock_basic_info": "list_date",
         "tushare_stock_basic_raw": None,
@@ -177,10 +187,7 @@ class QualityInspectionRepository(BaseRepository):
     def inspect_table(self, table: str, keys: tuple[str, ...], context: RunContext) -> dict[str, Any]:
         if not keys or any(not key.replace("_", "").isalnum() for key in keys):
             raise ValueError("invalid quality key columns")
-        canonical_table = {
-            "adj_factor_daily": "std.adj_factor_daily",
-            "valuation_daily": "std.valuation_daily",
-        }.get(table, table)
+        canonical_table = self.CANONICAL_TABLES.get(table, table)
         qualified = self._qualified_table(canonical_table)
         date_column = self.DATE_COLUMNS.get(canonical_table, self.DATE_COLUMNS.get(table, "trade_date"))
         scope = WorkScope(partition=f"quality:{table}")

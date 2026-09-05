@@ -1,5 +1,15 @@
 # 当前金融数据模型与来源说明
 
+## 2026-09-05 当前生效状态
+
+以下状态覆盖本文后续保留的早期开发记录；早期章节只用于历史审计，不代表当前生产状态：
+
+- `foundation_v2_20260821`（数据基线）已通过质量门禁；`research-v2.0` 已形成 1226 个 `FROZEN`（冻结）研究快照，覆盖 2021-08-02 至 2026-08-21。
+- 当前 Research Snapshot（研究快照）使用 `research.snapshot_lineage_bundle`（紧凑血缘包）和 `research.lineage_source_record`（来源记录字典）；`research.snapshot_lineage` 是 v1 只读兼容存储。
+- 当前 Standard（标准层）行情正式表为 `std.daily_kline`、`std.valuation_daily` 和 `std.adj_factor_daily`；`public._legacy_*` 仅为回滚备份。
+- `feature.price_daily_v1` 仅作只读兼容；`feature.company_financial_v1`、`feature.valuation_daily_v1` 和 `feature.technical_daily_v1` 仍是当前链路中的有效输入/特征，不能仅按 `v1` 后缀清理。
+- `foundation_v2_20260821` 对应的正式 Backtest Dataset（回测数据集）尚未创建；策略版本仍需满足 `APPROVED`（批准）门禁。
+
 ## 2026-08-07 手动每日决策层
 
 新增 `research.candidate_run`、`research.candidate`、`research.ai_audit`、

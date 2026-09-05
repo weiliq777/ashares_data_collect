@@ -412,6 +412,10 @@ def create_dataset(
     """创建 Dataset；校验在 Repository 读边界内完成，写入走 typed gateway。"""
     if not snapshot_ids:
         raise ValueError("至少需要一个 FROZEN Research Snapshot")
+    if not dataset_name or len(dataset_name) > 160:
+        raise ValueError("dataset_name must be between 1 and 160 characters")
+    if not dataset_version or len(dataset_version) > 40:
+        raise ValueError("dataset_version must be between 1 and 40 characters")
     if not benchmark_code or "." not in benchmark_code:
         raise ValueError("benchmark_code 必须是 Tushare 指数代码")
     if not warmup_start <= evaluation_start <= evaluation_end:
@@ -582,10 +586,17 @@ def _materialized_hashes(dataset_id: str) -> dict[str, Any]:
             for row in rows:
                 execution_hasher.update(row)
                 stats = execution_by_day.setdefault(
-                    row[0], {"hasher": _IncrementalRowHasher(), "count": 0}
+                    row[0], {
+                        "hasher": _IncrementalRowHasher(),
+                        "count": 0,
+                        "quality_counts": {},
+                    }
                 )
                 stats["hasher"].update(row)
                 stats["count"] += 1
+                quality = row[-1]
+                quality_counts = stats["quality_counts"]
+                quality_counts[quality] = quality_counts.get(quality, 0) + 1
             last_key = tuple(rows[-1][:2])
         calendar_rows = repository.materialized_calendar_rows(dataset_id, context)
         dividend_rows = repository.materialized_dividend_rows(dataset_id, context)
@@ -638,6 +649,21 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
         if not members:
             issues.append("dataset_member 为空")
         materialized = _materialized_hashes(dataset_id)
+        benchmark_repair = manifest.get("benchmark_source_manifest")
+        benchmark_repair_hash = manifest.get("benchmark_source_manifest_hash")
+        if benchmark_repair or benchmark_repair_hash:
+            if not benchmark_repair or not benchmark_repair_hash:
+                issues.append("Dataset 基准修复来源清单不完整")
+            else:
+                encoded_repair = json.dumps(
+                    _canonical(benchmark_repair), ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":"), allow_nan=False,
+                )
+                actual_repair_hash = hashlib.sha256(
+                    encoded_repair.encode("utf-8")
+                ).hexdigest()
+                if actual_repair_hash != str(benchmark_repair_hash).strip():
+                    issues.append("Dataset 基准修复来源清单哈希不一致")
         for field, label in (
             ("calendar_hash", "calendar"), ("rules_hash", "rules"),
             ("execution_hash", "execution"), ("corporate_action_hash", "corporate_action"),

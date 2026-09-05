@@ -2,6 +2,16 @@
 
 更新时间：2026-08-08
 
+## 2026-09-05 当前生效状态
+
+本节覆盖下方早期阶段记录中的“当前状态”描述；早期章节保留为历史审计记录，不得作为现状判断依据。
+
+- 当前正式数据基线为 `foundation_v2_20260821`（状态 `validated`），截止日为 2026-08-21。
+- 当前正式 Research Snapshot（研究快照）为 `research-v2.0`、`lineage_storage_version=v2`，共 1226 个 `FROZEN`（冻结）交易日快照，覆盖 2021-08-02 至 2026-08-21。
+- 当前快照默认使用 `research.snapshot_lineage_bundle`（紧凑血缘包）和 `research.lineage_source_record`（来源记录字典）；`research.snapshot_lineage` 仅作 v1 只读兼容存储。
+- Standard（标准层）日线正式来源是 `std.daily_kline`；迁移前的 `public.daily_kline` 只允许作为已命名的历史迁移来源/备份出现。
+- 截至本更新日，`foundation_v2_20260821` 尚未创建正式 Backtest Dataset（回测数据集）；策略版本也仍需通过 `APPROVED`（批准）门禁后才能正式回测。
+
 当前运行基线：`baseline_20260806` 已通过质量门禁并保存完整 `source_manifest_hash`，状态为 `validated`；旧 `baseline_20260803` 仅保留为 `superseded` 审计记录。正式 `research-v1.3` 快照仍需基于该基线重新生成并完成 `build → validate → freeze`，不得复用旧版快照系列。
 
 多日期生成使用 `data_collect.jobs.research_snapshot_series`：Manifest 采用批量 `execute_values`，股票快照、血缘和输入统计按每批 10 个截止日集合写入；每个 `snapshot_id` 仍保持单日粒度，`validate` 保留逐日审计语义。默认只完成 `build → validate`，正式 `freeze` 仍要求干净 Git 或显式代码归档。
@@ -64,7 +74,7 @@ pit.security_tradeability_daily
 feature.price_daily_v2
 feature.valuation_daily_v1
 pit.financial_asof
-public.daily_kline
+std.daily_kline
 std.security_status_daily
 feature.shareholder_return_v1
 public.tushare_stock_basic_raw_version（受 validated baseline record_id 上限约束）

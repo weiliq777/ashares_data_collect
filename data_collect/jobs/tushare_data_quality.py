@@ -24,9 +24,13 @@ CHECKS = {
     "tushare_adj_factor_raw": ("ts_code", "trade_date"),
     "tushare_trade_cal_raw": ("exchange", "cal_date"),
     "tushare_market_raw_version": ("dataset", "business_key", "payload_hash"),
-    "daily_kline": ("stock_code", "trade_date"),
-    "valuation_daily": ("stock_code", "trade_date", "source"),
-    "adj_factor_daily": ("stock_code", "trade_date", "source"),
+    # Canonical Standard relations after the physical cutover.  The
+    # repository still accepts the old logical aliases for explicitly
+    # requested compatibility checks, but the scheduled quality inventory
+    # must never target removed public.* relations.
+    "std.daily_kline": ("stock_code", "trade_date"),
+    "std.valuation_daily": ("stock_code", "trade_date", "source"),
+    "std.adj_factor_daily": ("stock_code", "trade_date", "source"),
     "std.stock_financial_indicator": ("stock_code", "report_date", "announce_date", "source"),
     "tushare_fina_indicator_raw": ("ts_code", "ann_date", "end_date"),
     "tushare_income_raw": ("ts_code", "ann_date", "end_date"),

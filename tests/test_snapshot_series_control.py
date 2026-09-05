@@ -356,6 +356,35 @@ def test_finalize_skips_completed_preflight_after_restart():
     assert report.status_counts == {"FROZEN": 4}
 
 
+def test_finalize_restarts_incomplete_preflight_from_zero():
+    repository = FakeRepository([_row(index, "VALIDATED") for index in range(1, 5)])
+    calls = []
+    checkpoint = Checkpoint(InMemoryCheckpointStore())
+    run_id = f"snapshot-series-finalize-{_selector().digest}"
+    checkpoint.mark_progress(
+        run_id, "snapshot_series_finalize", f"{_selector().digest}:preflight", 2,
+    )
+
+    def inspect(ids):
+        calls.append(("inspect", tuple(ids)))
+        return {}
+
+    def freeze(ids):
+        calls.append(("freeze", tuple(ids)))
+        repository.set_statuses(ids, "FROZEN")
+
+    runner = SnapshotSeriesFinalize(
+        SnapshotSeriesMonitor(repository, object()), checkpoint, inspect, freeze,
+    )
+    report = runner.run(_selector(), batch_size=2, run_id=run_id)
+
+    assert [entry for kind, entry in calls if kind == "inspect"][:2] == [
+        tuple(row["snapshot_id"] for row in repository.rows[:2]),
+        tuple(row["snapshot_id"] for row in repository.rows[2:]),
+    ]
+    assert report.status_counts == {"FROZEN": 4}
+
+
 def test_finalize_does_not_freeze_when_any_deep_batch_fails():
     repository = FakeRepository([_row(index, "VALIDATED") for index in range(1, 5)])
     frozen = []

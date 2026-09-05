@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
 from data_collect.data_access.context import RunContext, WorkScope
@@ -59,6 +60,10 @@ class DatasetRepository(BaseRepository):
 
     def set_batch_checkpoint(self, dataset_id: str, batch_start, batch_end, status: str, context: RunContext, **fields) -> int:
         row = {"dataset_id": dataset_id, "stage": "BUILD", "batch_start": batch_start, "batch_end": batch_end, "status": status, **fields}
+        if status == "COMPLETED":
+            row["completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
+        elif status in {"RUNNING", "FAILED"}:
+            row["completed_at"] = None
         if "details" in row:
             row["details"] = json.dumps(row["details"] or {}, ensure_ascii=False, default=str)
         return self.kernel.write.upsert(
@@ -77,7 +82,13 @@ class DatasetRepository(BaseRepository):
         return self.kernel.rebuild.run_scoped_merge(sql, self._set_based_plan("backtest.dataset_execution_bar", scope, allow_delete=True), context, (dataset_id, start, end))
 
     def write_execution_rows(self, rows: Sequence[dict[str, Any]], context: RunContext, dataset_id: str) -> int:
-        return self.kernel.write.bulk_insert(context, WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}), "backtest.dataset_execution_bar", list(rows))
+        return self.kernel.write.bulk_insert(
+            context,
+            WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}),
+            "backtest.dataset_execution_bar",
+            list(rows),
+            restart_checkpoint=True,
+        )
 
     def batch_member_inputs(self, dataset_id: str, day, context: RunContext) -> dict[str, Any] | None:
         rows = self.kernel.read._repository_query(
@@ -92,11 +103,16 @@ class DatasetRepository(BaseRepository):
         return rows[0] if rows else None
 
     def update_batch_member(self, dataset_id: str, day, fields: dict[str, Any], context: RunContext) -> int:
-        return self.kernel.write.upsert(
-            context, WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}), "backtest.dataset_member",
-            [{"dataset_id": dataset_id, "research_date": day, **fields}], key=("dataset_id", "research_date"),
-            update_columns=tuple(fields), skip_noop=True,
+        changed = self.kernel.write.update_dataset_member_stats(
+            context,
+            WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}),
+            dataset_id,
+            day,
+            fields,
         )
+        if changed != 1:
+            raise RuntimeError(f"Dataset 成员不存在或已冻结，拒绝更新统计: {dataset_id}/{day}")
+        return changed
 
     def clear_auxiliary(self, dataset_id: str, context: RunContext) -> None:
         scope = WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id})
@@ -128,6 +144,7 @@ class DatasetRepository(BaseRepository):
         self.kernel.write.bulk_insert(
             context, scope, "backtest.dataset_calendar",
             [{"dataset_id": dataset_id, "trade_date": row["trade_date"], "exchange": row["exchange"], "is_open": row["is_open"], "pretrade_date": row["pretrade_date"], "source_record_key": f"{row['exchange']}:{row['trade_date']}", "source_record_version": row["record_id"], "source_payload_hash": row["source_payload_hash"]} for row in calendar_rows],
+            restart_checkpoint=True,
         )
         dividend_rows = self.kernel.read._repository_query(
             context, "tushare_dividend_raw",
@@ -139,6 +156,7 @@ class DatasetRepository(BaseRepository):
         self.kernel.write.bulk_insert(
             context, scope, "backtest.dataset_dividend_event",
             [{"dataset_id": dataset_id, **dict(zip(("ts_code","report_date","announce_date","implementation_status","stock_div","stock_bonus_rate","stock_conversion_rate","cash_div","cash_div_tax","record_date","ex_date","pay_date","div_list_date","implementation_announce_date","source_record_key","source_record_version","source_payload_hash"), (row[key] for key in ("ts_code","report_date","announce_date","implementation_status","stock_div","stock_bonus_rate","stock_conversion_rate","cash_div","cash_div_tax","record_date","ex_date","pay_date","div_list_date","implementation_announce_date","event_key","record_id","payload_hash"))))} for row in dividend_rows],
+            restart_checkpoint=True,
         )
         source_rules = self.kernel.read._repository_query(
             context, "foundation.market_rule_effective",
@@ -171,19 +189,256 @@ class DatasetRepository(BaseRepository):
         self.kernel.write.bulk_insert(
             context, scope, "backtest.dataset_rule_snapshot",
             [{"dataset_id": dataset_id, **{key: row[key] for key in ("rule_version","market_rule_version","fee_rule_version","effective_from","effective_to","market","min_buy_lot","allow_sell_odd_lot","t_plus_one","price_tick","cash_settlement_days","limit_pct","commission_rate","min_commission","stamp_duty_sell_rate","transfer_fee_rate","slippage_bps","approval_status","approved_by","approved_at","approval_hash")}, "parameters": json.dumps(row["parameters"] or {}, ensure_ascii=False, default=str), "rule_hash": hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()} for row in source_rules],
+            restart_checkpoint=True,
         )
         benchmark_rows = self.kernel.read._repository_query(
             context, "tushare_index_daily_raw",
             """WITH chosen AS (SELECT DISTINCT ON (r.trade_date) r.trade_date,r.ts_code,NULLIF(r.payload->>'close','')::double precision AS close,r.record_id,r.payload_hash FROM tushare_index_daily_raw r JOIN backtest.dataset_member m ON m.dataset_id=%s AND m.research_date=r.trade_date WHERE r.ts_code=%s AND r.record_id <= %s ORDER BY r.trade_date,r.fetched_at DESC,r.record_id DESC) SELECT trade_date,ts_code,close,record_id,payload_hash FROM chosen ORDER BY trade_date""",
             (dataset_id, manifest["benchmark_code"], boundaries["index"]), scope, 100_000,
         )
+        repair_rows = self.benchmark_source_repair_rows(manifest, context)
+        if repair_rows:
+            baseline_by_date = {row["trade_date"]: row for row in benchmark_rows}
+            overlap = baseline_by_date.keys() & {row["trade_date"] for row in repair_rows}
+            if overlap:
+                raise RuntimeError(
+                    "benchmark repair is only allowed for dates absent at baseline: "
+                    f"{sorted(overlap)[:5]}"
+                )
+            benchmark_rows = sorted(
+                [*benchmark_rows, *repair_rows],
+                key=lambda row: row["trade_date"],
+            )
         member_dates = self.member_dates(dataset_id, context)
         if len(benchmark_rows) != len(member_dates) or any(row["close"] is None or float(row["close"]) <= 0 for row in benchmark_rows):
             raise RuntimeError("基准指数没有覆盖全部 Dataset 日期或存在非法收盘价")
         self.kernel.write.bulk_insert(
             context, scope, "backtest.dataset_benchmark_bar",
             [{"dataset_id": dataset_id, "trade_date": row["trade_date"], "ts_code": row["ts_code"], "close": row["close"], "source_record_key": f"{row['ts_code']}:{row['trade_date']}", "source_record_version": row["record_id"], "source_payload_hash": row["payload_hash"]} for row in benchmark_rows],
+            restart_checkpoint=True,
         )
+
+    @staticmethod
+    def _canonical_json(value: Any) -> str:
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str,
+        )
+
+    @classmethod
+    def _manifest_hash(cls, value: Any) -> str:
+        return hashlib.sha256(cls._canonical_json(value).encode("utf-8")).hexdigest()
+
+    def bind_benchmark_source_repair(
+        self,
+        dataset_id: str,
+        context: RunContext,
+    ) -> dict[str, Any] | None:
+        """Bind only late-arriving benchmark rows absent at the baseline.
+
+        A validated data baseline is immutable.  If an auxiliary benchmark
+        row was missing when that baseline was published, the Dataset may
+        explicitly bind a tiny repair manifest after the source has been
+        collected.  Existing baseline-bound benchmark rows are never replaced
+        by newer versions, and the repair is persisted before materialization.
+        """
+        manifest = self.manifest(dataset_id, context)
+        if manifest["status"] not in {"BUILDING", "FAILED"}:
+            raise RuntimeError(
+                f"benchmark repair requires BUILDING/FAILED Dataset: {manifest['status']}"
+            )
+        existing = manifest.get("benchmark_source_manifest")
+        existing_hash = manifest.get("benchmark_source_manifest_hash")
+        if existing is not None or existing_hash:
+            if not existing or not existing_hash:
+                raise RuntimeError("Dataset benchmark repair manifest is only partially bound")
+            actual_hash = self._manifest_hash(existing)
+            if actual_hash != str(existing_hash).strip():
+                raise RuntimeError("Dataset benchmark repair manifest hash mismatch")
+            return existing
+
+        baseline = self.baseline(manifest["baseline"], context)
+        if not baseline or baseline["status"] != "validated":
+            raise RuntimeError("Dataset benchmark repair requires a validated baseline")
+        source = baseline.get("source_manifest") or {}
+        baseline_hash = str(baseline.get("source_manifest_hash") or "").strip()
+        boundary = (
+            source.get("append_only_sources", {})
+            .get("tushare_index_daily_raw", {})
+            .get("max_record_id")
+        )
+        if not baseline_hash or boundary is None:
+            raise RuntimeError("validated baseline has no index Raw boundary")
+
+        member_dates = self.member_dates(dataset_id, context)
+        if not member_dates:
+            raise RuntimeError("Dataset has no member dates for benchmark repair")
+        benchmark_code = manifest["benchmark_code"]
+        baseline_rows = self.kernel.read._repository_query(
+            context,
+            "tushare_index_daily_raw",
+            """WITH chosen AS (
+                    SELECT DISTINCT ON (r.trade_date)
+                           r.trade_date, r.ts_code,
+                           NULLIF(r.payload->>'close','')::double precision AS close,
+                           r.record_id, r.payload_hash
+                      FROM tushare_index_daily_raw r
+                      JOIN backtest.dataset_member m
+                        ON m.dataset_id=%s AND m.research_date=r.trade_date
+                     WHERE r.ts_code=%s
+                       AND r.record_id <= %s
+                     ORDER BY r.trade_date,r.fetched_at DESC,r.record_id DESC
+                )
+                SELECT trade_date,ts_code,close,record_id,payload_hash
+                  FROM chosen
+                 WHERE close IS NOT NULL AND close > 0
+                 ORDER BY trade_date""",
+            (dataset_id, benchmark_code, int(boundary)),
+            WorkScope(
+                date_from=min(member_dates), date_to=max(member_dates),
+                partition=f"dataset:benchmark:baseline:{dataset_id}",
+            ),
+            100_000,
+        )
+        covered = {row["trade_date"] for row in baseline_rows}
+        missing_dates = [day for day in member_dates if day not in covered]
+        if not missing_dates:
+            return None
+
+        upper_rows = self.kernel.read._repository_query(
+            context,
+            "tushare_index_daily_raw",
+            "SELECT MAX(record_id) AS max_record_id FROM tushare_index_daily_raw",
+            (),
+            WorkScope(partition=f"dataset:benchmark:repair-boundary:{dataset_id}"),
+            2,
+        )
+        upper = upper_rows[0]["max_record_id"] if upper_rows else None
+        if upper is None or int(upper) <= int(boundary):
+            raise RuntimeError(
+                f"benchmark dates missing at baseline but no later Raw version exists: {missing_dates[:3]}"
+            )
+        repair_rows = self.kernel.read._repository_query(
+            context,
+            "tushare_index_daily_raw",
+            """SELECT DISTINCT ON (trade_date)
+                       trade_date,ts_code,
+                       NULLIF(payload->>'close','')::double precision AS close,
+                       record_id,payload_hash
+                  FROM tushare_index_daily_raw
+                 WHERE ts_code=%s
+                   AND trade_date = ANY(%s::date[])
+                   AND record_id > %s AND record_id <= %s
+                 ORDER BY trade_date,fetched_at DESC,record_id DESC""",
+            (benchmark_code, missing_dates, int(boundary), int(upper)),
+            WorkScope(
+                date_from=min(missing_dates), date_to=max(missing_dates),
+                partition=f"dataset:benchmark:repair:{dataset_id}",
+            ),
+            100_000,
+        )
+        if len(repair_rows) != len(missing_dates) or any(
+            row["close"] is None or float(row["close"]) <= 0
+            for row in repair_rows
+        ):
+            found = {row["trade_date"] for row in repair_rows}
+            raise RuntimeError(
+                "benchmark repair Raw coverage remains incomplete: "
+                f"missing={sorted(set(missing_dates) - found)[:5]}"
+            )
+
+        repair_manifest = {
+            "schema_version": "backtest-benchmark-repair-v1",
+            "dataset_id": str(dataset_id),
+            "benchmark_code": benchmark_code,
+            "base_source_manifest_hash": baseline_hash,
+            "source_table": "tushare_index_daily_raw",
+            "baseline_record_upper_bound": int(boundary),
+            "repair_record_upper_bound": int(upper),
+            "repairs": [
+                {
+                    "trade_date": row["trade_date"].isoformat(),
+                    "ts_code": row["ts_code"],
+                    "record_id": int(row["record_id"]),
+                    "payload_hash": str(row["payload_hash"]),
+                    "close": float(row["close"]),
+                }
+                for row in sorted(repair_rows, key=lambda item: item["trade_date"])
+            ],
+        }
+        repair_hash = self._manifest_hash(repair_manifest)
+        changed = self.kernel.write.update_dataset_manifest(
+            context,
+            WorkScope(
+                date_from=min(missing_dates), date_to=max(missing_dates),
+                partition=f"dataset:benchmark:bind:{dataset_id}",
+                dimensions={"dataset_id": str(dataset_id)},
+            ),
+            dataset_id,
+            ("BUILDING", "FAILED"),
+            {
+                "benchmark_source_manifest": self._canonical_json(repair_manifest),
+                "benchmark_source_manifest_hash": repair_hash,
+            },
+        )
+        if changed != 1:
+            raise RuntimeError(f"Dataset benchmark repair binding changed concurrently: {dataset_id}")
+        return repair_manifest
+
+    def benchmark_source_repair_rows(
+        self,
+        manifest: dict[str, Any],
+        context: RunContext,
+    ) -> list[dict[str, Any]]:
+        """Load and verify the exact Raw rows named by a repair manifest."""
+        repair = manifest.get("benchmark_source_manifest")
+        repair_hash = manifest.get("benchmark_source_manifest_hash")
+        if not repair and not repair_hash:
+            return []
+        if not repair or not repair_hash or self._manifest_hash(repair) != str(repair_hash).strip():
+            raise RuntimeError("Dataset benchmark repair manifest is invalid")
+        if repair.get("dataset_id") != str(manifest["dataset_id"]):
+            raise RuntimeError("Dataset benchmark repair belongs to another Dataset")
+        if repair.get("benchmark_code") != manifest["benchmark_code"]:
+            raise RuntimeError("Dataset benchmark repair code mismatch")
+        entries = repair.get("repairs") or []
+        if not entries:
+            raise RuntimeError("Dataset benchmark repair manifest has no rows")
+        record_ids = [int(entry["record_id"]) for entry in entries]
+        if len(set(record_ids)) != len(record_ids):
+            raise RuntimeError("Dataset benchmark repair contains duplicate Raw record ids")
+        rows = self.kernel.read._repository_query(
+            context,
+            "tushare_index_daily_raw",
+            """SELECT trade_date,ts_code,
+                       NULLIF(payload->>'close','')::double precision AS close,
+                       record_id,payload_hash
+                  FROM tushare_index_daily_raw
+                 WHERE record_id = ANY(%s::bigint[])""",
+            (record_ids,),
+            WorkScope(partition=f"dataset:benchmark:repair-verify:{manifest['dataset_id']}"),
+            100_000,
+        )
+        by_id = {int(row["record_id"]): row for row in rows}
+        if len(by_id) != len(entries):
+            raise RuntimeError("Dataset benchmark repair Raw records are no longer available")
+        verified = []
+        seen_dates = set()
+        for entry in entries:
+            record_id = int(entry["record_id"])
+            row = by_id[record_id]
+            expected_date = entry["trade_date"]
+            if (
+                row["ts_code"] != entry["ts_code"]
+                or row["trade_date"].isoformat() != expected_date
+                or str(row["payload_hash"]) != str(entry["payload_hash"])
+                or float(row["close"]) != float(entry["close"])
+                or row["trade_date"] in seen_dates
+            ):
+                raise RuntimeError("Dataset benchmark repair Raw row differs from its bound manifest")
+            seen_dates.add(row["trade_date"])
+            verified.append(row)
+        return verified
 
     def baseline(self, baseline_tag: str, context: RunContext) -> dict[str, Any] | None:
         rows = self.kernel.read._repository_query(
@@ -201,13 +456,32 @@ class DatasetRepository(BaseRepository):
     def calendar_status(self, days: Sequence, context: RunContext) -> dict[Any, Any]:
         if not days:
             return {}
-        rows = self.kernel.read._repository_query(
-            context, "std.trading_calendar",
-            """SELECT trade_date, is_open FROM std.trading_calendar
-                WHERE exchange='SSE' AND trade_date = ANY(%s)""",
-            (list(days),), WorkScope(partition="calendar:boundary"), 100,
-        )
-        return {row["trade_date"]: row["is_open"] for row in rows}
+        # A five-year Dataset has more than 100 boundary dates.  Keep this
+        # lookup bounded and deterministic; the old single ANY() query used
+        # max_rows=100 and therefore failed before Dataset creation.
+        unique_days = tuple(dict.fromkeys(days))
+        result: dict[Any, Any] = {}
+        batch_size = 100
+        for offset in range(0, len(unique_days), batch_size):
+            batch = unique_days[offset:offset + batch_size]
+            rows = self.kernel.read._repository_query(
+                context, "std.trading_calendar",
+                """SELECT trade_date, BOOL_AND(is_open) AS min_is_open,
+                                  BOOL_OR(is_open) AS max_is_open
+                    FROM std.trading_calendar
+                   WHERE exchange='SSE' AND trade_date = ANY(%s)
+                   GROUP BY trade_date""",
+                (list(batch),),
+                WorkScope(partition=f"calendar:boundary:{offset // batch_size}"),
+                len(batch),
+            )
+            for row in rows:
+                if row["min_is_open"] != row["max_is_open"]:
+                    raise RuntimeError(
+                        f"SSE trading calendar has conflicting is_open values: {row['trade_date']}"
+                    )
+                result[row["trade_date"]] = row["min_is_open"]
+        return result
 
     def snapshot_manifests(self, snapshot_ids: Sequence[str], context: RunContext) -> list[dict[str, Any]]:
         if not snapshot_ids:
@@ -268,12 +542,28 @@ class DatasetRepository(BaseRepository):
         return [tuple(row[key] for key in keys) for row in rows]
 
     def update_member_stats(self, dataset_id: str, rows: Sequence[dict[str, Any]], context: RunContext) -> int:
-        return self.kernel.write.upsert(
-            context, WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}),
-            "backtest.dataset_member", list(rows), key=("dataset_id", "research_date"),
-            update_columns=("observation_row_count", "execution_row_count", "execution_hash", "corporate_action_hash", "quality_status"),
-            skip_noop=True,
+        materialized = [
+            {
+                "dataset_id": dataset_id,
+                "research_date": row["research_date"],
+                "observation_row_count": row["observation_row_count"],
+                "execution_row_count": row["execution_row_count"],
+                "execution_hash": row["execution_hash"],
+                "corporate_action_hash": row["corporate_action_hash"],
+                "quality_status": row["quality_status"],
+            }
+            for row in rows
+        ]
+        changed = self.kernel.write.update_dataset_member_stats_batch(
+            context,
+            WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}),
+            materialized,
         )
+        if changed != len(materialized):
+            raise RuntimeError(
+                f"Dataset member stats update missed rows: expected={len(materialized)}, changed={changed}"
+            )
+        return changed
 
     def materialized_calendar_rows(self, dataset_id: str, context: RunContext) -> list[tuple]:
         rows = self.kernel.read._repository_query(
@@ -348,18 +638,42 @@ class DatasetRepository(BaseRepository):
 
     def validation_counts(self, dataset_id: str, context: RunContext) -> dict[str, Any]:
         queries = {
-            "missing_execution_rows": "SELECT COUNT(*) AS value FROM backtest.dataset_execution_bar WHERE dataset_id=%s AND quality_status='MISSING_SOURCE'",
-            "missing_execution_lineage": "SELECT COUNT(*) AS value FROM backtest.dataset_execution_bar WHERE dataset_id=%s AND (((can_buy IS TRUE OR can_sell IS TRUE) AND (source_payload_hash IS NULL OR limit_source_record_id IS NULL OR limit_source_payload_hash IS NULL)) OR (is_suspended IS TRUE AND suspend_source_record_id IS NULL))",
-            "missing_calendar_lineage": "SELECT COUNT(*) AS value FROM backtest.dataset_calendar WHERE dataset_id=%s AND source_payload_hash IS NULL",
-            "missing_limit_rows": "SELECT COUNT(*) AS value FROM backtest.dataset_execution_bar WHERE dataset_id=%s AND quality_status='VALID' AND is_suspended IS NOT TRUE AND (can_buy IS TRUE OR can_sell IS TRUE) AND (up_limit IS NULL OR down_limit IS NULL)",
-            "future_dividend_rows": "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND COALESCE(implementation_announce_date, announce_date, report_date, ex_date) > ex_date",
-            "invalid_dividend_dates": "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND ((pay_date IS NOT NULL AND pay_date < ex_date) OR (div_list_date IS NOT NULL AND div_list_date < ex_date))",
-            "missing_dividend_lineage": "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND (source_record_version IS NULL OR source_payload_hash IS NULL)",
-            "inconsistent_stock_rates": "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND stock_div IS NOT NULL AND (stock_bonus_rate IS NOT NULL OR stock_conversion_rate IS NOT NULL) AND ABS(stock_div - (COALESCE(stock_bonus_rate, 0) + COALESCE(stock_conversion_rate, 0))) > 1e-8",
+            "missing_execution_rows": (
+                "backtest.dataset_execution_bar",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_execution_bar WHERE dataset_id=%s AND quality_status='MISSING_SOURCE'",
+            ),
+            "missing_execution_lineage": (
+                "backtest.dataset_execution_bar",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_execution_bar WHERE dataset_id=%s AND (((can_buy IS TRUE OR can_sell IS TRUE) AND (source_payload_hash IS NULL OR limit_source_record_id IS NULL OR limit_source_payload_hash IS NULL)) OR (is_suspended IS TRUE AND suspend_source_record_id IS NULL))",
+            ),
+            "missing_calendar_lineage": (
+                "backtest.dataset_calendar",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_calendar WHERE dataset_id=%s AND source_payload_hash IS NULL",
+            ),
+            "missing_limit_rows": (
+                "backtest.dataset_execution_bar",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_execution_bar WHERE dataset_id=%s AND quality_status='VALID' AND is_suspended IS NOT TRUE AND (can_buy IS TRUE OR can_sell IS TRUE) AND (up_limit IS NULL OR down_limit IS NULL)",
+            ),
+            "future_dividend_rows": (
+                "backtest.dataset_dividend_event",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND COALESCE(implementation_announce_date, announce_date, report_date, ex_date) > ex_date",
+            ),
+            "invalid_dividend_dates": (
+                "backtest.dataset_dividend_event",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND ((pay_date IS NOT NULL AND pay_date < ex_date) OR (div_list_date IS NOT NULL AND div_list_date < ex_date))",
+            ),
+            "missing_dividend_lineage": (
+                "backtest.dataset_dividend_event",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND (source_record_version IS NULL OR source_payload_hash IS NULL)",
+            ),
+            "inconsistent_stock_rates": (
+                "backtest.dataset_dividend_event",
+                "SELECT COUNT(*) AS value FROM backtest.dataset_dividend_event WHERE dataset_id=%s AND stock_div IS NOT NULL AND (stock_bonus_rate IS NOT NULL OR stock_conversion_rate IS NOT NULL) AND ABS(stock_div - (COALESCE(stock_bonus_rate, 0) + COALESCE(stock_conversion_rate, 0))) > 1e-8",
+            ),
         }
         result = {}
-        for name, sql in queries.items():
-            rows = self.kernel.read._repository_query(context, "backtest.dataset_validation", sql, (dataset_id,), WorkScope(partition=dataset_id), 2)
+        for name, (source, sql) in queries.items():
+            rows = self.kernel.read._repository_query(context, source, sql, (dataset_id,), WorkScope(partition=dataset_id), 2)
             result[name] = int(rows[0]["value"]) if rows else 0
         return result
 
@@ -371,7 +685,8 @@ class DatasetRepository(BaseRepository):
                 feature_version,warmup_start,evaluation_start,evaluation_end,out_of_sample_start,
                 market_rule_version,fee_rule_version,status,built_at,validated_at,frozen_at,input_manifest_hash,
                 selection_predicate,selected_columns,hash_algorithm,availability_rules,calendar_hash,rules_hash,
-                execution_hash,corporate_action_hash,benchmark_code,benchmark_hash,quality_report_hash,
+                execution_hash,corporate_action_hash,benchmark_code,benchmark_hash,
+                benchmark_source_manifest,benchmark_source_manifest_hash,quality_report_hash,
                 code_version,git_commit,git_dirty,diff_hash,code_archive_path,code_archive_sha256,
                 code_archive_size_bytes FROM backtest.dataset_manifest WHERE dataset_id=%s""",
             (dataset_id,), WorkScope(partition=str(dataset_id), dimensions={"dataset_id": dataset_id}), 2,
@@ -399,6 +714,25 @@ class DatasetRepository(BaseRepository):
             WorkScope(partition=f"checkpoint:{dataset_id}:{stage}", dimensions={"dataset_id": dataset_id}), 2,
         )
         return rows[0] if rows else None
+
+    def execution_row_count(self, dataset_id: str, start, end, context: RunContext) -> int:
+        """Return the bounded materialized-row count for a build batch.
+
+        A COMPLETED checkpoint is only a resume hint.  The physical rows may
+        have been rolled back or removed by a later failed retry, so callers
+        must verify the corresponding bounded range before skipping it.
+        """
+        rows = self.kernel.read._repository_query(
+            context,
+            "backtest.dataset_execution_bar",
+            """SELECT COUNT(*) AS row_count
+                 FROM backtest.dataset_execution_bar
+                WHERE dataset_id=%s AND trade_date BETWEEN %s AND %s""",
+            (dataset_id, start, end),
+            WorkScope(partition=dataset_id, date_from=start, date_to=end),
+            2,
+        )
+        return int(rows[0]["row_count"]) if rows else 0
 
     def set_checkpoint(self, dataset_id: str, stage: str, status: str, context: RunContext, **fields) -> int:
         row = {"dataset_id": dataset_id, "stage": stage, "status": status, **fields}
@@ -562,8 +896,74 @@ class DatasetRepository(BaseRepository):
         context: RunContext,
         batch_rows: int = 5_000,
     ):
+        # Resolve each bounded date/code key once per source table.  The old
+        # implementation performed four LATERAL lookups for every snapshot
+        # row.  That was logically correct but produced tens of thousands of
+        # tiny index probes per five-day batch and could make a single FETCH
+        # exceed the Kernel statement timeout on a cold WSL/PostgreSQL cache.
+        # These materialized, date-bounded source sets preserve the same
+        # latest-version and Raw fallback semantics while keeping the query
+        # set-based and bounded to the current Dataset batch.
         sql = """
-            SELECT m.research_date AS day, s.ts_code AS code, s.market AS market,
+            WITH base AS MATERIALIZED (
+                SELECT m.research_date AS day, s.ts_code AS code, s.market AS market,
+                       s.is_suspended_asof, s.can_buy, s.can_sell, s.limit_status
+                  FROM backtest.dataset_member m
+                  JOIN research.stock_snapshot_daily s
+                    ON s.snapshot_id=m.research_snapshot_id AND s.research_date=m.research_date
+                 WHERE m.dataset_id=%s AND m.research_date BETWEEN %s AND %s
+            ), keys AS MATERIALIZED (
+                SELECT DISTINCT day, code FROM base
+            ), market_source AS MATERIALIZED (
+                SELECT ts_code, trade_date, record_id, payload, payload_hash, fetched_at
+                  FROM public.tushare_market_raw_version
+                 WHERE dataset='daily' AND trade_date BETWEEN %s AND %s
+                   AND record_id <= %s
+            ), market AS MATERIALIZED (
+                SELECT DISTINCT ON (k.day, k.code)
+                       k.day, k.code, mv.record_id, mv.payload, mv.payload_hash
+                  FROM keys k
+                  JOIN market_source mv
+                    ON mv.ts_code=k.code AND mv.trade_date=k.day
+                 ORDER BY k.day, k.code, mv.fetched_at DESC, mv.record_id DESC
+            ), legacy_source AS MATERIALIZED (
+                SELECT ts_code, trade_date, payload, fetched_at
+                  FROM public.tushare_daily_raw
+                 WHERE source='tushare' AND trade_date BETWEEN %s AND %s
+                   AND fetched_at <= %s::timestamp
+            ), legacy AS MATERIALIZED (
+                SELECT DISTINCT ON (k.day, k.code)
+                       k.day, k.code, legacy.payload
+                  FROM keys k
+                  LEFT JOIN market v ON v.day=k.day AND v.code=k.code
+                  JOIN legacy_source legacy
+                    ON legacy.ts_code=k.code AND legacy.trade_date=k.day
+                 WHERE v.record_id IS NULL
+                 ORDER BY k.day, k.code, legacy.fetched_at DESC
+            ), limit_source AS MATERIALIZED (
+                SELECT ts_code, trade_date, record_id, payload, payload_hash, fetched_at
+                  FROM public.tushare_stk_limit_raw
+                 WHERE trade_date BETWEEN %s AND %s AND record_id <= %s
+            ), limits AS MATERIALIZED (
+                SELECT DISTINCT ON (k.day, k.code)
+                       k.day, k.code, raw_limit.record_id, raw_limit.payload, raw_limit.payload_hash
+                  FROM keys k
+                  JOIN limit_source raw_limit
+                    ON raw_limit.ts_code=k.code AND raw_limit.trade_date=k.day
+                 ORDER BY k.day, k.code, raw_limit.fetched_at DESC, raw_limit.record_id DESC
+            ), suspend_source AS MATERIALIZED (
+                SELECT ts_code, trade_date, record_id, payload_hash, fetched_at
+                  FROM public.tushare_suspend_d_raw
+                 WHERE trade_date BETWEEN %s AND %s AND record_id <= %s
+            ), suspends AS MATERIALIZED (
+                SELECT DISTINCT ON (k.day, k.code)
+                       k.day, k.code, raw_suspend.record_id, raw_suspend.payload_hash
+                  FROM keys k
+                  JOIN suspend_source raw_suspend
+                    ON raw_suspend.ts_code=k.code AND raw_suspend.trade_date=k.day
+                 ORDER BY k.day, k.code, raw_suspend.fetched_at DESC, raw_suspend.record_id DESC
+            )
+            SELECT b.day, b.code, b.market,
                    NULLIF(COALESCE(v.payload, r.payload)->>'open', '')::double precision AS opn,
                    NULLIF(COALESCE(v.payload, r.payload)->>'high', '')::double precision AS high,
                    NULLIF(COALESCE(v.payload, r.payload)->>'low', '')::double precision AS low,
@@ -572,45 +972,27 @@ class DatasetRepository(BaseRepository):
                    NULLIF(COALESCE(v.payload, r.payload)->>'amount', '')::double precision * 1000 AS amount,
                    NULLIF(lim.payload->>'up_limit', '')::double precision AS up_limit,
                    NULLIF(lim.payload->>'down_limit', '')::double precision AS down_limit,
-                   (COALESCE(s.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL) AS suspended,
-                   (COALESCE(s.can_buy, FALSE) AND NOT (COALESCE(s.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL)) AS can_buy,
-                   (COALESCE(s.can_sell, FALSE) AND NOT (COALESCE(s.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL)) AS can_sell,
+                   (COALESCE(b.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL) AS suspended,
+                   (COALESCE(b.can_buy, FALSE) AND NOT (COALESCE(b.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL)) AS can_buy,
+                   (COALESCE(b.can_sell, FALSE) AND NOT (COALESCE(b.is_suspended_asof, FALSE) OR sus.record_id IS NOT NULL)) AS can_sell,
                    (COALESCE(v.payload, r.payload) IS NOT NULL AND lim.record_id IS NOT NULL) AS status_source_present,
-                   s.limit_status AS limit_status, COALESCE(v.payload, r.payload) AS payload,
+                   b.limit_status AS limit_status, COALESCE(v.payload, r.payload) AS payload,
                    v.record_id AS version, v.payload_hash AS payload_hash,
                    lim.record_id AS limit_version, lim.payload_hash AS limit_hash,
                    sus.record_id AS suspend_version, sus.payload_hash AS suspend_hash
-              FROM backtest.dataset_member m
-              JOIN research.stock_snapshot_daily s
-                ON s.snapshot_id=m.research_snapshot_id AND s.research_date=m.research_date
-              LEFT JOIN LATERAL (
-                  SELECT record_id, payload, payload_hash FROM tushare_market_raw_version mv
-                   WHERE mv.dataset='daily' AND mv.business_key=s.ts_code || ':' || to_char(m.research_date,'YYYYMMDD')
-                     AND mv.record_id <= %s ORDER BY mv.fetched_at DESC, mv.record_id DESC LIMIT 1
-              ) v ON TRUE
-              LEFT JOIN LATERAL (
-                  SELECT legacy.payload FROM tushare_daily_raw legacy
-                   WHERE v.record_id IS NULL AND legacy.ts_code=s.ts_code
-                     AND legacy.trade_date=m.research_date AND legacy.source='tushare'
-                     AND legacy.fetched_at <= %s::timestamp
-                   ORDER BY legacy.fetched_at DESC LIMIT 1
-              ) r ON TRUE
-              LEFT JOIN LATERAL (
-                  SELECT record_id, payload, payload_hash FROM tushare_stk_limit_raw raw_limit
-                   WHERE raw_limit.ts_code=s.ts_code AND raw_limit.trade_date=m.research_date
-                     AND raw_limit.record_id <= %s ORDER BY raw_limit.fetched_at DESC, raw_limit.record_id DESC LIMIT 1
-              ) lim ON TRUE
-              LEFT JOIN LATERAL (
-                  SELECT record_id, payload_hash FROM tushare_suspend_d_raw raw_suspend
-                   WHERE raw_suspend.ts_code=s.ts_code AND raw_suspend.trade_date=m.research_date
-                     AND raw_suspend.record_id <= %s ORDER BY raw_suspend.fetched_at DESC, raw_suspend.record_id DESC LIMIT 1
-              ) sus ON TRUE
-             WHERE m.dataset_id=%s AND m.research_date BETWEEN %s AND %s
-             ORDER BY m.research_date, s.ts_code
+              FROM base b
+              LEFT JOIN market v ON v.day=b.day AND v.code=b.code
+              LEFT JOIN legacy r ON r.day=b.day AND r.code=b.code
+              LEFT JOIN limits lim ON lim.day=b.day AND lim.code=b.code
+              LEFT JOIN suspends sus ON sus.day=b.day AND sus.code=b.code
+             ORDER BY b.day, b.code
         """
         params = (
-            boundaries["daily"], boundaries["legacy_daily"], boundaries["limit"],
-            boundaries["suspend"], dataset_id, batch_start, batch_end,
+            dataset_id, batch_start, batch_end,
+            batch_start, batch_end, boundaries["daily"],
+            batch_start, batch_end, boundaries["legacy_daily"],
+            batch_start, batch_end, boundaries["limit"],
+            batch_start, batch_end, boundaries["suspend"],
         )
         columns = (
             "day", "code", "market", "opn", "high", "low", "close", "volume", "amount",

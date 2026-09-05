@@ -581,13 +581,14 @@ class SnapshotSeriesFinalize:
             )
 
         # Complete the deep preflight for every date before freezing the first
-        # pending batch.  Queries remain per-snapshot and batch-bounded.  A
-        # restart must honor the checkpoint: repeating all historical checks
-        # defeats resumability and can keep a production freeze at cursor 0.
+        # pending batch.  Queries remain per-snapshot and batch-bounded.  The
+        # aggregate checkpoint stores only a cursor, not the issue findings.
+        # Therefore an incomplete preflight cannot safely resume at its cursor:
+        # a process failure after a bad batch could otherwise skip that batch
+        # and publish an incomplete audit.  Completed preflights still skip all
+        # deep checks on a legitimate restart.
         if previous_preflight is None or not previous_preflight.done:
-            inspected = previous_preflight.cursor if previous_preflight else 0
-            if inspected < 0 or inspected > len(report.records):
-                raise RuntimeError("invalid snapshot preflight checkpoint cursor")
+            inspected = 0
             issue_count = 0
             issue_samples: dict[str, list[dict]] = {}
             for chunk in bounded_batches(report.records[inspected:], batch_size):

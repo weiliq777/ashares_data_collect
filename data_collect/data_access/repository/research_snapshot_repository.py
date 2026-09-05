@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
@@ -26,14 +26,20 @@ class ResearchSnapshotRepository(BaseRepository):
     LINEAGE_STORAGE_V2 = "v2"
     # Snapshot SQL is set-based, but one code batch must also remain below the
     # governed 30-second statement deadline on the oldest/highest-cost dates.
-    # 500 codes keeps the stock INSERT ... SELECT below the governed
-    # 30-second statement deadline while cutting per-batch planning and
-    # trigger overhead.  Stock rows remain bounded by the transaction policy.
-    SNAPSHOT_CODE_BATCH_SIZE = 500
+    # 100 codes keeps the stock INSERT ... SELECT below the governed
+    # 30-second statement deadline on the production WSL/PostgreSQL storage;
+    # the adaptive runner below can split a batch further for an unusually
+    # expensive date without widening the transaction deadline.
+    SNAPSHOT_CODE_BATCH_SIZE = 100
     # The compact lineage statement writes one row per stock and uses
     # statement-level guards, so it can safely use a larger independent batch.
     # Its source dictionary is still bounded to roughly ten records per code.
     LINEAGE_CODE_BATCH_SIZE = 1_000
+    # Legacy migration reads an existing ten-row-per-code relation and does
+    # not materialize the wide snapshot row.  One thousand codes keep the
+    # source aggregation safely below the 30-second statement deadline on the
+    # production WSL/PostgreSQL storage while keeping each transaction small.
+    LEGACY_LINEAGE_CODE_BATCH_SIZE = 1_000
     # Rebuild retries must remove any partially materialized snapshot first.
     # A complete snapshot has roughly 50k lineage rows; deleting all of them
     # in one governed statement can exceed the 30-second statement deadline
@@ -54,6 +60,18 @@ class ResearchSnapshotRepository(BaseRepository):
         "std.security_status_daily": "ts_code",
         "feature.shareholder_return_v1": "ts_code",
     }
+    LINEAGE_FIELD_GROUPS = (
+        "universe", "tradeability", "price", "valuation", "financial",
+        "shareholder_return", "lifecycle", "instrument", "market_facts",
+        "fundamental_history",
+    )
+    MAX_SNAPSHOT_CODES = 20_000
+    # A timeout means the database rolled back the whole typed Gateway
+    # statement.  Split the exact code set and retry only the smaller
+    # idempotent unit; never increase the statement deadline or retry an
+    # arbitrary SQL operation.  25 keeps the fallback bounded on the most
+    # expensive Foundation-v2 joins while avoiding one-row thrashing.
+    MIN_ADAPTIVE_CODE_BATCH_SIZE = 25
 
     @classmethod
     def lineage_target(cls, manifest: dict[str, Any]) -> str:
@@ -568,6 +586,165 @@ class ResearchSnapshotRepository(BaseRepository):
         return sql.replace(final_select, bundle_select, 1)
 
     @staticmethod
+    def legacy_lineage_bundle_sql() -> str:
+        """Return the bounded v1-lineage to v2-bundle migration statement.
+
+        This statement intentionally reads only the already materialized
+        ``research.snapshot_lineage`` facts.  It does not join or rewrite the
+        stock snapshot, PIT or Feature relations.  One invocation is scoped
+        by a single snapshot/date and a bounded code array; the final INSERT
+        therefore produces at most one bundle row per requested stock.
+
+        The source identity and bundle hashes mirror ``lineage_bundle_sql``.
+        Consequently this is a physical-format conversion, not a second
+        interpretation of the snapshot's upstream data.
+        """
+        return f"""
+        WITH params AS (
+            SELECT %s::uuid AS snapshot_id,
+                   %s::date AS research_date
+        ), codes AS (
+            SELECT unnest(%s::text[]) AS ts_code
+        ), legacy_rows AS (
+            SELECT l.snapshot_id, l.research_date, l.ts_code, l.field_group,
+                   l.source_table, l.source_record_key,
+                   l.source_record_version, l.source_payload_hash,
+                   digest(convert_to(jsonb_build_object(
+                       'source_table', l.source_table,
+                       'source_record_key', l.source_record_key,
+                       'source_record_version', l.source_record_version,
+                       'source_payload_hash', l.source_payload_hash
+                   )::text, 'UTF8'), 'sha256') AS source_identity_hash
+              FROM research.snapshot_lineage l
+              JOIN params p
+                ON p.snapshot_id=l.snapshot_id
+               AND p.research_date=l.research_date
+              JOIN codes c
+                ON c.ts_code=l.ts_code
+             WHERE l.field_group IN (
+                   'universe', 'tradeability', 'price', 'valuation',
+                   'financial', 'shareholder_return', 'lifecycle',
+                   'instrument', 'market_facts', 'fundamental_history'
+               )
+        ), complete_keys AS (
+            SELECT snapshot_id, research_date, ts_code
+              FROM legacy_rows
+             GROUP BY snapshot_id, research_date, ts_code
+            HAVING COUNT(*)=10
+               AND COUNT(DISTINCT field_group)=10
+               AND COUNT(*) FILTER (
+                   WHERE source_record_key NOT LIKE '%%:missing'
+                     AND (source_record_version IS NULL
+                          OR source_payload_hash IS NULL)
+               )=0
+        ), complete_rows AS (
+            SELECT l.*
+              FROM legacy_rows l
+              JOIN complete_keys k
+                ON k.snapshot_id=l.snapshot_id
+               AND k.research_date=l.research_date
+               AND k.ts_code=l.ts_code
+        ), source_rows AS (
+            SELECT DISTINCT source_table, source_record_key,
+                            source_record_version, source_payload_hash,
+                            source_identity_hash
+              FROM complete_rows
+        ), inserted_source AS (
+            INSERT INTO research.lineage_source_record
+                (source_identity_hash, source_table, source_record_key,
+                 source_record_version, source_payload_hash)
+            SELECT source_identity_hash, source_table, source_record_key,
+                   source_record_version, source_payload_hash
+              FROM source_rows
+            ON CONFLICT (source_identity_hash) DO NOTHING
+            RETURNING source_ref_id, source_identity_hash
+        ), resolved_refs AS (
+            SELECT c.snapshot_id, c.research_date, c.ts_code, c.field_group,
+                   c.source_identity_hash,
+                   COALESCE(i.source_ref_id, d.source_ref_id) AS source_ref_id
+              FROM complete_rows c
+              LEFT JOIN inserted_source i
+                ON i.source_identity_hash=c.source_identity_hash
+              LEFT JOIN research.lineage_source_record d
+                ON d.source_identity_hash=c.source_identity_hash
+        ), bundles AS (
+            SELECT snapshot_id, research_date, ts_code,
+                   MAX(source_ref_id) FILTER (WHERE field_group='universe') AS universe_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='tradeability') AS tradeability_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='price') AS price_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='valuation') AS valuation_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='financial') AS financial_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='shareholder_return') AS shareholder_return_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='lifecycle') AS lifecycle_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='instrument') AS instrument_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='market_facts') AS market_facts_source_ref_id,
+                   MAX(source_ref_id) FILTER (WHERE field_group='fundamental_history') AS fundamental_history_source_ref_id,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='universe'))[1] AS universe_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='tradeability'))[1] AS tradeability_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='price'))[1] AS price_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='valuation'))[1] AS valuation_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='financial'))[1] AS financial_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='shareholder_return'))[1] AS shareholder_return_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='lifecycle'))[1] AS lifecycle_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='instrument'))[1] AS instrument_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='market_facts'))[1] AS market_facts_identity_hash,
+                   (array_agg(source_identity_hash ORDER BY source_identity_hash)
+                       FILTER (WHERE field_group='fundamental_history'))[1] AS fundamental_history_identity_hash
+              FROM resolved_refs
+             GROUP BY snapshot_id, research_date, ts_code
+            HAVING COUNT(*)=10 AND COUNT(DISTINCT field_group)=10
+        )
+        INSERT INTO research.snapshot_lineage_bundle
+            (snapshot_id, research_date, ts_code,
+             universe_source_ref_id, tradeability_source_ref_id,
+             price_source_ref_id, valuation_source_ref_id,
+             financial_source_ref_id, shareholder_return_source_ref_id,
+             lifecycle_source_ref_id, instrument_source_ref_id,
+             market_facts_source_ref_id, fundamental_history_source_ref_id,
+             source_bundle_hash)
+        SELECT snapshot_id, research_date, ts_code,
+               universe_source_ref_id, tradeability_source_ref_id,
+               price_source_ref_id, valuation_source_ref_id,
+               financial_source_ref_id, shareholder_return_source_ref_id,
+               lifecycle_source_ref_id, instrument_source_ref_id,
+               market_facts_source_ref_id, fundamental_history_source_ref_id,
+               encode(digest(convert_to(jsonb_build_object(
+                   'universe', encode(universe_identity_hash, 'hex'),
+                   'tradeability', encode(tradeability_identity_hash, 'hex'),
+                   'price', encode(price_identity_hash, 'hex'),
+                   'valuation', encode(valuation_identity_hash, 'hex'),
+                   'financial', encode(financial_identity_hash, 'hex'),
+                   'shareholder_return', encode(shareholder_return_identity_hash, 'hex'),
+                   'lifecycle', encode(lifecycle_identity_hash, 'hex'),
+                   'instrument', encode(instrument_identity_hash, 'hex'),
+                   'market_facts', encode(market_facts_identity_hash, 'hex'),
+                   'fundamental_history', encode(fundamental_history_identity_hash, 'hex')
+               )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
+          FROM bundles
+        ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE SET
+            universe_source_ref_id=EXCLUDED.universe_source_ref_id,
+            tradeability_source_ref_id=EXCLUDED.tradeability_source_ref_id,
+            price_source_ref_id=EXCLUDED.price_source_ref_id,
+            valuation_source_ref_id=EXCLUDED.valuation_source_ref_id,
+            financial_source_ref_id=EXCLUDED.financial_source_ref_id,
+            shareholder_return_source_ref_id=EXCLUDED.shareholder_return_source_ref_id,
+            lifecycle_source_ref_id=EXCLUDED.lifecycle_source_ref_id,
+            instrument_source_ref_id=EXCLUDED.instrument_source_ref_id,
+            market_facts_source_ref_id=EXCLUDED.market_facts_source_ref_id,
+            fundamental_history_source_ref_id=EXCLUDED.fundamental_history_source_ref_id,
+            source_bundle_hash=EXCLUDED.source_bundle_hash
+        """
+
+    @staticmethod
     def stock_snapshot_batch_sql():
         """Return the set-based materialization SQL for several cutoff dates."""
         sql = ResearchSnapshotRepository.stock_snapshot_sql()
@@ -907,6 +1084,251 @@ class ResearchSnapshotRepository(BaseRepository):
             if target == "research.snapshot_input" or deleted < self.SNAPSHOT_DELETE_CHUNK_SIZE:
                 return total_deleted
 
+    def snapshot_codes(
+        self, snapshot_id: str, cutoff: date, context: RunContext,
+    ) -> tuple[str, ...]:
+        """Read the existing snapshot code set for a bounded lineage repair.
+
+        The code set is deliberately taken from the already materialized
+        snapshot, not regenerated from PIT/Feature sources.  This keeps a
+        lineage-format migration from silently changing the snapshot's
+        universe.  A small sentinel row detects an unexpected oversized
+        snapshot before any bundle write starts.
+        """
+        rows = self.kernel.read._repository_query(
+            context,
+            "research.stock_snapshot_daily",
+            """SELECT ts_code
+                  FROM research.stock_snapshot_daily
+                 WHERE snapshot_id=%s AND research_date=%s
+                 ORDER BY ts_code
+                 LIMIT %s""",
+            (snapshot_id, cutoff, self.MAX_SNAPSHOT_CODES + 1),
+            self._snapshot_scope(snapshot_id, cutoff),
+            max_rows=self.MAX_SNAPSHOT_CODES + 1,
+        )
+        if len(rows) > self.MAX_SNAPSHOT_CODES:
+            raise RuntimeError(
+                "snapshot code set exceeds bounded lineage migration limit: "
+                f"snapshot_id={snapshot_id}, limit={self.MAX_SNAPSHOT_CODES}"
+            )
+        codes = tuple(str(row["ts_code"]) for row in rows)
+        if len(codes) != len(set(codes)):
+            raise RuntimeError(f"snapshot code set contains duplicates: {snapshot_id}")
+        return codes
+
+    @staticmethod
+    def _is_statement_timeout(exc: BaseException) -> bool:
+        """Return true only for the governed PostgreSQL statement timeout."""
+        message = str(exc).lower()
+        return "statement timeout" in message
+
+    def _run_adaptive_code_operation(
+        self,
+        codes: Iterable[str],
+        operation: Callable[[tuple[str, ...]], int],
+        *,
+        minimum_batch_size: int | None = None,
+    ) -> int:
+        """Run one typed code batch, splitting only after statement timeout.
+
+        Every ``operation`` call is a named Gateway operation.  The Gateway
+        transaction rolls back before this method receives a timeout, so a
+        smaller retry cannot duplicate rows from the timed-out statement.
+        Non-timeout errors and batches at the minimum size remain visible to
+        the caller instead of being hidden by a retry loop.
+        """
+        batch = tuple(str(code) for code in codes)
+        if not batch:
+            return 0
+        minimum = (
+            self.MIN_ADAPTIVE_CODE_BATCH_SIZE
+            if minimum_batch_size is None else int(minimum_batch_size)
+        )
+        if minimum < 1:
+            raise ValueError("minimum_batch_size must be positive")
+        if len(batch) <= minimum:
+            return int(operation(batch))
+        try:
+            return int(operation(batch))
+        except Exception as exc:
+            if not self._is_statement_timeout(exc):
+                raise
+            midpoint = len(batch) // 2
+            left = self._run_adaptive_code_operation(
+                batch[:midpoint], operation, minimum_batch_size=minimum,
+            )
+            right = self._run_adaptive_code_operation(
+                batch[midpoint:], operation, minimum_batch_size=minimum,
+            )
+            return left + right
+
+    def has_legacy_lineage(
+        self, snapshot_id: str, cutoff: date, context: RunContext,
+    ) -> bool:
+        """Return whether a snapshot has an old lineage row.
+
+        This is an existence probe, not a count.  It lets the migration route
+        genuinely legacy snapshots to format conversion while routing
+        incomplete snapshots that never had legacy lineage to the normal v2
+        builder without scanning the large lineage table twice.
+        """
+        rows = self.kernel.read._repository_query(
+            context,
+            self.LEGACY_LINEAGE_TARGET,
+            """SELECT 1
+                  FROM research.snapshot_lineage
+                 WHERE snapshot_id=%s AND research_date=%s
+                 LIMIT 1""",
+            (snapshot_id, cutoff),
+            self._snapshot_scope(snapshot_id, cutoff),
+            max_rows=2,
+        )
+        return bool(rows)
+
+    def snapshot_materialization_counts(
+        self, snapshot_id: str, cutoff: date, context: RunContext,
+    ) -> dict[str, int]:
+        """Read bounded child counts for a snapshot without lineage joins."""
+        scope = self._snapshot_scope(snapshot_id, cutoff)
+        counts: dict[str, int] = {}
+        for key, target, sql, params in (
+            (
+                "stock_rows", "research.stock_snapshot_daily",
+                """SELECT COUNT(*) AS value
+                      FROM research.stock_snapshot_daily
+                     WHERE snapshot_id=%s AND research_date=%s""",
+                (snapshot_id, cutoff),
+            ),
+            (
+                "input_rows", "research.snapshot_input",
+                """SELECT COUNT(*) AS value
+                      FROM research.snapshot_input
+                     WHERE snapshot_id=%s""",
+                (snapshot_id,),
+            ),
+            (
+                "bundle_rows", "research.snapshot_lineage_bundle",
+                """SELECT COUNT(*) AS value
+                      FROM research.snapshot_lineage_bundle
+                     WHERE snapshot_id=%s AND research_date=%s""",
+                (snapshot_id, cutoff),
+            ),
+        ):
+            rows = self.kernel.read._repository_query(
+                context, target, sql, params, scope, max_rows=2,
+            )
+            counts[key] = int(rows[0]["value"] or 0)
+        return counts
+
+    def materialize_legacy_lineage_v2(
+        self,
+        snapshot_ids: Iterable[str],
+        context: RunContext,
+    ) -> dict[str, int]:
+        """Migrate legacy lineage to v2 without rebuilding snapshot rows.
+
+        Each snapshot has its own lifecycle transition and each code slice is
+        a separate short Gateway transaction.  The existing stock snapshot
+        and input manifest are never deleted or updated; acceptance remains
+        responsible for proving that they are complete before VALIDATED is
+        restored.
+        """
+        ids = tuple(str(value) for value in snapshot_ids)
+        if not ids:
+            return {}
+        if len(ids) > 20:
+            raise ValueError("legacy lineage migration batches are limited to 20 snapshots")
+
+        results: dict[str, int] = {}
+        sql = self.legacy_lineage_bundle_sql()
+        for snapshot_id in ids:
+            manifest = self.manifest(snapshot_id, context)
+            if manifest["status"] not in {"DRAFT", "FAILED"}:
+                raise RuntimeError(
+                    "legacy lineage migration accepts only DRAFT/FAILED snapshots: "
+                    f"{snapshot_id} ({manifest['status']})"
+                )
+            if not is_foundation_schema(manifest["schema_version"]):
+                raise RuntimeError(
+                    "legacy lineage v2 migration requires a Foundation snapshot: "
+                    f"{snapshot_id} ({manifest['schema_version']})"
+                )
+            if manifest.get("lineage_storage_version") != self.LINEAGE_STORAGE_V2:
+                raise RuntimeError(
+                    "legacy lineage v2 migration requires the manifest to be "
+                    f"prepared as v2: {snapshot_id}"
+                )
+
+            cutoff = manifest["cutoff"]
+            snapshot_scope = self._snapshot_scope(snapshot_id, cutoff)
+            with self.kernel.lock_manager.session_exclusive(
+                "research.snapshot", snapshot_id,
+            ):
+                changed = self.kernel.write.transition_snapshot_manifest(
+                    context,
+                    snapshot_scope,
+                    snapshot_id,
+                    ("DRAFT", "FAILED"),
+                    "BUILDING",
+                    {"failure_reason": None},
+                )
+                if changed != 1:
+                    raise RuntimeError(
+                        "snapshot lifecycle changed before legacy lineage migration: "
+                        f"{snapshot_id}"
+                    )
+
+                # A previous interrupted v2 attempt may have left a partial
+                # bundle.  Clear only that physical representation.  The
+                # legacy lineage source, stock snapshot and snapshot_input
+                # remain untouched for audit and recovery.
+                self._delete_snapshot_rows(
+                    snapshot_id, context, self.BUNDLE_LINEAGE_TARGET, cutoff,
+                )
+                codes = self.snapshot_codes(snapshot_id, cutoff, context)
+                if not codes:
+                    raise RuntimeError(
+                        "cannot migrate lineage for an empty stock snapshot: "
+                        f"{snapshot_id}/{cutoff}"
+                    )
+
+                written = 0
+                for offset in range(0, len(codes), self.LEGACY_LINEAGE_CODE_BATCH_SIZE):
+                    code_batch = codes[
+                        offset:offset + self.LEGACY_LINEAGE_CODE_BATCH_SIZE
+                    ]
+                    batch_scope = WorkScope(
+                        date_from=cutoff,
+                        date_to=cutoff,
+                        codes=code_batch,
+                        partition=f"{snapshot_id}:lineage-v2-legacy",
+                        dimensions={"snapshot_id": snapshot_id},
+                    )
+                    plan = SqlPlan(
+                        operation=Operation.REBUILD,
+                        target=self.BUNDLE_LINEAGE_TARGET,
+                        scope=batch_scope,
+                        expected_mode="SET_BASED",
+                        estimated_rows=len(code_batch),
+                        allow_insert_select=True,
+                    )
+                    affected = self.kernel.rebuild.run_snapshot_lineage_bundle_from_legacy(
+                        sql,
+                        plan,
+                        context,
+                        (snapshot_id, cutoff, list(code_batch)),
+                    )
+                    if affected != len(code_batch):
+                        raise RuntimeError(
+                            "legacy lineage bundle row count mismatch: "
+                            f"snapshot_id={snapshot_id}, expected={len(code_batch)}, "
+                            f"written={affected}"
+                        )
+                    written += affected
+                results[snapshot_id] = written
+        return results
+
     def _precompute_input_manifest(
         self,
         definitions,
@@ -1000,9 +1422,12 @@ class ResearchSnapshotRepository(BaseRepository):
                 written = 0
                 for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
                     code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
-                    written += self.kernel.rebuild.run_insert_select(
-                        stock_sql, stock_plan, context,
-                        (snapshot_id, high_water, cutoff, code_batch),
+                    written += self._run_adaptive_code_operation(
+                        code_batch,
+                        lambda batch: self.kernel.rebuild.run_insert_select(
+                            stock_sql, stock_plan, context,
+                            (snapshot_id, high_water, cutoff, list(batch)),
+                        ),
                     )
                 if written <= 0:
                     raise RuntimeError(f"截止日没有可生成的 universe 数据: {cutoff}")
@@ -1018,9 +1443,12 @@ class ResearchSnapshotRepository(BaseRepository):
                     )
                     for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
                         code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
-                        self.kernel.rebuild.run_scoped_merge(
-                            foundation_sql, foundation_plan, context,
-                            (snapshot_id, snapshot_id, cutoff, code_batch),
+                        self._run_adaptive_code_operation(
+                            code_batch,
+                            lambda batch: self.kernel.rebuild.run_scoped_merge(
+                                foundation_sql, foundation_plan, context,
+                                (snapshot_id, snapshot_id, cutoff, list(batch)),
+                            ),
                         )
                 lineage_plan = SqlPlan(
                     operation=Operation.REBUILD, target=lineage_target, scope=scope,
@@ -1047,14 +1475,20 @@ class ResearchSnapshotRepository(BaseRepository):
                 for offset in range(0, len(codes), self.LINEAGE_CODE_BATCH_SIZE):
                     code_batch = codes[offset:offset + self.LINEAGE_CODE_BATCH_SIZE]
                     if lineage_target == self.BUNDLE_LINEAGE_TARGET:
-                        self.kernel.rebuild.run_snapshot_lineage_bundle(
-                            lineage_sql, lineage_plan, context,
-                            (snapshot_id, cutoff, code_batch),
+                        self._run_adaptive_code_operation(
+                            code_batch,
+                            lambda batch: self.kernel.rebuild.run_snapshot_lineage_bundle(
+                                lineage_sql, lineage_plan, context,
+                                (snapshot_id, cutoff, list(batch)),
+                            ),
                         )
                     else:
-                        self.kernel.rebuild.run_insert_select(
-                            lineage_sql, lineage_plan, context,
-                            (snapshot_id, cutoff, code_batch),
+                        self._run_adaptive_code_operation(
+                            code_batch,
+                            lambda batch: self.kernel.rebuild.run_insert_select(
+                                lineage_sql, lineage_plan, context,
+                                (snapshot_id, cutoff, list(batch)),
+                            ),
                         )
                 self.kernel.write.bulk_insert(context, scope, "research.snapshot_input", input_rows)
                 changed = self.kernel.write.transition_snapshot_manifest(
@@ -1230,9 +1664,12 @@ class ResearchSnapshotRepository(BaseRepository):
                 written = 0
                 for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
                     code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
-                    written += self.kernel.rebuild.run_insert_select(
-                        stock_sql, stock_plan, context,
-                        (high_water, list(ids), list(code_batch)),
+                    written += self._run_adaptive_code_operation(
+                        code_batch,
+                        lambda batch: self.kernel.rebuild.run_insert_select(
+                            stock_sql, stock_plan, context,
+                            (high_water, list(ids), list(batch)),
+                        ),
                     )
                 if written <= 0:
                     raise RuntimeError("批量快照没有写入 universe 数据")
@@ -1247,9 +1684,12 @@ class ResearchSnapshotRepository(BaseRepository):
                     foundation_sql = self.foundation_snapshot_batch_sql()
                     for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
                         code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
-                        self.kernel.rebuild.run_scoped_merge(
-                            foundation_sql, foundation_plan, context,
-                            (list(ids), list(cutoffs), list(code_batch)),
+                        self._run_adaptive_code_operation(
+                            code_batch,
+                            lambda batch: self.kernel.rebuild.run_scoped_merge(
+                                foundation_sql, foundation_plan, context,
+                                (list(ids), list(cutoffs), list(batch)),
+                            ),
                         )
 
                 # The lineage statement contains eleven UNION ALL branches
@@ -1291,14 +1731,20 @@ class ResearchSnapshotRepository(BaseRepository):
                     for offset in range(0, len(codes), self.LINEAGE_CODE_BATCH_SIZE):
                         code_batch = codes[offset:offset + self.LINEAGE_CODE_BATCH_SIZE]
                         if lineage_target == self.BUNDLE_LINEAGE_TARGET:
-                            self.kernel.rebuild.run_snapshot_lineage_bundle(
-                                lineage_sql, lineage_plan, context,
-                                (snapshot_id, cutoff, list(code_batch)),
+                            self._run_adaptive_code_operation(
+                                code_batch,
+                                lambda batch: self.kernel.rebuild.run_snapshot_lineage_bundle(
+                                    lineage_sql, lineage_plan, context,
+                                    (snapshot_id, cutoff, list(batch)),
+                                ),
                             )
                         else:
-                            self.kernel.rebuild.run_insert_select(
-                                lineage_sql, lineage_plan, context,
-                                (snapshot_id, cutoff, list(code_batch)),
+                            self._run_adaptive_code_operation(
+                                code_batch,
+                                lambda batch: self.kernel.rebuild.run_insert_select(
+                                    lineage_sql, lineage_plan, context,
+                                    (snapshot_id, cutoff, list(batch)),
+                                ),
                             )
 
                 all_input_rows = [
@@ -1694,6 +2140,38 @@ class ResearchSnapshotRepository(BaseRepository):
         if rows:
             raise RuntimeError(f"point-in-time price batch coverage invalid: {rows[:10]}")
 
+    @staticmethod
+    def _input_definition_for_stored_rows(stored_rows, definitions):
+        """Return the explicit input contract represented by stored rows.
+
+        Foundation-v2 was first materialized before the V1 compatibility
+        source was registered as a manifest dependency.  Those snapshots have
+        a valid ten-input manifest; current builds intentionally have eleven
+        inputs.  This is a narrowly defined historical compatibility rule,
+        not permission to accept an arbitrary or incomplete manifest.
+        """
+        current = tuple(definitions)
+        current_keys = tuple((item["schema"], item["table"]) for item in current)
+        stored_keys = tuple(
+            (row["schema_name"], row["table_name"])
+            for row in stored_rows
+        )
+        variants = [(current_keys, current)]
+        compatibility_key = ("feature", "company_financial_v1")
+        if compatibility_key in current_keys:
+            legacy = tuple(
+                item for item in current
+                if (item["schema"], item["table"]) != compatibility_key
+            )
+            variants.append(
+                (tuple((item["schema"], item["table"]) for item in legacy), legacy)
+            )
+        stored_key_set = set(stored_keys)
+        for expected_keys, candidate in variants:
+            if len(stored_rows) == len(candidate) and stored_key_set == set(expected_keys):
+                return candidate
+        return None
+
     def check_snapshot(
         self, manifest: dict[str, Any], source_manifest: dict[str, Any],
         definitions, row_bytes, manifest_hash, required_lineage_groups: int, context: RunContext,
@@ -1797,15 +2275,21 @@ class ResearchSnapshotRepository(BaseRepository):
                         ORDER BY schema_name, table_name""",
             (snapshot_id,), scope, max(2, len(definitions) + 1),
         )
-        expected_keys = [(item["schema"], item["table"]) for item in definitions]
         stored_by_key = {(row["schema_name"], row["table_name"]): row for row in stored_inputs}
-        if len(stored_inputs) != len(definitions) or set(stored_by_key) != set(expected_keys):
+        expected_definitions = self._input_definition_for_stored_rows(
+            stored_inputs, definitions,
+        )
+        if expected_definitions is None:
+            expected_keys = [(item["schema"], item["table"]) for item in definitions]
             issues.append({
                 "snapshot_input_manifest_incomplete": {
                     "expected": expected_keys, "stored": sorted(stored_by_key),
                 }
             })
         else:
+            expected_keys = [
+                (item["schema"], item["table"]) for item in expected_definitions
+            ]
             ordered_inputs = [stored_by_key[key] for key in expected_keys]
             current_hash = manifest_hash(ordered_inputs)
             if current_hash != manifest["input_hash"]:
@@ -1834,6 +2318,145 @@ class ResearchSnapshotRepository(BaseRepository):
             )[0]
             if any(maturity.values()):
                 issues.append({"research_v1_2_maturity_or_pit_failures": tuple(maturity.values())})
+        return issues
+
+    def check_legacy_lineage_v2(
+        self, manifest: dict[str, Any], context: RunContext,
+    ) -> list[dict[str, Any]]:
+        """Validate a format-converted snapshot without current input drift.
+
+        A legacy snapshot may have a valid historical input manifest that is
+        smaller than today's input definition (for example, before the V1
+        compatibility source was registered).  The migration must therefore
+        validate the representation conversion itself: the existing stock
+        code set and ten legacy groups must map to one complete bundle row per
+        stock, with every dictionary reference resolvable.  It must not ask
+        the current snapshot builder to reinterpret or rewrite that manifest.
+        """
+        snapshot_id = str(manifest["snapshot_id"])
+        cutoff = manifest["cutoff"]
+        scope = WorkScope(
+            date_from=cutoff, date_to=cutoff,
+            partition=f"legacy-lineage-check:{snapshot_id}",
+        )
+        issues: list[dict[str, Any]] = []
+
+        stock_rows = int(self.kernel.read._repository_query(
+            context,
+            "research.stock_snapshot_daily",
+            """SELECT COUNT(*) AS value
+                  FROM research.stock_snapshot_daily
+                 WHERE snapshot_id=%s AND research_date=%s""",
+            (snapshot_id, cutoff), scope, 2,
+        )[0]["value"] or 0)
+        legacy_summary = self.kernel.read._repository_query(
+            context,
+            "research.snapshot_lineage",
+            """SELECT COUNT(*) AS row_count,
+                       COUNT(DISTINCT ts_code) AS code_count,
+                       COUNT(*) FILTER (WHERE source_record_key NOT LIKE '%%:missing'
+                                         AND (source_record_version IS NULL
+                                              OR source_payload_hash IS NULL)) AS invalid_metadata,
+                       COUNT(*) FILTER (WHERE source_record_key IS NULL) AS null_keys
+                  FROM research.snapshot_lineage
+                 WHERE snapshot_id=%s AND research_date=%s""",
+            (snapshot_id, cutoff), scope, 2,
+        )[0]
+        legacy_incomplete = int(self.kernel.read._repository_query(
+            context,
+            "research.snapshot_lineage",
+            """SELECT COUNT(*) AS value
+                  FROM (
+                    SELECT ts_code
+                      FROM research.snapshot_lineage
+                     WHERE snapshot_id=%s AND research_date=%s
+                     GROUP BY ts_code
+                    HAVING COUNT(*)<>10
+                        OR COUNT(DISTINCT field_group)<>10
+                  ) incomplete""",
+            (snapshot_id, cutoff), scope, 2,
+        )[0]["value"] or 0)
+        bundle_summary = self.kernel.read._repository_query(
+            context,
+            "research.snapshot_lineage_bundle",
+            """SELECT COUNT(*) AS row_count,
+                       COUNT(*) FILTER (WHERE source_bundle_hash IS NULL) AS null_hashes
+                  FROM research.snapshot_lineage_bundle
+                 WHERE snapshot_id=%s AND research_date=%s""",
+            (snapshot_id, cutoff), scope, 2,
+        )[0]
+        broken_refs = int(self.kernel.read._repository_query(
+            context,
+            "research.snapshot_lineage_bundle",
+            """WITH refs AS (
+                    SELECT b.snapshot_id, b.research_date, v.field_group,
+                           v.source_ref_id
+                      FROM research.snapshot_lineage_bundle b
+                      CROSS JOIN LATERAL (VALUES
+                        ('universe', b.universe_source_ref_id),
+                        ('tradeability', b.tradeability_source_ref_id),
+                        ('price', b.price_source_ref_id),
+                        ('valuation', b.valuation_source_ref_id),
+                        ('financial', b.financial_source_ref_id),
+                        ('shareholder_return', b.shareholder_return_source_ref_id),
+                        ('lifecycle', b.lifecycle_source_ref_id),
+                        ('instrument', b.instrument_source_ref_id),
+                        ('market_facts', b.market_facts_source_ref_id),
+                        ('fundamental_history', b.fundamental_history_source_ref_id)
+                      ) v(field_group, source_ref_id)
+                     WHERE b.snapshot_id=%s AND b.research_date=%s
+                )
+                SELECT COUNT(*) AS value
+                  FROM refs r
+                  LEFT JOIN research.lineage_source_record d
+                    ON d.source_ref_id=r.source_ref_id
+                 WHERE r.source_ref_id IS NULL
+                    OR d.source_ref_id IS NULL
+                    OR (d.source_record_key NOT LIKE '%%:missing'
+                        AND (d.source_record_version IS NULL
+                             OR d.source_payload_hash IS NULL))""",
+            (snapshot_id, cutoff), scope, 2,
+        )[0]["value"] or 0)
+
+        legacy_rows = int(legacy_summary["row_count"] or 0)
+        legacy_codes = int(legacy_summary["code_count"] or 0)
+        invalid_metadata = int(legacy_summary["invalid_metadata"] or 0)
+        null_keys = int(legacy_summary["null_keys"] or 0)
+        bundle_rows = int(bundle_summary["row_count"] or 0)
+        null_hashes = int(bundle_summary["null_hashes"] or 0)
+        if stock_rows <= 0:
+            issues.append({"snapshot_rows": stock_rows})
+        if (
+            legacy_rows != stock_rows * 10
+            or legacy_codes != stock_rows
+            or invalid_metadata
+            or null_keys
+            or legacy_incomplete
+        ):
+            issues.append({
+                "legacy_lineage_incomplete": {
+                    "stock_rows": stock_rows,
+                    "legacy_rows": legacy_rows,
+                    "legacy_codes": legacy_codes,
+                    "invalid_metadata": invalid_metadata,
+                    "null_keys": null_keys,
+                    "incomplete_codes": legacy_incomplete,
+                }
+            })
+        if bundle_rows != stock_rows:
+            issues.append({
+                "snapshot_lineage_row_mismatch": {
+                    "snapshot_rows": stock_rows,
+                    "lineage_bundle_rows": bundle_rows,
+                }
+            })
+        if null_hashes or broken_refs:
+            issues.append({
+                "lineage_bundle_refs_invalid": {
+                    "null_bundle_hashes": null_hashes,
+                    "broken_refs": broken_refs,
+                }
+            })
         return issues
 
     def check_snapshots_batch(
@@ -2011,7 +2634,6 @@ class ResearchSnapshotRepository(BaseRepository):
                         ORDER BY snapshot_id, schema_name, table_name""",
             (ids,), scope, max_rows=max(2, len(ids) * len(definitions) + 1),
         )
-        expected_keys = [(item["schema"], item["table"]) for item in definitions]
         inputs_by_id: dict[str, list[dict[str, Any]]] = {}
         for row in stored_inputs:
             inputs_by_id.setdefault(str(row["snapshot_id"]), []).append(row)
@@ -2019,7 +2641,13 @@ class ResearchSnapshotRepository(BaseRepository):
             snapshot_id = str(manifest["snapshot_id"])
             rows = inputs_by_id.get(snapshot_id, [])
             stored_by_key = {(row["schema_name"], row["table_name"]): row for row in rows}
-            if len(rows) != len(definitions) or set(stored_by_key) != set(expected_keys):
+            expected_definitions = self._input_definition_for_stored_rows(
+                rows, definitions,
+            )
+            if expected_definitions is None:
+                expected_keys = [
+                    (item["schema"], item["table"]) for item in definitions
+                ]
                 add(snapshot_id, {
                     "snapshot_input_manifest_incomplete": {
                         "expected": expected_keys, "stored": sorted(stored_by_key),
@@ -2030,6 +2658,10 @@ class ResearchSnapshotRepository(BaseRepository):
                 # persisted input hash has always been defined over the
                 # original input-manifest columns, excluding that grouping
                 # column; keep the historical hash contract unchanged.
+                expected_keys = [
+                    (item["schema"], item["table"])
+                    for item in expected_definitions
+                ]
                 ordered = [
                     {key: row[key] for key in row if key != "snapshot_id"}
                     for key in expected_keys

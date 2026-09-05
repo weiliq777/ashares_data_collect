@@ -106,8 +106,43 @@ def test_snapshot_code_batches_stay_below_statement_deadline_budget():
     source = __import__("pathlib").Path(
         "data_collect/data_access/repository/research_snapshot_repository.py"
     ).read_text(encoding="utf-8")
-    assert "SNAPSHOT_CODE_BATCH_SIZE = 500" in source
+    assert "SNAPSHOT_CODE_BATCH_SIZE = 100" in source
     assert "LINEAGE_CODE_BATCH_SIZE = 1_000" in source
+
+
+def test_snapshot_code_operation_splits_only_statement_timeout():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    calls = []
+    successful = []
+
+    def operation(batch):
+        calls.append(tuple(batch))
+        if len(batch) > 2:
+            raise RuntimeError("canceling statement due to statement timeout")
+        successful.append(tuple(batch))
+        return len(batch)
+
+    result = repository._run_adaptive_code_operation(
+        ("A", "B", "C", "D", "E", "F", "G"),
+        operation,
+        minimum_batch_size=2,
+    )
+
+    assert result == 7
+    assert calls[0] == ("A", "B", "C", "D", "E", "F", "G")
+    assert any(len(batch) > 2 for batch in calls[1:])
+    assert all(len(batch) <= 2 for batch in successful)
+    assert sorted(code for batch in successful for code in batch) == list("ABCDEFG")
+
+
+def test_snapshot_code_operation_does_not_split_non_timeout_error():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+
+    def operation(batch):
+        raise RuntimeError("invalid source row")
+
+    with pytest.raises(RuntimeError, match="invalid source row"):
+        repository._run_adaptive_code_operation(("A", "B", "C"), operation)
 
 
 def test_snapshot_uses_contract_base_adjusted_price_and_lineage_hash():
@@ -342,6 +377,30 @@ def test_foundation_inputs_declare_v1_compatibility_and_v2_financial_sources():
     assert "FROM feature.company_financial_v1 c" in _stock_snapshot_sql()
 
 
+def test_snapshot_input_manifest_accepts_only_the_explicit_legacy_foundation_set():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    definitions = [
+        {"schema": "pit", "table": "universe_daily"},
+        {"schema": "feature", "table": "company_financial_v2"},
+        {"schema": "feature", "table": "company_financial_v1"},
+    ]
+    legacy_rows = [
+        {"schema_name": "pit", "table_name": "universe_daily"},
+        {"schema_name": "feature", "table_name": "company_financial_v2"},
+    ]
+    selected = repository._input_definition_for_stored_rows(
+        legacy_rows, definitions,
+    )
+    assert [(item["schema"], item["table"]) for item in selected] == [
+        ("pit", "universe_daily"),
+        ("feature", "company_financial_v2"),
+    ]
+    assert repository._input_definition_for_stored_rows(
+        [{"schema_name": "pit", "table_name": "universe_daily"}],
+        definitions,
+    ) is None
+
+
 def test_foundation_lineage_points_financial_group_to_selected_v2_record():
     sql = ResearchSnapshotRepository.lineage_sql(foundation=True)
     assert "'feature.company_financial_v2', COALESCE" in sql
@@ -391,6 +450,24 @@ def test_lineage_bundle_preserves_ten_groups_and_is_replay_safe():
     assert "encode(universe_identity_hash, 'hex')" in sql
     assert "ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE" in sql
     assert "INSERT INTO research.snapshot_lineage\n" not in sql
+
+
+def test_legacy_lineage_bundle_is_format_migration_only():
+    sql = ResearchSnapshotRepository.legacy_lineage_bundle_sql()
+    lower = sql.lower()
+    assert "from research.snapshot_lineage l" in lower
+    assert "select unnest(%s::text[]) as ts_code" in lower
+    assert "join codes c" in lower
+    assert "l.ts_code=any(p.codes)" not in lower
+    assert "research.stock_snapshot_daily" not in lower
+    assert "insert into research.lineage_source_record" in lower
+    assert "insert into research.snapshot_lineage_bundle" in lower
+    assert "count(*)=10" in lower
+    assert "count(distinct field_group)=10" in lower
+    assert "source_table <> 'feature.company_financial_v2'" not in lower
+    assert "on conflict (source_identity_hash) do nothing" in lower
+    assert "on conflict (research_date, snapshot_id, ts_code) do update" in lower
+    assert "insert into research.snapshot_lineage\n" not in lower
 
 
 def test_lineage_target_defaults_legacy_and_selects_v2_manifest():

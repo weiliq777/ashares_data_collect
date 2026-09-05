@@ -185,21 +185,51 @@ class RebuildGateway:
         escape hatch. Both targets are checked against concrete policies and
         the operation remains one statement/one short Kernel transaction.
         """
+        return self._run_snapshot_lineage_bundle(
+            sql, plan, context, params,
+            operation_name="run_snapshot_lineage_bundle",
+            required_source=None,
+        )
+
+    def run_snapshot_lineage_bundle_from_legacy(
+        self, sql: str, plan: SqlPlan, context: RunContext, params=None,
+    ) -> int:
+        """Convert one bounded legacy lineage slice into a v2 bundle.
+
+        This is a deliberately separate named operation.  It permits only the
+        fixed two-target dictionary/bundle statement whose read source is the
+        immutable ``research.snapshot_lineage`` table.  It never rebuilds or
+        updates ``research.stock_snapshot_daily`` and is therefore a format
+        migration, not a snapshot rebuild or a generic SQL escape hatch.
+        """
+        return self._run_snapshot_lineage_bundle(
+            sql, plan, context, params,
+            operation_name="run_snapshot_lineage_bundle_from_legacy",
+            required_source="research.snapshot_lineage",
+        )
+
+    def _run_snapshot_lineage_bundle(
+        self,
+        sql: str,
+        plan: SqlPlan,
+        context: RunContext,
+        params,
+        *,
+        operation_name: str,
+        required_source: str | None,
+    ) -> int:
         if not isinstance(plan, SqlPlan):
-            raise TypeError("run_snapshot_lineage_bundle requires SqlPlan")
+            raise TypeError(f"{operation_name} requires SqlPlan")
         if plan.target != "research.snapshot_lineage_bundle":
             raise ValueError(
-                "run_snapshot_lineage_bundle target must be "
-                "research.snapshot_lineage_bundle"
+                f"{operation_name} target must be research.snapshot_lineage_bundle"
             )
         if plan.operation != Operation.REBUILD or plan.expected_mode != "SET_BASED":
-            raise ValueError(
-                "run_snapshot_lineage_bundle requires REBUILD/SET_BASED"
-            )
+            raise ValueError(f"{operation_name} requires REBUILD/SET_BASED")
         if not isinstance(context, RunContext):
-            raise TypeError("run_snapshot_lineage_bundle requires RunContext")
+            raise TypeError(f"{operation_name} requires RunContext")
         if not isinstance(sql, str) or not sql.strip():
-            raise ValueError("run_snapshot_lineage_bundle SQL must not be empty")
+            raise ValueError(f"{operation_name} SQL must not be empty")
 
         source_plan = SqlPlan(
             operation=Operation.REBUILD,
@@ -209,9 +239,21 @@ class RebuildGateway:
             estimated_rows=max(0, int(plan.estimated_rows or 0) * 10),
             allow_insert_select=True,
         )
+        if required_source:
+            code_scope = plan.scope.codes or ()
+            if not code_scope:
+                raise ValueError(
+                    f"{operation_name} requires a non-empty bounded code scope"
+                )
+            if len(code_scope) > 5_000:
+                raise ValueError(
+                    f"{operation_name} code scope exceeds the 5000-code safety ceiling"
+                )
         self._kernel.query_guard.check(plan)
         self._kernel.query_guard.check(source_plan)
-        self._validate_snapshot_lineage_bundle_sql(sql)
+        self._validate_snapshot_lineage_bundle_sql(
+            sql, required_source=required_source,
+        )
 
         def run_sql() -> int:
             # The dictionary is shared by every snapshot series.  A unique
@@ -226,7 +268,15 @@ class RebuildGateway:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params) if params else ())
-                return int(cur.rowcount or 0)
+                affected = int(cur.rowcount or 0)
+                if required_source and affected != len(plan.scope.codes or ()):
+                    # Raise before Kernel commits so an incomplete legacy
+                    # source slice cannot leave a visible partial bundle.
+                    raise RuntimeError(
+                        f"{operation_name} produced {affected} rows for "
+                        f"{len(plan.scope.codes or ())} requested codes"
+                    )
+                return affected
 
         # Both writes are replay-safe: source rows use DO NOTHING and bundle
         # rows use a deterministic scoped upsert.
@@ -828,8 +878,16 @@ class RebuildGateway:
     # ---- 内部 ----
 
     @staticmethod
-    def _validate_snapshot_lineage_bundle_sql(sql: str) -> None:
-        """Accept only the fixed two-target lineage bundle statement."""
+    def _validate_snapshot_lineage_bundle_sql(
+        sql: str, *, required_source: str | None = None,
+    ) -> None:
+        """Accept only the fixed two-target lineage bundle statement.
+
+        ``required_source`` narrows the named operation further for the
+        legacy-format migration.  The current snapshot builder has a
+        different, fixed source relation and continues to use the original
+        operation without this restriction.
+        """
         normalized = re.sub(r"--[^\n]*|/\*.*?\*/", " ", sql, flags=re.S).strip()
         statements = [part.strip() for part in normalized.split(";") if part.strip()]
         if len(statements) != 1:
@@ -870,6 +928,57 @@ class RebuildGateway:
             )
         if not re.search(r"\bON\s+CONFLICT\b", normalized, re.I):
             raise ValueError("snapshot lineage bundle must be replay-safe")
+        if required_source:
+            source_pattern = rf"\bFROM\s+{re.escape(required_source)}\b"
+            if not re.search(source_pattern, normalized, re.I):
+                raise ValueError(
+                    "snapshot lineage bundle migration must read "
+                    f"{required_source}"
+                )
+            if re.search(
+                r"\b(?:FROM|JOIN)\s+research\.stock_snapshot_daily\b",
+                normalized,
+                re.I,
+            ):
+                raise ValueError(
+                    "legacy lineage migration must not read or rebuild "
+                    "research.stock_snapshot_daily"
+                )
+            # This named operation is a format conversion, not a general
+            # INSERT ... SELECT seam.  Keep its read-side relation set just
+            # as explicit as its two write targets: the immutable legacy
+            # lineage table, the content-addressed dictionary, and CTEs that
+            # belong to this statement.  A future caller cannot quietly add a
+            # wide PIT/Feature or unrelated business-table join to the
+            # migration path and recreate the original write amplification.
+            cte_names = {
+                name.lower()
+                for name in re.findall(
+                    r"(?:\bWITH\s+|,\s*)([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(",
+                    normalized,
+                    re.I,
+                )
+            }
+            read_relations = {
+                relation.lower()
+                for relation in re.findall(
+                    r"\b(?:FROM|JOIN)\s+"
+                    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+                    normalized,
+                    re.I,
+                )
+            }
+            allowed_relations = {
+                required_source.lower(),
+                "research.lineage_source_record",
+                *cte_names,
+            }
+            unexpected_relations = sorted(read_relations - allowed_relations)
+            if unexpected_relations:
+                raise ValueError(
+                    "legacy lineage migration read relations must be limited to "
+                    f"{sorted(allowed_relations)}; found={unexpected_relations}"
+                )
 
     @staticmethod
     def _validate_table_fill_sql(sql: str, staging: str) -> None:

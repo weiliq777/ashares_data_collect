@@ -55,6 +55,16 @@ class FakeCursor:
             # PostgreSQL reports rows affected by the final INSERT ... SELECT,
             # not by the preceding COPY.  Simulate that contract for gateway tests.
             self.rowcount = staged_rowcount
+        elif (
+            sql.lstrip().upper().startswith("WITH")
+            and "INSERT INTO research.snapshot_lineage_bundle" in sql
+            and "FROM research.snapshot_lineage" in sql
+            and params
+            and isinstance(params[-1], (list, tuple))
+        ):
+            # The legacy lineage migration validates the final bundle count
+            # before Kernel commits.  Mirror PostgreSQL's final INSERT count.
+            self.rowcount = len(params[-1])
 
     def executemany(self, sql, params_list):
         params_list = list(params_list)

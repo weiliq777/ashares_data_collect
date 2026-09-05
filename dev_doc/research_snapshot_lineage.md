@@ -18,3 +18,11 @@
 `research_snapshot.validate` 除了检查 10 个字段组，还检查所有非 `:missing` 的血缘记录必须同时具有 `source_record_version` 和 `source_payload_hash`。快照构建仍使用 `REPEATABLE READ`，验证失败必须重新构建。
 
 测试口径：当前新增血缘及冻结前质量/基线复核测试后，`tests/test_research_snapshot.py` 单独 7 个测试；与 `tests/test_phase2_business_rules.py` 合并运行共 13 个测试。正式 FROZEN 快照应使用干净 Git commit，dirty 工作区只保留为补救审计信息。
+
+## 2026-09 紧凑血缘格式迁移实现契约
+
+- 本入口只适用于已经物化了 `research.stock_snapshot_daily`（股票研究快照表）和 `research.snapshot_lineage`（v1 旧血缘表）的 Foundation-v2 快照；它是物理格式转换，不是 Snapshot（研究快照）重建。
+- 迁移通过 `ResearchSnapshotRepository`（研究快照仓储）的集合式 SQL，读取旧血缘的十个逻辑字段组，并以有限的 `ts_code`（证券代码）批次写入 `research.lineage_source_record`（来源记录字典）和 `research.snapshot_lineage_bundle`（紧凑血缘包）。旧血缘、股票快照和 `snapshot_input`（快照输入清单）在迁移期间保持不变。
+- `RebuildGateway.run_snapshot_lineage_bundle_from_legacy`（从旧血缘生成紧凑血缘包的重建网关操作）只允许这两个写入目标、旧血缘/来源字典及本语句 CTE；不得借此增加 PIT/Feature（时点层/特征层）连接或通用 SQL 执行能力。
+- 每个代码批次必须通过 `QueryGuard`（查询守卫）、`TransactionManager`（事务管理器）和 `RetryPolicy`（重试策略）控制；写入行数必须等于请求代码数，缺失或不完整的十组来源会在提交前失败并回滚。
+- 没有既有股票快照和旧血缘的 DRAFT（草稿）日期必须走正常的 Foundation-v2 Snapshot 构建器；迁移入口不得隐式创建或重建它们。旧 v1 血缘只有在整组迁移、等价性验收、冻结和引用审计完成后才可归档或删除。

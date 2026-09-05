@@ -33,6 +33,8 @@ from data_collect.data_access.context import (
 from data_collect.data_access.chunk_planner import ChunkConfig
 from data_collect.data_access.transaction_manager import TransactionConfig
 from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.dataset_repository import DatasetRepository
+from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
 from tests._fake_db import FakeConnection
 
 from tests.test_data_access_core import (
@@ -378,6 +380,12 @@ def test_bulk_insert_resumes_after_last_committed_checkpoint(monkeypatch):
     state = store.load(ctx().run_id, ctx().job_name, scope_key)
     assert state is not None and state.cursor == 3 and state.done is True
 
+    replayed.clear()
+    kernel.write.bulk_insert(
+        ctx(), write_scope, "ops.source_registry", rows, restart_checkpoint=True
+    )
+    assert replayed == [("s0", "s1"), ("s2", "s3"), ("s4",)]
+
 
 def test_snapshot_manifest_transition_is_guarded_and_typed():
     kernel, conn = make_kernel(build_default_registry())
@@ -403,6 +411,87 @@ def test_snapshot_manifest_allows_building_metadata_update():
         ("BUILDING",), "BUILDING", {"input_manifest_hash": "a" * 64},
     )
     assert changed == 0
+
+
+def test_dataset_manifest_transition_casts_dataset_uuid():
+    kernel, conn = make_kernel(build_default_registry())
+    kernel.write.transition_dataset_manifest(
+        ctx(), WorkScope(partition="dataset-1", dimensions={"dataset_id": "dataset-1"}),
+        "00000000-0000-0000-0000-000000000001", ("DRAFT",), "BUILDING", {},
+    )
+    sql = next(item["sql"] for item in conn.executed if item["kind"] == "execute")
+    assert "m.dataset_id=v.dataset_id::uuid" in sql
+
+
+def test_dataset_manifest_transition_casts_nullable_timestamps():
+    kernel, conn = make_kernel(build_default_registry())
+    kernel.write.transition_dataset_manifest(
+        ctx(), WorkScope(partition="dataset-1", dimensions={"dataset_id": "dataset-1"}),
+        "00000000-0000-0000-0000-000000000001", ("DRAFT",), "BUILDING",
+        {"failure_reason": None, "failed_at": None},
+    )
+    sql = next(item["sql"] for item in conn.executed if item["kind"] == "execute")
+    assert "failed_at=v.failed_at::timestamp" in sql
+
+
+def test_dataset_member_statistics_use_update_only():
+    kernel, conn = make_kernel(build_default_registry())
+    kernel.write.update_dataset_member_stats(
+        ctx(), WorkScope(partition="dataset-1", dimensions={"dataset_id": "dataset-1"}),
+        "00000000-0000-0000-0000-000000000001", date(2021, 8, 2),
+        {"execution_row_count": 10, "quality_status": "VALID"},
+    )
+    sql = next(item["sql"] for item in conn.executed if item["kind"] == "execute")
+    assert sql.startswith("UPDATE backtest.dataset_member SET")
+    assert "INSERT INTO backtest.dataset_member" not in sql
+    assert "dm.status <> 'FROZEN'" in sql
+
+
+def test_dataset_member_statistics_batch_builds_placeholders_per_column_and_chunk():
+    kernel, conn = make_kernel(build_default_registry(), max_rows=1)
+    rows = [
+        {
+            "dataset_id": "00000000-0000-0000-0000-000000000001",
+            "research_date": date(2021, 8, day),
+            "observation_row_count": 10 + day,
+            "execution_row_count": 20 + day,
+            "execution_hash": f"hash-{day}",
+            "corporate_action_hash": f"action-{day}",
+            "quality_status": "VALID",
+        }
+        for day in (2, 3)
+    ]
+
+    kernel.write.update_dataset_member_stats_batch(
+        ctx(), WorkScope(partition="dataset-1"), rows,
+    )
+
+    updates = [
+        item for item in conn.executed
+        if item["kind"] == "execute"
+        and item["sql"].startswith("UPDATE backtest.dataset_member AS m SET")
+    ]
+    assert len(updates) == 2
+    assert all("INSERT INTO backtest.dataset_member" not in item["sql"] for item in updates)
+    assert all(item["sql"].count("%s") == len(rows[0]) for item in updates)
+    assert all(len(item["params"]) == len(rows[0]) for item in updates)
+
+
+def test_dataset_validation_queries_use_their_actual_repository_sources():
+    kernel, _ = make_kernel(build_default_registry())
+    repository = DatasetRepository(kernel)
+    calls = []
+
+    def fake_repository_query(context, source, sql, params, scope, max_rows):
+        calls.append((source, sql))
+        return [{"value": 0}]
+
+    kernel.read._repository_query = fake_repository_query
+    result = repository.validation_counts("dataset-1", ctx())
+
+    assert result and len(calls) == len(result)
+    assert all(source != "backtest.dataset_validation" for source, _ in calls)
+    assert all(f"FROM {source}" in sql for source, sql in calls)
 
 
 def test_snapshot_manifest_transition_casts_json_quality_report():
@@ -815,6 +904,124 @@ def test_snapshot_lineage_bundle_rejects_unapproved_dml_target():
             plan,
             ctx(),
         )
+
+
+def test_legacy_lineage_bundle_operation_requires_legacy_source_and_two_targets():
+    kernel, conn = make_kernel(build_default_registry())
+    scope = WorkScope(
+        date_from=date(2026, 1, 1), date_to=date(2026, 1, 1),
+        codes=("000001.SZ",), partition="snapshot-lineage-legacy",
+        dimensions={"snapshot_id": "snapshot-id"},
+    )
+    plan = SqlPlan(
+        operation=Operation.REBUILD,
+        target="research.snapshot_lineage_bundle",
+        scope=scope,
+        expected_mode="SET_BASED",
+        estimated_rows=1,
+        allow_insert_select=True,
+    )
+    sql = """
+        WITH legacy AS (
+            SELECT snapshot_id, research_date, ts_code
+              FROM research.snapshot_lineage
+        ), inserted_source AS (
+            INSERT INTO research.lineage_source_record
+                (source_identity_hash, source_table, source_record_key)
+            VALUES (decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'hex'), 'x', 'y')
+            ON CONFLICT DO NOTHING
+            RETURNING source_ref_id
+        )
+        INSERT INTO research.snapshot_lineage_bundle
+            (snapshot_id, research_date, ts_code,
+             universe_source_ref_id, tradeability_source_ref_id,
+             price_source_ref_id, valuation_source_ref_id,
+             financial_source_ref_id, shareholder_return_source_ref_id,
+             lifecycle_source_ref_id, instrument_source_ref_id,
+             market_facts_source_ref_id, fundamental_history_source_ref_id,
+             source_bundle_hash)
+        SELECT l.snapshot_id, l.research_date, l.ts_code,
+               i.source_ref_id, i.source_ref_id, i.source_ref_id, i.source_ref_id,
+               i.source_ref_id, i.source_ref_id, i.source_ref_id, i.source_ref_id,
+               i.source_ref_id, i.source_ref_id, repeat('a', 64)::char(64)
+          FROM legacy l CROSS JOIN inserted_source i
+        ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE
+            SET source_bundle_hash=EXCLUDED.source_bundle_hash
+    """
+
+    kernel.rebuild.run_snapshot_lineage_bundle_from_legacy(
+        sql, plan, ctx(), ("snapshot-id", date(2026, 1, 1), ["000001.SZ"]),
+    )
+
+    assert conn.committed == 1
+    assert any("research.snapshot_lineage" in e["sql"] for e in conn.executed)
+
+
+def test_legacy_lineage_bundle_operation_rejects_snapshot_rebuild_source():
+    kernel, _ = make_kernel(build_default_registry())
+    scope = WorkScope(
+        date_from=date(2026, 1, 1), codes=("000001.SZ",),
+        dimensions={"snapshot_id": "snapshot-id"},
+    )
+    plan = SqlPlan(
+        operation=Operation.REBUILD,
+        target="research.snapshot_lineage_bundle",
+        scope=scope,
+        expected_mode="SET_BASED",
+        estimated_rows=1,
+        allow_insert_select=True,
+    )
+    sql = """
+        WITH inserted_source AS (
+            INSERT INTO research.lineage_source_record
+                (source_identity_hash, source_table, source_record_key)
+            VALUES (decode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'hex'), 'x', 'y')
+            ON CONFLICT DO NOTHING
+            RETURNING source_ref_id
+        )
+        INSERT INTO research.snapshot_lineage_bundle
+            (snapshot_id, research_date, ts_code,
+             universe_source_ref_id, tradeability_source_ref_id,
+             price_source_ref_id, valuation_source_ref_id,
+             financial_source_ref_id, shareholder_return_source_ref_id,
+             lifecycle_source_ref_id, instrument_source_ref_id,
+             market_facts_source_ref_id, fundamental_history_source_ref_id,
+             source_bundle_hash)
+        SELECT '00000000-0000-0000-0000-000000000000'::uuid, DATE '2026-01-01', '000001.SZ',
+               source_ref_id, source_ref_id, source_ref_id, source_ref_id,
+               source_ref_id, source_ref_id, source_ref_id, source_ref_id,
+               source_ref_id, source_ref_id, repeat('a', 64)::char(64)
+          FROM inserted_source
+        ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE
+            SET source_bundle_hash=EXCLUDED.source_bundle_hash
+    """
+    with pytest.raises(ValueError, match="must read research.snapshot_lineage"):
+        kernel.rebuild.run_snapshot_lineage_bundle_from_legacy(sql, plan, ctx())
+
+
+def test_legacy_lineage_bundle_operation_rejects_unapproved_read_relation():
+    kernel, _ = make_kernel(build_default_registry())
+    scope = WorkScope(
+        date_from=date(2026, 1, 1), codes=("000001.SZ",),
+        dimensions={"snapshot_id": "snapshot-id"},
+    )
+    plan = SqlPlan(
+        operation=Operation.REBUILD,
+        target="research.snapshot_lineage_bundle",
+        scope=scope,
+        expected_mode="SET_BASED",
+        estimated_rows=1,
+        allow_insert_select=True,
+    )
+    sql = ResearchSnapshotRepository.legacy_lineage_bundle_sql()
+    sql = sql.replace(
+        "FROM research.snapshot_lineage l",
+        "FROM research.snapshot_lineage l "
+        "JOIN public.unrelated_large_table x ON FALSE",
+        1,
+    )
+    with pytest.raises(ValueError, match="read relations must be limited"):
+        kernel.rebuild.run_snapshot_lineage_bundle_from_legacy(sql, plan, ctx())
 
 
 def test_lineage_v2_prepare_is_a_bounded_named_manifest_operation():

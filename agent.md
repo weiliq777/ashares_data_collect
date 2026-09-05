@@ -100,3 +100,7 @@ uv run python tools/check_data_access_contract.py
 - v2 血缘包哈希必须基于十个来源内容身份哈希，不得依赖自增 `source_ref_id`；来源字典写入使用事务级互斥，保证不同快照系列并发构建时引用解析稳定。
 - 紧凑血缘切换只重建 Research Snapshot 子表；Raw（原始层）、Standard（标准层）、PIT（时点层）和 Feature（特征层）是只读输入，不得因快照物理优化而重跑。
 - 任何大表优化先做有界分批、短事务、Explain（执行计划）和等价性校验；不可因速度问题绕过 Repository（仓储）→ DataAccessKernel（数据访问内核）、冻结保护或输入哈希。
+- 旧格式迁移必须直接读取已存在的 `research.snapshot_lineage`（旧血缘表）并按有限代码批次聚合到 v2；不得调用完整 Snapshot（研究快照）构建器，不得改写 `stock_snapshot_daily`（股票快照表）或上游层。来源不完整时整批回滚并失败关闭。
+- 没有既有股票快照/旧血缘的 `DRAFT`（草稿）日期不属于格式迁移，必须走正常的 v2 Snapshot 构建路径；迁移入口不得为了“补齐”而隐式重建上游数据。
+- 旧血缘迁移按有限 `ts_code`（证券代码）集合分批；代码集合必须以可下推到 `(snapshot_id, research_date, ts_code, field_group)` 索引的连接条件进入 SQL。禁止使用只在索引扫描后过滤的数组谓词，避免同一交易日旧血缘被每个代码批次重复扫描。
+- 格式迁移的验收必须验证旧血缘十组、紧凑血缘包行数和来源字典引用；不得用当前版本的 `snapshot_input`（快照输入清单）定义反向否定历史快照，也不得为了通过验收补写或改写历史输入清单。

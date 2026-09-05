@@ -103,6 +103,7 @@ class WriteGateway:
         scope: WorkScope,
         target: str,
         rows: Sequence[Mapping[str, Any]],
+        restart_checkpoint: bool = False,
     ) -> int:
         if not isinstance(context, RunContext):
             raise TypeError("write.bulk_insert 必须携带 RunContext")
@@ -126,6 +127,12 @@ class WriteGateway:
         scope_key = self._kernel._checkpoint_batch_scope_key(
             "bulk_insert", t, scope, rows
         )
+        if restart_checkpoint:
+            # A caller may have deliberately removed the physical slice
+            # described by this checkpoint.  Clearing only this exact input
+            # batch makes replay explicit without weakening normal immutable
+            # bulk-insert resume behavior elsewhere.
+            self._kernel._checkpoint_clear(context, scope_key)
         resume_after, done = self._kernel._checkpoint_cursor(context, scope_key)
         if done:
             return 0
@@ -788,7 +795,8 @@ class WriteGateway:
         allowed = {
             "failure_reason", "failed_at", "quality_report", "quality_report_hash",
             "calendar_hash", "rules_hash", "execution_hash", "corporate_action_hash",
-            "benchmark_hash", "input_manifest_hash", "code_version", "git_commit",
+            "benchmark_hash", "benchmark_source_manifest", "benchmark_source_manifest_hash",
+            "input_manifest_hash", "code_version", "git_commit",
             "git_dirty", "diff_hash", "code_archive_path", "code_archive_sha256",
             "code_archive_size_bytes", "validated_at", "frozen_at",
         }
@@ -797,10 +805,29 @@ class WriteGateway:
         columns = tuple(sorted(fields))
         values = [dataset_id, *(fields.get(column) for column in columns)]
         placeholders = ", ".join(["%s"] * len(values))
+
+        # A VALUES relation has no knowledge of the target table's column
+        # types.  In particular, a NULL parameter is otherwise inferred as
+        # text and PostgreSQL rejects assignments such as
+        # ``failed_at = v.failed_at``.  Keep the cast at this Gateway
+        # boundary so callers can pass ordinary Python values, including
+        # None, without weakening the manifest state transition contract.
+        type_casts = {
+            "quality_report": "jsonb",
+            "benchmark_source_manifest": "jsonb",
+            "code_archive_size_bytes": "bigint",
+            "git_dirty": "boolean",
+            "failed_at": "timestamp",
+            "validated_at": "timestamp",
+            "frozen_at": "timestamp",
+        }
+
+        def typed_value(column: str) -> str:
+            cast = type_casts.get(column)
+            return f"v.{column}::{cast}" if cast else f"v.{column}"
+
         assignments = ", ".join(
-            f"{column}=v.{column}::jsonb" if column == "quality_report"
-            else f"{column}=v.{column}::bigint" if column == "code_archive_size_bytes"
-            else f"{column}=v.{column}"
+            f"{column}={typed_value(column)}"
             for column in columns
         )
         value_columns = ", ".join(("dataset_id", *columns))
@@ -808,7 +835,7 @@ class WriteGateway:
             "UPDATE backtest.dataset_manifest AS m SET status=%s"
             + (f", {assignments}" if assignments else "")
             + f" FROM (VALUES ({placeholders})) AS v({value_columns})"
-            + " WHERE m.dataset_id=v.dataset_id AND m.status = ANY(%s::text[]) AND m.status <> 'FROZEN'"
+            + " WHERE m.dataset_id=v.dataset_id::uuid AND m.status = ANY(%s::text[]) AND m.status <> 'FROZEN'"
         )
         plan = SqlPlan(operation=Operation.UPSERT, target="backtest.dataset_manifest", scope=scope, expected_mode="ROW_BASED", estimated_rows=1)
         self._kernel.query_guard.check(plan)
@@ -971,7 +998,7 @@ class WriteGateway:
         allowed = {
             "failure_reason", "failed_at", "quality_report", "quality_report_hash", "calendar_hash",
             "rules_hash", "execution_hash", "corporate_action_hash", "benchmark_hash", "input_manifest_hash",
-            "code_version", "git_commit", "git_dirty", "diff_hash",
+            "benchmark_source_manifest", "benchmark_source_manifest_hash", "code_version", "git_commit", "git_dirty", "diff_hash",
         }
         if set(fields) - allowed:
             raise ValueError(f"unsupported Dataset metadata fields: {sorted(set(fields) - allowed)}")
@@ -980,6 +1007,124 @@ class WriteGateway:
         plan = SqlPlan(operation=Operation.UPSERT, target="backtest.dataset_manifest", scope=scope, expected_mode="ROW_BASED", estimated_rows=1)
         self._kernel.query_guard.check(plan)
         return self._kernel._run_chunk(lambda: self._update_snapshot_manifest(sql, [*fields.values(), dataset_id, list(allowed_statuses)]))
+
+    def update_dataset_member_stats(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        dataset_id: str,
+        research_date: Any,
+        fields: Mapping[str, Any],
+    ) -> int:
+        """Update an existing Dataset member's derived build statistics.
+
+        Dataset members are created with required identity columns before the
+        build starts.  This is deliberately UPDATE-only: a partial row must
+        never be synthesized by an Upsert that omits ``research_snapshot_id``
+        or ``member_role``.
+        """
+        if not fields:
+            raise ValueError("Dataset member statistics require fields")
+        allowed = {
+            "observation_row_count", "execution_row_count", "execution_hash",
+            "corporate_action_hash", "quality_status",
+        }
+        if set(fields) - allowed:
+            raise ValueError(
+                f"unsupported Dataset member statistic fields: {sorted(set(fields) - allowed)}"
+            )
+        assignments = ", ".join(
+            f"{validate_table_name(column)}=%s" for column in fields
+        )
+        sql = (
+            f"UPDATE backtest.dataset_member SET {assignments} "
+            "WHERE dataset_id=%s AND research_date=%s "
+            "AND EXISTS (SELECT 1 FROM backtest.dataset_manifest dm "
+            "WHERE dm.dataset_id=backtest.dataset_member.dataset_id "
+            "AND dm.status <> 'FROZEN')"
+        )
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="backtest.dataset_member",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+        params = [*fields.values(), dataset_id, research_date]
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(sql, params)
+        )
+
+    def update_dataset_member_stats_batch(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Update many existing Dataset members without an insert fallback."""
+        if not rows:
+            return 0
+        allowed = {
+            "dataset_id", "research_date", "observation_row_count",
+            "execution_row_count", "execution_hash", "corporate_action_hash",
+            "quality_status",
+        }
+        columns = tuple(rows[0].keys())
+        if set(columns) - allowed or not {"dataset_id", "research_date"} <= set(columns):
+            raise ValueError("Dataset member batch update has unsupported or missing identity fields")
+        if any(tuple(row.keys()) != columns for row in rows):
+            raise ValueError("Dataset member batch update columns must be identical")
+        update_columns = tuple(column for column in columns if column not in {"dataset_id", "research_date"})
+        if not update_columns:
+            raise ValueError("Dataset member batch update requires statistic fields")
+        if set(update_columns) - {
+            "observation_row_count", "execution_row_count", "execution_hash",
+            "corporate_action_hash", "quality_status",
+        }:
+            raise ValueError("Dataset member batch update contains non-statistic fields")
+        value_columns = ", ".join(columns)
+        typed = {
+            "dataset_id": "uuid",
+            "research_date": "date",
+            "observation_row_count": "bigint",
+            "execution_row_count": "bigint",
+        }
+        assignments = ", ".join(
+            f"{column}=v.{column}::{typed[column]}"
+            if column in typed else f"{column}=v.{column}"
+            for column in update_columns
+        )
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="backtest.dataset_member",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=len(rows),
+        )
+        self._kernel.query_guard.check(plan)
+
+        total = 0
+        materialized = list(rows)
+        for chunk in self._kernel.chunk_planner.iter_chunks(materialized):
+            self._kernel._reserve_atomic_chunk(chunk)
+            params = [value for row in chunk for value in (row[column] for column in columns)]
+            chunk_value_sql = ", ".join(
+                "(" + ", ".join("%s" for _ in columns) + ")"
+                for _ in chunk
+            )
+            chunk_sql = (
+                f"UPDATE backtest.dataset_member AS m SET {assignments} "
+                f"FROM (VALUES {chunk_value_sql}) AS v({value_columns}) "
+                "WHERE m.dataset_id=v.dataset_id::uuid "
+                "AND m.research_date=v.research_date::date "
+                "AND EXISTS (SELECT 1 FROM backtest.dataset_manifest dm "
+                "WHERE dm.dataset_id=m.dataset_id AND dm.status <> 'FROZEN')"
+            )
+            total += self._kernel._run_chunk(
+                lambda sql=chunk_sql, params=params: self._update_snapshot_manifest(sql, params)
+            )
+        return total
 
     def _update_snapshot_manifest(self, sql: str, params: Sequence[Any]) -> int:
         conn = self._kernel._db_connection()

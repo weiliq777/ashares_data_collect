@@ -1,10 +1,13 @@
-"""Switch and rebuild one Research Snapshot series to compact lineage v2.
+"""Switch one Research Snapshot series to compact lineage v2.
 
 This is a one-time, pre-freeze migration for an existing Foundation-v2
-series.  It changes only Research Snapshot manifests and children; Raw,
+series.  It changes only the Research Snapshot lineage representation; Raw,
 Standard, PIT and Feature are read-only inputs and are never rebuilt here.
-The operation is resumable: the first metadata/lifecycle switch is atomic,
-and subsequent invocations preserve already VALIDATED v2 snapshots.
+Existing stock snapshot rows are preserved.  Legacy lineage is aggregated
+directly into the compact bundle in bounded code slices.  The operation is
+resumable: already VALIDATED v2 snapshots are skipped.  A date with no
+legacy lineage is treated as an incomplete snapshot and routed to the normal
+v2 builder only for that date.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from uuid import uuid4
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.checkpoint import Checkpoint, PostgresCheckpointStore
 from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
 from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
 from data_collect.data_access.research_contract import is_foundation_schema
 from data_collect.jobs.research_snapshot import (
@@ -35,8 +39,123 @@ from data_collect.jobs.snapshot_series_control import (
 JOB_NAME = "migrate_research_snapshot_lineage_v2"
 
 
-def _quality_mapping(ids: list[str], report: dict, quality_hash: str):
-    return {snapshot_id: (report, quality_hash) for snapshot_id in ids}
+def _validate_legacy_lineage_v2_batch(
+    snapshot_repository: ResearchSnapshotRepository,
+    snapshot_ids: list[str],
+    baseline: tuple,
+    quality_hash: str,
+    context: RunContext,
+) -> None:
+    """Accept the physical lineage conversion without current input drift.
+
+    The ordinary snapshot validator compares ``snapshot_input`` against the
+    current builder definition.  That is correct for a new snapshot, but a
+    format migration must preserve the historical manifest exactly.  This
+    validator checks only the conversion invariants and then uses the normal
+    lifecycle transition.
+    """
+    issues_by_snapshot: dict[str, list[dict]] = {}
+    for snapshot_id in snapshot_ids:
+        manifest = snapshot_repository.manifest(snapshot_id, context)
+        issues = snapshot_repository.check_legacy_lineage_v2(manifest, context)
+        if issues:
+            issues_by_snapshot[snapshot_id] = issues
+            snapshot_repository.mark_failed(
+                snapshot_id,
+                manifest["cutoff"],
+                json.dumps(issues, ensure_ascii=False, default=str),
+                context,
+            )
+        else:
+            snapshot_repository.validate_snapshot(
+                manifest, baseline, quality_hash, [], context,
+            )
+    if issues_by_snapshot:
+        raise RuntimeError(
+            f"legacy lineage v2 validation failed: {issues_by_snapshot}"
+        )
+
+
+def _build_migration_batch(
+    snapshot_repository: ResearchSnapshotRepository,
+    snapshot_ids: list[str],
+    baseline: tuple,
+    quality_report: dict,
+    quality_hash: str,
+    context: RunContext,
+) -> None:
+    """Route legacy rows to conversion and incomplete dates to v2 rebuild.
+
+    The migration must not manufacture lineage for a date that has no old
+    lineage.  Such a date is not a format conversion; it is an incomplete
+    snapshot and may use the ordinary bounded v2 builder.  Complete v2 child
+    data is left untouched and is only sent through the ordinary validator.
+    """
+    legacy_ids: list[str] = []
+    rebuild_ids: list[str] = []
+    for snapshot_id in snapshot_ids:
+        manifest = snapshot_repository.manifest(snapshot_id, context)
+        cutoff = manifest["cutoff"]
+        if snapshot_repository.has_legacy_lineage(snapshot_id, cutoff, context):
+            legacy_ids.append(snapshot_id)
+            continue
+        counts = snapshot_repository.snapshot_materialization_counts(
+            snapshot_id, cutoff, context,
+        )
+        complete_v2 = (
+            counts["stock_rows"] > 0
+            and counts["input_rows"] > 0
+            and counts["bundle_rows"] == counts["stock_rows"]
+        )
+        if not complete_v2:
+            rebuild_ids.append(snapshot_id)
+
+    if legacy_ids:
+        snapshot_repository.materialize_legacy_lineage_v2(legacy_ids, context)
+    if rebuild_ids:
+        build_snapshots_batch(
+            rebuild_ids,
+            baseline=baseline,
+            quality_reports={
+                snapshot_id: (quality_report, quality_hash)
+                for snapshot_id in rebuild_ids
+            },
+        )
+
+
+def _validate_migration_batch(
+    snapshot_repository: ResearchSnapshotRepository,
+    snapshot_ids: list[str],
+    baseline: tuple,
+    quality_report: dict,
+    quality_hash: str,
+    context: RunContext,
+) -> None:
+    """Validate legacy conversions and ordinary v2 repairs separately."""
+    legacy_ids: list[str] = []
+    ordinary_ids: list[str] = []
+    for snapshot_id in snapshot_ids:
+        manifest = snapshot_repository.manifest(snapshot_id, context)
+        if snapshot_repository.has_legacy_lineage(
+            snapshot_id, manifest["cutoff"], context,
+        ):
+            legacy_ids.append(snapshot_id)
+        else:
+            ordinary_ids.append(snapshot_id)
+
+    if legacy_ids:
+        _validate_legacy_lineage_v2_batch(
+            snapshot_repository, legacy_ids, baseline, quality_hash, context,
+        )
+    if ordinary_ids:
+        validate_snapshots_batch(
+            ordinary_ids,
+            baseline=baseline,
+            quality_reports={
+                snapshot_id: (quality_report, quality_hash)
+                for snapshot_id in ordinary_ids
+            },
+        )
 
 
 def run(
@@ -73,6 +192,7 @@ def run(
         pipeline_version="data-foundation-lineage-v2",
     )
     repository = SnapshotSeriesRepository(kernel)
+    snapshot_repository = ResearchSnapshotRepository(kernel)
     monitor = SnapshotSeriesMonitor(repository, context)
     try:
         baseline = _baseline(
@@ -106,7 +226,6 @@ def run(
             if invalid_versions:
                 raise RuntimeError(f"unknown lineage storage versions: {invalid_versions[:10]}")
 
-            ids = [record.snapshot_id for record in report.records]
             v1_ids = [
                 record.snapshot_id for record in report.records
                 if record.lineage_storage_version == "v1"
@@ -126,19 +245,21 @@ def run(
             runner = SnapshotSeriesResume(
                 monitor,
                 checkpoint,
-                build_batch=lambda batch_ids: build_snapshots_batch(
+                build_batch=lambda batch_ids: _build_migration_batch(
+                    snapshot_repository,
                     batch_ids,
-                    baseline=baseline,
-                    quality_reports=_quality_mapping(
-                        batch_ids, quality_report, quality_hash,
-                    ),
+                    baseline,
+                    quality_report,
+                    quality_hash,
+                    context,
                 ),
-                validate_batch=lambda batch_ids: validate_snapshots_batch(
+                validate_batch=lambda batch_ids: _validate_migration_batch(
+                    snapshot_repository,
                     batch_ids,
-                    baseline=baseline,
-                    quality_reports=_quality_mapping(
-                        batch_ids, quality_report, quality_hash,
-                    ),
+                    baseline,
+                    quality_report,
+                    quality_hash,
+                    context,
                 ),
             )
             final_report = runner.run(

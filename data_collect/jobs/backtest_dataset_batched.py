@@ -110,6 +110,22 @@ def _transform_row(row: tuple[Any, ...], dataset_id: str) -> tuple[tuple[Any, ..
     return values, quality
 
 
+def _quality_counter_key(quality: str) -> str:
+    """Map persisted row quality to the bounded per-day counter names."""
+    return "missing" if quality == "MISSING_SOURCE" else quality.lower()
+
+
+def _aggregate_execution_quality(quality_counts: dict[str, int]) -> str:
+    """Derive member quality from the actual persisted execution rows."""
+    if quality_counts.get("INVALID", 0):
+        return "INVALID"
+    if quality_counts.get("MISSING_SOURCE", 0):
+        return "MISSING_SOURCE"
+    if quality_counts.get("WARNING", 0):
+        return "WARNING"
+    return "VALID" if quality_counts.get("VALID", 0) else "MISSING_SOURCE"
+
+
 def _batch_checkpoint(dataset_id: str, batch_start: date, repository: DatasetRepository, context: RunContext) -> dict[str, Any] | None:
     return repository.batch_checkpoint(dataset_id, batch_start, context)
 
@@ -155,10 +171,10 @@ def _build_execution_batch(dataset_id: str, batch_start: date, batch_end: date, 
                 pending.append(dict(zip(columns, values)))
                 batch_hasher.update(values[1:])
                 total += 1
-                stats = per_day.setdefault(values[1], {"hasher": _IncrementalRowHasher(), "count": 0, "missing": 0, "invalid": 0, "warning": 0})
+                stats = per_day.setdefault(values[1], {"hasher": _IncrementalRowHasher(), "count": 0, "valid": 0, "missing": 0, "invalid": 0, "warning": 0})
                 stats["hasher"].update(values[1:])
                 stats["count"] += 1
-                key = "missing" if quality == "MISSING_SOURCE" else quality.lower()
+                key = _quality_counter_key(quality)
                 stats[key] += 1
                 if len(pending) >= 5000:
                     repository.write_execution_rows(pending, context, dataset_id)
@@ -184,14 +200,17 @@ def _finalize_build(dataset_id: str, manifest: dict[str, Any], metadata: dict[st
     members = repository.member_validation_rows(dataset_id, context)
     updates, member_stats = [], []
     for day, _role, snapshot_hash, _status, _schema, obs_count, _exec_count, _exec_hash, _corporate_hash, _quality in members:
-        execution = materialized["execution_by_day"].get(day, {"hasher": _IncrementalRowHasher(), "count": 0})
+        execution = materialized["execution_by_day"].get(
+            day,
+            {"hasher": _IncrementalRowHasher(), "count": 0, "quality_counts": {}},
+        )
         corporate = hash_rows(materialized["dividend_by_day"].get(day, []))
-        updates.append({"dataset_id": dataset_id, "research_date": day, "observation_row_count": obs_count, "execution_row_count": execution["count"], "execution_hash": execution["hasher"].hexdigest(), "corporate_action_hash": corporate, "quality_status": "VALID"})
+        updates.append({"dataset_id": dataset_id, "research_date": day, "observation_row_count": obs_count, "execution_row_count": execution["count"], "execution_hash": execution["hasher"].hexdigest(), "corporate_action_hash": corporate, "quality_status": _aggregate_execution_quality(execution["quality_counts"])})
         member_stats.append((dataset_id, day, snapshot_hash, execution["hasher"].hexdigest(), corporate, execution["count"]))
     if updates:
         repository.update_member_stats(dataset_id, updates, context)
-    input_hash = hash_rows(member_stats + [("calendar", materialized["calendar_hash"]), ("rules", materialized["rules_hash"]), ("execution", materialized["execution_hash"]), ("corporate_action", materialized["corporate_action_hash"]), ("benchmark", materialized["benchmark_hash"]), ("baseline_quality_report", manifest["baseline_quality_report_hash"]), ("baseline_source_manifest", manifest["baseline_source_manifest_hash"]), ("out_of_sample_start", manifest["out_of_sample_start"])])
-    quality = {"execution_rows": sum(item["count"] for item in materialized["execution_by_day"].values()), "calendar_rows": len(materialized["calendar_rows"]), "corporate_action_rows": len(materialized["dividend_rows"]), "rule_rows": len(materialized["rule_rows"]), "benchmark_rows": len(materialized["benchmark_rows"]), "member_count": len(members), "baseline_quality_report_hash": manifest["baseline_quality_report_hash"], "baseline_source_manifest_hash": manifest["baseline_source_manifest_hash"], "benchmark_code": manifest["benchmark_code"], "benchmark_hash": materialized["benchmark_hash"], "out_of_sample_start": manifest["out_of_sample_start"], "input_hash": input_hash, "build_mode": "date_batched_resumable"}
+    input_hash = hash_rows(member_stats + [("calendar", materialized["calendar_hash"]), ("rules", materialized["rules_hash"]), ("execution", materialized["execution_hash"]), ("corporate_action", materialized["corporate_action_hash"]), ("benchmark", materialized["benchmark_hash"]), ("benchmark_source_manifest", manifest.get("benchmark_source_manifest_hash") or ""), ("baseline_quality_report", manifest["baseline_quality_report_hash"]), ("baseline_source_manifest", manifest["baseline_source_manifest_hash"]), ("out_of_sample_start", manifest["out_of_sample_start"])])
+    quality = {"execution_rows": sum(item["count"] for item in materialized["execution_by_day"].values()), "calendar_rows": len(materialized["calendar_rows"]), "corporate_action_rows": len(materialized["dividend_rows"]), "rule_rows": len(materialized["rule_rows"]), "benchmark_rows": len(materialized["benchmark_rows"]), "member_count": len(members), "baseline_quality_report_hash": manifest["baseline_quality_report_hash"], "baseline_source_manifest_hash": manifest["baseline_source_manifest_hash"], "benchmark_code": manifest["benchmark_code"], "benchmark_hash": materialized["benchmark_hash"], "benchmark_source_manifest_hash": manifest.get("benchmark_source_manifest_hash"), "out_of_sample_start": manifest["out_of_sample_start"], "input_hash": input_hash, "build_mode": "date_batched_resumable"}
     repository.update_manifest(
         context, dataset_id, ("BUILDING",), {
             "calendar_hash": materialized["calendar_hash"],
@@ -199,6 +218,8 @@ def _finalize_build(dataset_id: str, manifest: dict[str, Any], metadata: dict[st
             "execution_hash": materialized["execution_hash"],
             "corporate_action_hash": materialized["corporate_action_hash"],
             "benchmark_hash": materialized["benchmark_hash"],
+            "benchmark_source_manifest": _json_param(manifest["benchmark_source_manifest"]) if manifest.get("benchmark_source_manifest") else None,
+            "benchmark_source_manifest_hash": manifest.get("benchmark_source_manifest_hash"),
             "input_manifest_hash": input_hash,
             "quality_report": _json_param(quality),
             "quality_report_hash": _quality_report_hash(quality),
@@ -223,10 +244,23 @@ def _build_dataset_batched(dataset_id: str, *, batch_days: int = 5, force_rebuil
         results = []
         for index, (batch_start, batch_end, _days) in enumerate(batches, start=1):
             checkpoint = _batch_checkpoint(dataset_id, batch_start, repository, context)
-            if not force_rebuild and checkpoint and checkpoint["status"] == "COMPLETED" and checkpoint["batch_end"] == batch_end and checkpoint["code_version"] == metadata["code_version"] and checkpoint["batch_hash"]:
-                results.append({"batch_start": batch_start, "batch_end": batch_end, "rows": checkpoint["row_count"], "skipped": True})
-                _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
-                continue
+            checkpoint_is_eligible = (
+                not force_rebuild
+                and checkpoint
+                and checkpoint["status"] == "COMPLETED"
+                and checkpoint["batch_end"] == batch_end
+                and checkpoint["code_version"] == metadata["code_version"]
+                and checkpoint["batch_hash"]
+            )
+            if checkpoint_is_eligible:
+                expected_rows = int(checkpoint["row_count"] or 0)
+                actual_rows = repository.execution_row_count(
+                    dataset_id, batch_start, batch_end, context
+                )
+                if actual_rows == expected_rows:
+                    results.append({"batch_start": batch_start, "batch_end": batch_end, "rows": expected_rows, "skipped": True})
+                    _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
+                    continue
             results.append(_build_execution_batch(dataset_id, batch_start, batch_end, boundaries, metadata["code_version"], repository, context))
             _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
         repository.rebuild_auxiliary(dataset_id, manifest, boundaries, context)
@@ -237,7 +271,6 @@ def _build_dataset_batched(dataset_id: str, *, batch_days: int = 5, force_rebuil
         kernel.close()
 
 
-@warehouse_write_job
 @warehouse_write_job
 def build_dataset_batched(
     dataset_id: str,

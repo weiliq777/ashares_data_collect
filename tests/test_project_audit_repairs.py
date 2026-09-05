@@ -51,11 +51,11 @@ def test_dataset_materializes_mutable_execution_inputs_from_bounded_raw():
     for token in (
         "limit_source_record_id",
         "FROM tushare_dividend_raw",
-        "FROM tushare_stk_limit_raw",
-        "FROM tushare_suspend_d_raw",
         "mv.dataset='trade_cal'",
     ):
         assert token in source
+    for table in ("tushare_stk_limit_raw", "tushare_suspend_d_raw"):
+        assert f"FROM {table}" in source or f"public.{table}" in source
     assert "交易日历 Raw 血缘不完整" in job_source
     assert "std.security_status_daily" not in source
     assert "pit.security_tradeability_daily" not in source
