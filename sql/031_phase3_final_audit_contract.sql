@@ -88,6 +88,7 @@ BEGIN
         IF NEW.run_id IS DISTINCT FROM OLD.run_id
            OR NEW.dataset_id IS DISTINCT FROM OLD.dataset_id
            OR NEW.strategy_id IS DISTINCT FROM OLD.strategy_id
+           OR NEW.strategy_version IS DISTINCT FROM OLD.strategy_version
            OR NEW.run_version IS DISTINCT FROM OLD.run_version
            OR NEW.initial_cash IS DISTINCT FROM OLD.initial_cash
            OR NEW.max_positions IS DISTINCT FROM OLD.max_positions

@@ -117,6 +117,15 @@ def test_quality_strategy_default_matches_frozen_gap_stress_rule():
     assert "gap_stress_pct=0.05" in source
 
 
+def test_backtest_strategy_version_binding_migration_cuts_over_legacy_fk():
+    source = Path("sql/095_backtest_strategy_version_binding.sql").read_text(encoding="utf-8")
+    assert "DROP CONSTRAINT IF EXISTS run_manifest_strategy_id_fkey" in source
+    assert "run_manifest_strategy_version_fkey" in source
+    assert "REFERENCES backtest.app_strategy_version(strategy_id, strategy_version)" in source
+    assert "assert_run_strategy_binding" in source
+    assert "requires an APPROVED application strategy" in source
+
+
 def test_snapshot_series_keeps_one_snapshot_per_cutoff_date():
     source = Path("data_collect/jobs/research_snapshot_series.py").read_text(encoding="utf-8")
     assert "normalize_cutoff_dates" in source

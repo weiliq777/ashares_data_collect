@@ -304,6 +304,7 @@ CREATE TABLE IF NOT EXISTS backtest.run_manifest (
     run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     dataset_id UUID NOT NULL REFERENCES backtest.dataset_manifest(dataset_id),
     strategy_id VARCHAR(80) NOT NULL REFERENCES backtest.strategy_definition(strategy_id),
+    strategy_version VARCHAR(40),
     run_version VARCHAR(40) NOT NULL,
     initial_cash NUMERIC(20,6) NOT NULL CHECK (initial_cash > 0),
     max_positions INTEGER CHECK (max_positions IS NULL OR max_positions > 0),

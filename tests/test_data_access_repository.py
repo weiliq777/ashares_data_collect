@@ -144,6 +144,18 @@ def test_backtest_run_repository_uses_bulk_insert_for_immutable_strategy():
     assert "ON CONFLICT" not in inserts[0]["sql"]
 
 
+def test_backtest_run_repository_requires_exact_approved_strategy_version():
+    from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(policy_registry=build_default_registry(), connection_factory=lambda: conn)
+    repository = BacktestRunRepository(kernel)
+    assert repository.strategy("strategy-v1", "1", ctx()) is None
+    query = conn.executed[-1]
+    assert "strategy_id=%s AND strategy_version=%s" in query["sql"]
+    assert query["params"] == ("strategy-v1", "1")
+
+
 def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
     from data_collect.data_access.repository.dataset_repository import DatasetRepository
 

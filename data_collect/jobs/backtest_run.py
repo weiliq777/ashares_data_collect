@@ -105,6 +105,7 @@ def register_strategy(strategy: BaseStrategy, code_version: str | None = None,
 def create_run(dataset_id: str, strategy_id: str, config: BacktestConfig,
                run_version: str = "1", code_archive_path: str | None = None,
                *, strategy_hash: str | None = None,
+               strategy_version: str | None = None,
                scenario_config: ScenarioConfig | None = None,
                evaluation_config: EvaluationConfig | None = None) -> str:
     # Repository persists market_rule_version, fee_rule_version and the full
@@ -116,6 +117,8 @@ def create_run(dataset_id: str, strategy_id: str, config: BacktestConfig,
     # 绛栫暐瀹氫箟宸插瓨鍦ㄤ笖涓嶅彲瑕嗙洊 / 姝ｅ紡鍥炴祴蹇呴』鏄惧紡璁剧疆 max_portfolio_risk_pct
     run_id = str(uuid.uuid4())
     metadata = _git_metadata()
+    if not strategy_version or not str(strategy_version).strip():
+        raise ValueError("正式回测必须显式绑定 strategy_version")
     if config.max_portfolio_risk_pct is None and config.allocation_mode != "target_value":
         raise RuntimeError("正式回测必须显式设置 max_portfolio_risk_pct；禁止让组合总风险上限默认为无限")
     if metadata["dirty"] and not code_archive_path:
@@ -141,9 +144,9 @@ def create_run(dataset_id: str, strategy_id: str, config: BacktestConfig,
     kernel, repository, context = _service("create-run")
     try:
         dataset, rule_rows = repository.dataset_rules(dataset_id, context)
-        if repository.strategy(strategy_id, context) is None:
+        if repository.strategy(strategy_id, strategy_version, context) is None:
             raise RuntimeError(
-                f"strategy {strategy_id} is not APPROVED in backtest.app_strategy_version"
+                f"strategy {strategy_id}/{strategy_version} is not APPROVED in backtest.app_strategy_version"
             )
         if dataset["status"] != "FROZEN":
             raise RuntimeError("正式回测只能使用 FROZEN Dataset")
@@ -220,13 +223,15 @@ def create_run(dataset_id: str, strategy_id: str, config: BacktestConfig,
                 )
         if strategy_hash:
             parameters["strategy_hash"] = strategy_hash
+        parameters["strategy_version"] = strategy_version
         if strategy_hash and scenario_config is not None:
             parameters["backtest_fingerprint"] = backtest_fingerprint(
                 strategy_hash, scenario_config.scenario_hash,
                 dataset["input_manifest_hash"], config.execution_model_version,
             )
         repository.create_run({
-            "run_id": run_id, "dataset_id": dataset_id, "strategy_id": strategy_id, "run_version": run_version,
+            "run_id": run_id, "dataset_id": dataset_id, "strategy_id": strategy_id,
+            "strategy_version": strategy_version, "run_version": run_version,
             "initial_cash": config.initial_cash, "max_positions": config.max_positions,
             "max_single_position_pct": config.max_single_position_pct, "max_portfolio_risk_pct": config.max_portfolio_risk_pct,
             "reserve_cash_pct": config.reserve_cash_pct, "market_rule_version": dataset["market_rule_version"],
@@ -289,6 +294,7 @@ def run_frozen_backtest(dataset_id: str, config: BacktestConfig | None = None,
     run_id = create_run(
         dataset_id, strategy_id, config, run_version, code_archive_path,
         strategy_hash=getattr(strategy, "strategy_hash", None),
+        strategy_version=strategy.strategy_version,
         evaluation_config=evaluation_config,
     )
     try:

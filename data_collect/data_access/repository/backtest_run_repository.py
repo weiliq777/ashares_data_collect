@@ -15,13 +15,14 @@ class BacktestRunRepository(BaseRepository):
             dimensions["dataset_id"] = dataset_id
         return WorkScope(partition=key, dimensions=dimensions)
 
-    def strategy(self, strategy_id: str, context: RunContext):
+    def strategy(self, strategy_id: str, strategy_version: str, context: RunContext):
         rows = self.kernel.read._repository_query(
             context, "backtest.app_strategy_version",
             """SELECT strategy_name, strategy_version, parameters_hash, code_version
                  FROM backtest.app_strategy_version
-                WHERE strategy_id=%s AND approval_status='APPROVED'""",
-            (strategy_id,), self._scope(strategy_id), 2,
+                WHERE strategy_id=%s AND strategy_version=%s
+                  AND approval_status='APPROVED'""",
+            (strategy_id, strategy_version), self._scope(strategy_id), 2,
         )
         return rows[0] if rows else None
 
