@@ -144,6 +144,39 @@ def test_backtest_run_repository_uses_bulk_insert_for_immutable_strategy():
     assert "ON CONFLICT" not in inserts[0]["sql"]
 
 
+def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = DatasetRepository(kernel)
+    start, end = date(2025, 1, 2), date(2025, 3, 31)
+
+    repository.bar_page(
+        "dataset-1", ctx(), (date(2025, 1, 31), "000001.SZ"), 100,
+        date_from=start, date_to=end,
+    )
+    repository.observation_page(
+        "dataset-1", ("research_date", "ts_code", "raw_close"), ctx(),
+        (date(2025, 1, 31), "000001.SZ"), 100,
+        date_from=start, date_to=end,
+    )
+
+    bar_query, observation_query = conn.executed[-2:]
+    assert "trade_date >= %s" in bar_query["sql"]
+    assert "trade_date <= %s" in bar_query["sql"]
+    assert bar_query["params"] == (
+        "dataset-1", start, end, date(2025, 1, 31), "000001.SZ",
+    )
+    assert "s.research_date >= %s" in observation_query["sql"]
+    assert "s.research_date <= %s" in observation_query["sql"]
+    assert observation_query["params"] == (
+        "dataset-1", start, end, date(2025, 1, 31), "000001.SZ",
+    )
+
+
 def test_instrument_repository_keeps_legacy_raw_first_seen_only():
     from data_collect.data_access.repository.instrument_repository import InstrumentRepository
 

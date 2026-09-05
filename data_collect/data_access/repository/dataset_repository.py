@@ -826,25 +826,39 @@ class DatasetRepository(BaseRepository):
         )
         return tuple(row["trade_date"] for row in rows)
 
-    def bar_page(self, dataset_id: str, context: RunContext, last_key: tuple | None = None, limit: int = 10_000) -> list[dict[str, Any]]:
+    def bar_page(
+        self, dataset_id: str, context: RunContext,
+        last_key: tuple | None = None, limit: int = 10_000,
+        date_from=None, date_to=None,
+    ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("bar page limit must be between 1 and 50000")
         keyset = "" if last_key is None else " AND (trade_date, ts_code) > (%s, %s)"
-        params = (dataset_id,) if last_key is None else (dataset_id, *last_key)
+        bounds = ""
+        params: tuple[Any, ...] = (dataset_id,)
+        if date_from is not None:
+            bounds += " AND trade_date >= %s"
+            params += (date_from,)
+        if date_to is not None:
+            bounds += " AND trade_date <= %s"
+            params += (date_to,)
+        if last_key is not None:
+            params += tuple(last_key)
         return self.kernel.read._repository_query(
             context, "backtest.dataset_execution_bar",
             f"""SELECT trade_date, ts_code, raw_open, raw_high, raw_low, raw_close,
                               volume, amount, up_limit, down_limit, is_suspended,
                               can_buy, can_sell, limit_status, market
                          FROM backtest.dataset_execution_bar
-                        WHERE dataset_id=%s {keyset}
+                        WHERE dataset_id=%s {bounds} {keyset}
                         ORDER BY trade_date, ts_code LIMIT {int(limit)}""",
-            params, WorkScope(partition=dataset_id), limit,
+            params, WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to), limit,
         )
 
     def observation_page(
         self, dataset_id: str, columns: Sequence[str], context: RunContext,
         last_key: tuple | None = None, limit: int = 10_000,
+        date_from=None, date_to=None,
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("observation page limit must be between 1 and 50000")
@@ -852,7 +866,16 @@ class DatasetRepository(BaseRepository):
             raise ValueError("observation columns must be identifiers")
         selected = ", ".join(f"s.{column}" for column in columns)
         keyset = "" if last_key is None else " AND (s.research_date, s.ts_code) > (%s, %s)"
-        params = (dataset_id,) if last_key is None else (dataset_id, *last_key)
+        bounds = ""
+        params: tuple[Any, ...] = (dataset_id,)
+        if date_from is not None:
+            bounds += " AND s.research_date >= %s"
+            params += (date_from,)
+        if date_to is not None:
+            bounds += " AND s.research_date <= %s"
+            params += (date_to,)
+        if last_key is not None:
+            params += tuple(last_key)
         return self.kernel.read._repository_query(
             context, "backtest.dataset_member",
             f"""SELECT {selected}
@@ -860,9 +883,9 @@ class DatasetRepository(BaseRepository):
                       WHERE s.snapshot_id IN (
                             SELECT research_snapshot_id FROM backtest.dataset_member
                              WHERE dataset_id=%s
-                      ){keyset}
+                      ){bounds}{keyset}
                       ORDER BY s.research_date, s.ts_code LIMIT {int(limit)}""",
-            params, WorkScope(partition=dataset_id), limit,
+            params, WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to), limit,
         )
 
     def load_dividends(self, dataset_id: str, context: RunContext) -> list[tuple]:

@@ -28,6 +28,7 @@ from .risk import (
     check_liquidity,
     open_position_stop_risk,
     size_position,
+    size_target_position,
 )
 
 
@@ -62,6 +63,11 @@ class BacktestConfig:
     exit_slippage_bps: float | None = None
     gap_stress_pct: float = 0.0
     monte_carlo_method: str = "bootstrap_with_replacement"
+    # ``risk`` 保持旧策略默认行为；V1 场景显式使用 target_value，避免把
+    # 目标仓位错误地塞进止损风险公式。
+    allocation_mode: str = "risk"
+    target_position_ratio: float | None = None
+    max_entry_position_ratio: float | None = None
 
     def __post_init__(self):
         if self.initial_cash <= 0 or not 0 < self.risk_pct < 1:
@@ -72,6 +78,15 @@ class BacktestConfig:
             raise ValueError("max_portfolio_risk_pct 必须在 (0,1] 内")
         if not 0 <= self.reserve_cash_pct < 1:
             raise ValueError("reserve_cash_pct 必须在 [0,1) 内")
+        if self.allocation_mode not in {"risk", "target_value"}:
+            raise ValueError("allocation_mode 只支持 risk 或 target_value")
+        if self.allocation_mode == "target_value":
+            if self.target_position_ratio is None or self.max_entry_position_ratio is None:
+                raise ValueError("target_value 模式必须显式设置 target/max_entry_position_ratio")
+            if not 0 < self.target_position_ratio <= self.max_entry_position_ratio <= 1:
+                raise ValueError("目标仓位比例必须满足 0 < target <= max_entry <= 1")
+        elif self.target_position_ratio is not None or self.max_entry_position_ratio is not None:
+            raise ValueError("risk 模式不应携带目标仓位参数")
         self.resolved_risk_policy()
         if self.monte_carlo_method not in {"bootstrap_with_replacement", "permutation_without_replacement"}:
             raise ValueError("monte_carlo_method 不受支持")
@@ -396,6 +411,9 @@ class BacktestEngine:
         run_id: str | None = None,
     ) -> BacktestResult:
         self._reset()
+        reset_strategy = getattr(strategy, "reset_state", None)
+        if callable(reset_strategy):
+            reset_strategy()
         self._id_namespace = str(run_id or dataset.dataset_id)
         self._dataset = dataset
         next_by_date = {day: dataset.next_trade_date(day) for day in dataset.calendar}
@@ -425,16 +443,29 @@ class BacktestEngine:
                 if raw_close is not None and raw_close > 0:
                     self._last_close[observation.ts_code] = float(raw_close)
 
+            # Strategy state is updated during warmup as well.  The strategy
+            # itself only receives frozen Dataset rows and a bounded daily bar;
+            # it never needs to rescan the historical database.
+            on_day = getattr(strategy, "on_day", None)
+            if callable(on_day):
+                on_day(current_day, dataset.observations_for(current_day), dataset)
+
             next_day = next_by_date.get(current_day)
             if dataset.evaluation_start <= current_day <= dataset.evaluation_end:
                 positions_view = self._positions_view()
                 if next_day is not None and next_day <= dataset.evaluation_end:
-                    signals = strategy.generate_signals(
-                        current_day, dataset.observations_for(current_day), positions_view
+                    is_signal_day = getattr(strategy, "is_signal_day", None)
+                    should_signal = (
+                        bool(is_signal_day(current_day, dataset.calendar))
+                        if callable(is_signal_day) else True
                     )
-                    self._create_signals_and_orders(current_day, next_day, signals, dataset)
+                    if should_signal:
+                        signals = strategy.generate_signals(
+                            current_day, dataset.observations_for(current_day), positions_view
+                        )
+                        self._create_signals_and_orders(current_day, next_day, signals, dataset)
                 else:
-                    self._warnings.append(f"{current_day}: evaluation শেষ日没有下一交易日，信号不创建订单")
+                    self._warnings.append(f"{current_day}: 评价结束日没有下一交易日，信号不创建订单")
                 self._record_daily(current_day, dataset)
 
         for order in self._pending_orders:
@@ -494,8 +525,31 @@ class BacktestEngine:
             shares = sum(lot.remaining_shares for lot in active)
             average = sum(lot.remaining_shares * lot.cost_price for lot in active) / shares
             view[code] = {"hold_shares": shares, "average_cost": average,
-                          "lots": tuple(active)}
+                          "lots": tuple(active),
+                          # PENDING is the database-compatible order state;
+                          # retryable_sell distinguishes a deferred sell from
+                          # an ordinary one-shot pending order.
+                          "pending_exit": any(
+                              order["ts_code"] == code
+                              and order["direction"] == "SELL"
+                              and order["status"] == "PENDING"
+                              and bool(order.get("retryable_sell"))
+                              for order in self._pending_orders
+                          )}
         return view
+
+    def _position_count_after_pending_sells(self) -> int:
+        """计算已排队卖单成交后预计剩余的持仓数。
+
+        周度调仓可以在同一批次同时产生替换卖单和买单。创建订单时先扣除
+        已排队卖出的代码，T+1 执行阶段仍会按真实卖出结果再次校验。
+        """
+        active_codes = set(self._positions_view())
+        queued_sells = {
+            order["ts_code"] for order in self._pending_orders
+            if order["status"] == "PENDING" and order["direction"] == "SELL"
+        }
+        return len(active_codes - queued_sells)
 
     def _current_risk_amount(self, day: date, dataset: BacktestDataset) -> float:
         total = 0.0
@@ -828,7 +882,11 @@ class BacktestEngine:
                 signal["status"] = "IGNORED"
                 continue
             bar = dataset.bar(next_day, intent.ts_code)
-            if bar is None:
+            retryable_sell = (
+                intent.direction == "SELL"
+                and bool(dict(intent.reason).get("retryable_sell"))
+            )
+            if bar is None and not retryable_sell:
                 signal["status"] = "NO_EXECUTION_BAR"
                 continue
             order = {
@@ -849,6 +907,8 @@ class BacktestEngine:
                 "reference_price": intent.raw_reference_price,
                 "stop_loss_price_raw": intent.stop_loss_price_raw,
                 "status": "PENDING", "reject_reason": None,
+                "retryable_sell": retryable_sell,
+                "retry_count": 0,
             }
             if intent.direction == "SELL":
                 shares = self._position_shares().get(intent.ts_code, 0)
@@ -865,32 +925,50 @@ class BacktestEngine:
                 if intent.ts_code in self._positions_view():
                     order["status"] = "REJECTED"
                     order["reject_reason"] = "已有持仓，禁止重复买入/向下摊平"
-                elif len(self._positions_view()) >= self.config.max_positions:
+                elif self._position_count_after_pending_sells() >= self.config.max_positions:
                     order["status"] = "REJECTED"
                     order["reject_reason"] = "达到最大持仓数"
-                elif intent.raw_reference_price is None or intent.stop_loss_price_raw is None:
+                elif intent.raw_reference_price is None:
                     order["status"] = "REJECTED"
-                    order["reject_reason"] = "缺少原始价格或原始坐标止损价"
+                    order["reject_reason"] = "缺少原始价格"
                 else:
                     # 数量按实际成交日的规则/费用预算，避免规则在 T+1 生效切换时使用旧版本。
                     market_rule, fee_rule = self._rules_for(next_day, intent.ts_code, dataset)
                     closing_equity = self._current_equity(day, dataset)
-                    sizing = size_position(
-                        available_cash=self._investable_cash(closing_equity),
-                        risk_pct=self.config.risk_pct,
-                        entry_price=float(intent.raw_reference_price),
-                        stop_loss_price=float(intent.stop_loss_price_raw),
-                        fee_rule=fee_rule,
-                        market_rule=market_rule,
-                        equity_base=closing_equity,
-                        max_position_value=closing_equity * self.config.max_single_position_pct,
-                        max_risk_amount=(
-                            closing_equity * self.config.max_portfolio_risk_pct
-                            - self._current_risk_amount(day, dataset)
-                            if self.config.max_portfolio_risk_pct is not None else None
-                        ),
-                        risk_policy=self.config.resolved_risk_policy(fee_rule),
-                    )
+                    if self.config.allocation_mode == "target_value":
+                        sizing = size_target_position(
+                            available_cash=self._investable_cash(closing_equity),
+                            equity_base=closing_equity,
+                            entry_price=float(intent.raw_reference_price),
+                            target_position_ratio=float(self.config.target_position_ratio),
+                            max_position_ratio=float(self.config.max_entry_position_ratio),
+                            fee_rule=fee_rule,
+                            market_rule=market_rule,
+                            risk_policy=self.config.resolved_risk_policy(fee_rule),
+                        )
+                    else:
+                        if intent.stop_loss_price_raw is None:
+                            order["status"] = "REJECTED"
+                            order["reject_reason"] = "风险仓位模式缺少原始坐标止损价"
+                            self._orders.append(order)
+                            signal["status"] = "REJECTED"
+                            continue
+                        sizing = size_position(
+                            available_cash=self._investable_cash(closing_equity),
+                            risk_pct=self.config.risk_pct,
+                            entry_price=float(intent.raw_reference_price),
+                            stop_loss_price=float(intent.stop_loss_price_raw),
+                            fee_rule=fee_rule,
+                            market_rule=market_rule,
+                            equity_base=closing_equity,
+                            max_position_value=closing_equity * self.config.max_single_position_pct,
+                            max_risk_amount=(
+                                closing_equity * self.config.max_portfolio_risk_pct
+                                - self._current_risk_amount(day, dataset)
+                                if self.config.max_portfolio_risk_pct is not None else None
+                            ),
+                            risk_policy=self.config.resolved_risk_policy(fee_rule),
+                        )
                     order.update(sizing.as_dict())
                     order["requested_shares"] = sizing.planned_shares
                     if not sizing.eligible:
@@ -908,7 +986,10 @@ class BacktestEngine:
                 signal["status"] = "REJECTED"
 
     def _execute_pending_orders(self, day: date, dataset: BacktestDataset):
-        pending = [order for order in self._pending_orders if order["status"] == "PENDING" and order["order_date"] == day]
+        pending = [
+            order for order in self._pending_orders
+            if order["status"] == "PENDING" and order["order_date"] == day
+        ]
         pending.sort(
             key=lambda item: (
                 0 if item["direction"] == "SELL" else 1,
@@ -919,7 +1000,10 @@ class BacktestEngine:
         for order in pending:
             bar = dataset.bar(day, order["ts_code"])
             if bar is None or not bar.has_execution_prices or bar.is_suspended:
-                self._reject_order(order, "缺少有效执行行情或停牌")
+                if order.get("retryable_sell"):
+                    self._defer_sell_order(order, day, dataset, "缺少有效执行行情或停牌")
+                else:
+                    self._reject_order(order, "缺少有效执行行情或停牌")
                 continue
             if order["direction"] == "BUY":
                 market_rule, fee_rule = self._rules_for(day, order["ts_code"], dataset)
@@ -938,28 +1022,44 @@ class BacktestEngine:
                     float(bar.raw_open), "BUY", fee_rule, market_rule, bar=bar
                 )
                 stop = order.get("stop_loss_price_raw")
-                if stop is None or fill_price <= float(stop):
+                if self.config.allocation_mode != "target_value" and (
+                    stop is None or fill_price <= float(stop)
+                ):
                     self._reject_order(order, "开盘成交价不高于止损价，风险坐标失效")
                     continue
                 equity = self._current_equity_at_open(day, dataset)
-                actual_sizing = size_position(
-                    available_cash=self._investable_cash(equity),
-                    risk_pct=self.config.risk_pct,
-                    # size_position applies the versioned entry slippage itself;
-                    # pass the raw open to avoid charging entry slippage twice.
-                    entry_price=float(bar.raw_open),
-                    stop_loss_price=float(stop),
-                    fee_rule=fee_rule,
-                    market_rule=market_rule,
-                    equity_base=equity,
-                    max_position_value=equity * self.config.max_single_position_pct,
-                    max_risk_amount=(
-                        equity * self.config.max_portfolio_risk_pct
-                        - self._current_risk_amount(day, dataset)
-                        if self.config.max_portfolio_risk_pct is not None else None
-                    ),
-                    risk_policy=self.config.resolved_risk_policy(fee_rule),
-                )
+                if self.config.allocation_mode == "target_value":
+                    actual_sizing = size_target_position(
+                        available_cash=self._investable_cash(equity),
+                        equity_base=equity,
+                        # The helper applies the versioned entry slippage;
+                        # pass raw open so slippage is not charged twice.
+                        entry_price=float(bar.raw_open),
+                        target_position_ratio=float(self.config.target_position_ratio),
+                        max_position_ratio=float(self.config.max_entry_position_ratio),
+                        fee_rule=fee_rule,
+                        market_rule=market_rule,
+                        risk_policy=self.config.resolved_risk_policy(fee_rule),
+                    )
+                else:
+                    actual_sizing = size_position(
+                        available_cash=self._investable_cash(equity),
+                        risk_pct=self.config.risk_pct,
+                        # size_position applies the versioned entry slippage itself;
+                        # pass the raw open to avoid charging entry slippage twice.
+                        entry_price=float(bar.raw_open),
+                        stop_loss_price=float(stop),
+                        fee_rule=fee_rule,
+                        market_rule=market_rule,
+                        equity_base=equity,
+                        max_position_value=equity * self.config.max_single_position_pct,
+                        max_risk_amount=(
+                            equity * self.config.max_portfolio_risk_pct
+                            - self._current_risk_amount(day, dataset)
+                            if self.config.max_portfolio_risk_pct is not None else None
+                        ),
+                        risk_policy=self.config.resolved_risk_policy(fee_rule),
+                    )
                 if not actual_sizing.eligible:
                     self._reject_order(order, f"T+1 开盘按实际价格重算仓位失败: {actual_sizing.reason}")
                     continue
@@ -1030,10 +1130,16 @@ class BacktestEngine:
             else:
                 market_rule, fee_rule = self._rules_for(day, order["ts_code"], dataset)
                 if not bar.can_sell or self._limit_blocked(bar, "SELL"):
-                    self._reject_order(order, "当日不可卖出或跌停")
+                    if order.get("retryable_sell"):
+                        self._defer_sell_order(order, day, dataset, "当日不可卖出或跌停")
+                    else:
+                        self._reject_order(order, "当日不可卖出或跌停")
                     continue
                 if not self._all_shares_sellable(order["ts_code"], day, order["order_shares"]):
-                    self._reject_order(order, "T+1 限制或可卖股份不足")
+                    if order.get("retryable_sell"):
+                        self._defer_sell_order(order, day, dataset, "T+1 限制或可卖股份不足")
+                    else:
+                        self._reject_order(order, "T+1 限制或可卖股份不足")
                     continue
                 fill_price = self._apply_slippage(
                     float(bar.raw_open), "SELL", fee_rule, market_rule, bar=bar
@@ -1054,7 +1160,11 @@ class BacktestEngine:
                 order["liquidity_status"] = liquidity.liquidity_status
                 order["liquidity_reject_reason"] = liquidity.reject_reason
                 if not liquidity.allowed:
-                    self._reject_order(order, liquidity.reject_reason or "流动性门禁拒绝")
+                    reason = liquidity.reject_reason or "流动性门禁拒绝"
+                    if order.get("retryable_sell"):
+                        self._defer_sell_order(order, day, dataset, reason)
+                    else:
+                        self._reject_order(order, reason)
                     continue
                 self._sell_position(
                     order["ts_code"], order["order_shares"], fill_price, day, order,
@@ -1064,6 +1174,38 @@ class BacktestEngine:
                 if order["status"] == "FILLED":
                     order["actual_shares"] = order["order_shares"]
                     self._set_signal_status(order, "FILLED")
+                elif order.get("retryable_sell"):
+                    # _sell_position may reject a settlement-boundary or
+                    # final sellability failure internally.  Convert that
+                    # one-shot rejection back into the same controlled daily
+                    # retry path instead of silently losing the position.
+                    self._defer_sell_order(
+                        order, day, dataset,
+                        order.get("reject_reason") or "卖出未成交",
+                    )
+
+    def _defer_sell_order(
+        self,
+        order: dict[str, Any],
+        day: date,
+        dataset: BacktestDataset,
+        reason: str,
+    ) -> None:
+        """把未成交卖单推进到下一个交易日，保持数据库兼容的 PENDING 状态。"""
+        next_day = dataset.next_trade_date(day)
+        order["actual_shares"] = 0
+        order["reject_reason"] = reason
+        order["retry_count"] = int(order.get("retry_count", 0)) + 1
+        order.setdefault("retry_history", []).append({"date": day, "reason": reason})
+        if next_day is None or next_day > dataset.evaluation_end:
+            order["status"] = "EXPIRED"
+            self._set_signal_status(order, "EXPIRED")
+            order["reject_reason"] = f"{reason}；回测区间结束未成交"
+            return
+        order["order_date"] = next_day
+        order["expire_date"] = next_day
+        order["status"] = "PENDING"
+        self._set_signal_status(order, "PENDING")
 
     def _reject_order(self, order: dict[str, Any], reason: str):
         order["status"] = "REJECTED"
@@ -1553,7 +1695,11 @@ class BacktestEngine:
             peak = max(peak, value)
             max_dd = max(max_dd, (peak - value) / peak if peak else 0.0)
         days = max(1, len(self._performance_daily))
-        cagr = (final / self.config.initial_cash) ** (252 / days) - 1 if final > 0 else -1.0
+        calendar_days = max(1, (dataset.evaluation_end - dataset.evaluation_start).days)
+        cagr = (
+            (final / self.config.initial_cash) ** (365.2425 / calendar_days) - 1
+            if final > 0 else -1.0
+        )
         mean_return = sum(returns) / len(returns) if returns else 0.0
         variance = sum((item - mean_return) ** 2 for item in returns) / max(1, len(returns) - 1)
         volatility = math.sqrt(variance) * math.sqrt(252)
@@ -1624,9 +1770,8 @@ class BacktestEngine:
         if first <= 0 or last <= 0:
             raise RuntimeError("FROZEN Dataset 基准收盘价无效")
         benchmark_return = last / first - 1.0
-        benchmark_cagr = (
-            (last / first) ** (252 / max(1, observation_days)) - 1.0
-        )
+        calendar_days = max(1, (dataset.evaluation_end - dataset.evaluation_start).days)
+        benchmark_cagr = (last / first) ** (365.2425 / calendar_days) - 1.0
         metrics["benchmark_total_return"] = benchmark_return
         metrics["benchmark_cagr"] = benchmark_cagr
         metrics["excess_total_return"] = float(metrics.get("total_return", 0.0)) - benchmark_return

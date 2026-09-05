@@ -85,7 +85,14 @@ uv run python tools/check_data_access_contract.py
   - `dev_doc/portfolio_design.md`：组合模拟与审批边界
   - `dev_doc/project_completion_runbook.md`：生产执行顺序
 
-## 六、常用目录边界
+## 六、当前正式策略实现基线
+
+- `QualityTrendRotation_V1`（质量趋势轮动 V1）的完整执行契约在
+  `dev_doc/quality_trend_rotation_v1.md`；其“每周最后交易日收盘出信号、下一交易日开盘执行、失败卖出每日重试”规则不可被任务脚本自行改写。
+- 策略（Strategy）只负责质量过滤、趋势候选、确定性排名和买卖意图；交易场景（Scenario）负责 1 万元资金、3 个目标持仓、30% 目标仓位、35% 买入上限、100 股整手、费用和滑点；评价（Evaluation）单独负责区间、基准和统计公式。
+- 目标仓位策略不使用止损距离反推股数；不能因为 100 股整手导致理论风险公式返回 0 股而误判策略逻辑。任何策略/场景/评价/引擎语义变化必须生成新的哈希身份，不得覆盖旧回测结果。
+
+## 七、常用目录边界
 
 - `data_collect/data_access/`：数据访问内核、Gateway（网关）、Policy（策略）和 Repository（仓储）。
 - `data_collect/normalize/`：接口响应到 Standard 模型的纯转换。

@@ -354,6 +354,91 @@ def size_position(
     )
 
 
+def size_target_position(
+    available_cash: float,
+    equity_base: float,
+    entry_price: float,
+    target_position_ratio: float,
+    max_position_ratio: float,
+    fee_rule: FeeRule | None = None,
+    market_rule: MarketRule | None = None,
+    risk_policy: RiskPolicy | None = None,
+) -> PositionSizingResult:
+    """按目标市值计算整手数量，不把止损风险公式混入仓位分配。
+
+    ``QualityTrendRotation_V1`` 的 Scenario（交易场景）规定目标仓位约为
+    总权益的 30%，单次买入不得超过 35%。这和旧策略的“止损距离决定股数”
+    是两种不同的仓位模型，因此必须显式分支，不能用缺省止损值伪装成风险模型。
+    ``entry_price`` 是未加滑点的原始开盘价；与 ``size_position`` 一样，实际
+    的压力价格在这里按版本化滑点和最小价位向不利方向取整。
+    """
+    fee_rule = fee_rule or FeeRule()
+    market_rule = market_rule or MarketRule()
+    risk_policy = risk_policy or RiskPolicy(
+        entry_slippage_bps=fee_rule.slippage_bps,
+        exit_slippage_bps=fee_rule.slippage_bps,
+    )
+    invalid = lambda reason, theoretical=0.0: PositionSizingResult(
+        False, float(theoretical), 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        risk_policy.risk_policy_version, reason,
+    )
+    values = (
+        available_cash, equity_base, entry_price,
+        target_position_ratio, max_position_ratio,
+    )
+    if any(not math.isfinite(float(value)) for value in values):
+        return invalid("目标仓位参数必须是有限数")
+    if available_cash <= 0 or equity_base <= 0 or entry_price <= 0:
+        return invalid("资金、总权益和买入价必须为正")
+    if not 0 < target_position_ratio <= max_position_ratio <= 1:
+        return invalid("目标仓位比例必须满足 0 < target <= max_entry <= 1")
+
+    pressure_buy_price = market_rule.round_adverse(
+        float(entry_price) * (1.0 + float(risk_policy.entry_slippage_bps) / 10000.0),
+        "BUY",
+    )
+    target_value = float(equity_base) * float(target_position_ratio)
+    max_value = float(equity_base) * float(max_position_ratio)
+    theoretical = target_value / pressure_buy_price
+    shares = math.floor(theoretical / market_rule.min_buy_lot) * market_rule.min_buy_lot
+    shares = min(
+        shares,
+        math.floor(max_value / pressure_buy_price / market_rule.min_buy_lot)
+        * market_rule.min_buy_lot,
+    )
+
+    while shares >= market_rule.min_buy_lot:
+        buy_value = shares * pressure_buy_price
+        buy_fees = fee_rule.buy_cost(buy_value)
+        required = buy_value + buy_fees
+        if required <= available_cash + 1e-8 and buy_value <= max_value + 1e-8:
+            estimated_sell_fees = fee_rule.sell_cost(buy_value)
+            estimated_slippage = shares * max(
+                0.0, pressure_buy_price - float(entry_price)
+            )
+            return PositionSizingResult(
+                True,
+                float(theoretical),
+                shares,
+                shares,
+                round(required, 6),
+                0.0,
+                0.0,
+                round(buy_fees, 6),
+                round(estimated_sell_fees, 6),
+                round(estimated_slippage, 6),
+                0.0,
+                risk_policy.risk_policy_version,
+                "",
+            )
+        shares -= market_rule.min_buy_lot
+
+    return invalid(
+        f"目标仓位向下取整后不足一手或超过现金上限（理论股数 {theoretical:.2f}）",
+        theoretical,
+    )
+
+
 def open_position_stop_risk(
     shares: int,
     cost_price: float,

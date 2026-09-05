@@ -24,7 +24,16 @@ from .risk import (
     check_liquidity,
     open_position_stop_risk,
     size_position,
+    size_target_position,
 )
+from .strategy.contract import (
+    EvaluationConfig,
+    ScenarioConfig,
+    StrategyVersionSpec,
+    backtest_fingerprint,
+    canonical_hash,
+)
+from .strategy.quality_trend_rotation_v1 import QualityTrendRotationV1
 from .validation import (
     assert_no_future_rows,
     assert_pit_cutoff_consistency,
@@ -40,6 +49,8 @@ __all__ = [
     "Observation", "PositionLotState", "SignalIntent", "FeeRule", "LiquidityCheck", "MarketRule", "MarketTemperatureScaler",
     "MonteCarloTester",
     "PositionSizingResult", "RiskPolicy", "check_liquidity", "open_position_stop_risk", "size_position",
+    "size_target_position", "StrategyVersionSpec", "ScenarioConfig", "EvaluationConfig",
+    "canonical_hash", "backtest_fingerprint", "QualityTrendRotationV1",
     "assert_no_future_rows", "assert_pit_cutoff_consistency", "truncate_dataset_asof",
     "validate_observation_cutoffs", "verify_pit_cutoff_consistency",
 ]

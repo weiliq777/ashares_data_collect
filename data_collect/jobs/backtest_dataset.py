@@ -762,17 +762,44 @@ def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
         kernel.close()
 
 
-def load_frozen_dataset(dataset_id: str, observation_columns: Sequence[str] | None = None) -> BacktestDataset:
+def load_frozen_dataset(
+    dataset_id: str,
+    observation_columns: Sequence[str] | None = None,
+    *,
+    evaluation_config=None,
+) -> BacktestDataset:
     kernel, repository, context = _read_service("load")
     try:
         manifest = repository.manifest(dataset_id, context)
         if manifest["status"] != "FROZEN":
             raise RuntimeError(f"只有 FROZEN Dataset 可以用于正式回测: {manifest['status']}")
-        calendar = repository.open_calendar(dataset_id, context)
+        effective_warmup_start = manifest["warmup_start"]
+        effective_evaluation_start = manifest["evaluation_start"]
+        effective_evaluation_end = manifest["evaluation_end"]
+        if evaluation_config is not None:
+            effective_warmup_start = evaluation_config.warmup_start
+            effective_evaluation_start = evaluation_config.evaluation_start
+            effective_evaluation_end = evaluation_config.evaluation_end
+            if not (
+                manifest["warmup_start"] <= effective_warmup_start
+                <= effective_evaluation_start <= effective_evaluation_end
+                <= manifest["evaluation_end"]
+            ):
+                raise RuntimeError(
+                    "Evaluation 评价区间必须完全位于 FROZEN Dataset 的冻结范围内"
+                )
+        calendar = tuple(
+            day for day in repository.open_calendar(dataset_id, context)
+            if effective_warmup_start <= day <= effective_evaluation_end
+        )
         bars: dict[date, dict[str, MarketBar]] = {}
         last_key = None
         while True:
-            page = repository.bar_page(dataset_id, context, last_key, 10_000)
+            page = repository.bar_page(
+                dataset_id, context, last_key, 10_000,
+                date_from=effective_warmup_start,
+                date_to=effective_evaluation_end,
+            )
             if not page:
                 break
             for row in page:
@@ -789,7 +816,11 @@ def load_frozen_dataset(dataset_id: str, observation_columns: Sequence[str] | No
         delist_dates: dict[str, date | None] = {}
         last_key = None
         while True:
-            page = repository.observation_page(dataset_id, selected_columns, context, last_key, 10_000)
+            page = repository.observation_page(
+                dataset_id, selected_columns, context, last_key, 10_000,
+                date_from=effective_warmup_start,
+                date_to=effective_evaluation_end,
+            )
             if not page:
                 break
             for row in page:
@@ -812,7 +843,11 @@ def load_frozen_dataset(dataset_id: str, observation_columns: Sequence[str] | No
                 if effective_from <= day and (effective_to is None or day <= effective_to):
                     rules[(day, None if market in {"ALL", "*"} else market)] = (market_rule, fee_rule)
         member_roles, snapshot_ids = repository.member_roles_and_snapshots(dataset_id, context)
-        return BacktestDataset(dataset_id=dataset_id, calendar=calendar, evaluation_start=manifest["evaluation_start"], evaluation_end=manifest["evaluation_end"], warmup_start=manifest["warmup_start"], observations={day: tuple(rows) for day, rows in observations.items()}, bars=bars, dividends={day: tuple(rows) for day, rows in dividends.items()}, member_roles=member_roles, snapshot_ids=snapshot_ids, rules=rules, delist_dates=delist_dates, benchmark_code=manifest["benchmark_code"], benchmark_closes=repository.load_benchmark_closes(dataset_id, manifest["benchmark_code"], context), out_of_sample_start=manifest["out_of_sample_start"], input_hash=manifest["input_manifest_hash"], require_explicit_rules=True)
+        effective_oos_start = max(
+            manifest["out_of_sample_start"] or effective_evaluation_start,
+            effective_evaluation_start,
+        )
+        return BacktestDataset(dataset_id=dataset_id, calendar=calendar, evaluation_start=effective_evaluation_start, evaluation_end=effective_evaluation_end, warmup_start=effective_warmup_start, observations={day: tuple(rows) for day, rows in observations.items()}, bars=bars, dividends={day: tuple(rows) for day, rows in dividends.items()}, member_roles=member_roles, snapshot_ids=snapshot_ids, rules=rules, delist_dates=delist_dates, benchmark_code=manifest["benchmark_code"], benchmark_closes=repository.load_benchmark_closes(dataset_id, manifest["benchmark_code"], context), out_of_sample_start=effective_oos_start, input_hash=manifest["input_manifest_hash"], require_explicit_rules=True)
     finally:
         kernel.close()
 

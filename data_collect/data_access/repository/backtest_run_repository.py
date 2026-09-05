@@ -58,7 +58,10 @@ class BacktestRunRepository(BaseRepository):
     def dataset_rules(self, dataset_id: str, context: RunContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         datasets = self.kernel.read._repository_query(
             context, "backtest.dataset_manifest",
-            "SELECT status, input_manifest_hash, market_rule_version, fee_rule_version FROM backtest.dataset_manifest WHERE dataset_id=%s",
+            """SELECT status, input_manifest_hash, market_rule_version,
+                      fee_rule_version, benchmark_code, warmup_start,
+                      evaluation_start, evaluation_end
+                 FROM backtest.dataset_manifest WHERE dataset_id=%s""",
             (dataset_id,), self._scope(dataset_id), 2,
         )
         rules = self.kernel.read._repository_query(
