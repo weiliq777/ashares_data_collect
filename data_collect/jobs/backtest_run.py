@@ -270,6 +270,7 @@ def run_frozen_backtest(dataset_id: str, config: BacktestConfig | None = None,
                 max_entry_position_ratio=0.35,
                 entry_slippage_bps=10.0,
                 exit_slippage_bps=10.0,
+                gap_stress_pct=0.05,
             )
         else:
             config = BacktestConfig()

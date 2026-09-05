@@ -112,6 +112,11 @@ def test_backtest_run_binds_dataset_rule_versions_and_immutable_strategy():
     assert "正式回测必须显式设置 max_portfolio_risk_pct" in source
 
 
+def test_quality_strategy_default_matches_frozen_gap_stress_rule():
+    source = Path("data_collect/jobs/backtest_run.py").read_text(encoding="utf-8")
+    assert "gap_stress_pct=0.05" in source
+
+
 def test_snapshot_series_keeps_one_snapshot_per_cutoff_date():
     source = Path("data_collect/jobs/research_snapshot_series.py").read_text(encoding="utf-8")
     assert "normalize_cutoff_dates" in source
