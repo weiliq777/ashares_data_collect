@@ -1126,6 +1126,45 @@ class WriteGateway:
             )
         return total
 
+    def update_backtest_run_status(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        run_id: str,
+        status: str,
+        failure_reason: str | None = None,
+    ) -> int:
+        """Transition an existing formal run without partial-row upsert.
+
+        ``run_manifest`` has several NOT NULL identity and audit columns. A
+        partial ``INSERT ... ON CONFLICT DO UPDATE`` still has to pass the
+        INSERT checks before PostgreSQL can reach the conflict branch, so
+        status transitions must use this explicitly named UPDATE operation.
+        The database state trigger remains the authority for the transition.
+        """
+        if status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            raise ValueError(f"unsupported Backtest Run terminal status: {status}")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("Backtest Run id cannot be empty")
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="backtest.run_manifest",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+        sql = (
+            "UPDATE backtest.run_manifest "
+            "SET status=%s, failure_reason=%s "
+            "WHERE run_id=%s AND status='RUNNING'"
+        )
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(
+                sql, (status, failure_reason, run_id)
+            )
+        )
+
     def _update_snapshot_manifest(self, sql: str, params: Sequence[Any]) -> int:
         conn = self._kernel._db_connection()
         with conn.cursor() as cur:

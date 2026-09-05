@@ -156,6 +156,22 @@ def test_backtest_run_repository_requires_exact_approved_strategy_version():
     assert query["params"] == ("strategy-v1", "1")
 
 
+def test_backtest_run_status_transition_uses_named_update_not_partial_upsert():
+    from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(policy_registry=build_default_registry(), connection_factory=lambda: conn)
+    repository = BacktestRunRepository(kernel)
+    changed = repository.kernel.write.update_backtest_run_status(
+        ctx(), WorkScope(partition="run-1"), "run-1", "FAILED", "test failure"
+    )
+    assert changed == 0
+    query = conn.executed[-1]
+    assert query["sql"].startswith("UPDATE backtest.run_manifest SET status=%s")
+    assert "WHERE run_id=%s AND status='RUNNING'" in query["sql"]
+    assert query["params"] == ("FAILED", "test failure", "run-1")
+
+
 def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
     from data_collect.data_access.repository.dataset_repository import DatasetRepository
 

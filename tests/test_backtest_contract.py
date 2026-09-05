@@ -124,6 +124,7 @@ def test_backtest_strategy_version_binding_migration_cuts_over_legacy_fk():
     assert "REFERENCES backtest.app_strategy_version(strategy_id, strategy_version)" in source
     assert "assert_run_strategy_binding" in source
     assert "requires an APPROVED application strategy" in source
+    assert "formal Backtest Run requires strategy_version" in source
 
 
 def test_snapshot_series_keeps_one_snapshot_per_cutoff_date():

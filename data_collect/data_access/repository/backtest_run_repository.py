@@ -144,10 +144,15 @@ class BacktestRunRepository(BaseRepository):
                                ("backtest.cash_ledger", cash), ("backtest.performance_daily", performance), ("backtest.metric", metrics)):
             if values:
                 self.kernel.write.bulk_insert(context, scope, target, values)
-        self.kernel.write.upsert(context, scope, "backtest.run_manifest", [{"run_id": run_id, "status": "SUCCEEDED"}],
-                                 key=("run_id",), update_columns=("status",), skip_noop=True)
+        changed = self.kernel.write.update_backtest_run_status(
+            context, scope, run_id, "SUCCEEDED"
+        )
+        if changed != 1:
+            raise RuntimeError(f"Backtest Run status transition missed RUNNING row: {run_id}")
 
     def mark_failed(self, run_id: str, reason: str, context: RunContext) -> None:
-        self.kernel.write.upsert(context, self._scope(run_id), "backtest.run_manifest",
-                                 [{"run_id": run_id, "status": "FAILED", "failure_reason": reason[:4000]}],
-                                 key=("run_id",), update_columns=("status", "failure_reason"), skip_noop=True)
+        changed = self.kernel.write.update_backtest_run_status(
+            context, self._scope(run_id), run_id, "FAILED", reason[:4000]
+        )
+        if changed != 1:
+            raise RuntimeError(f"Backtest Run failure transition missed RUNNING row: {run_id}")
