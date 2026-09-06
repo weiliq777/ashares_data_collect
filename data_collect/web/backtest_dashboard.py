@@ -7,12 +7,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 from threading import Lock
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
+from data_collect.evaluation.markdown import render_capital_sensitivity_markdown, render_diagnostic_markdown
 from data_collect.evaluation.standard import DEFAULT_CAPITALS, build_capital_sensitivity
 from data_collect.jobs.backtest_diagnostics import diagnose_run
 
@@ -152,11 +153,19 @@ def _trade_chart(run_id: str, lot_id: str) -> dict[str, Any]:
 class _DashboardHandler(BaseHTTPRequestHandler):
     server_version = "BacktestDashboard/1.0"
 
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -182,6 +191,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 run_ids = [item for value in values for item in value.split(",")]
                 self._json(200, _cached_capital_comparison(run_ids))
                 return
+            if path == "/api/backtests/compare.md":
+                values = parse_qs(parsed.query).get("run_ids", [])
+                run_ids = [item for value in values for item in value.split(",")]
+                markdown = render_capital_sensitivity_markdown(_cached_capital_comparison(run_ids))
+                self._send(
+                    200,
+                    markdown.encode("utf-8"),
+                    "text/markdown; charset=utf-8",
+                    {"Content-Disposition": 'attachment; filename="capital-sensitivity.md"'},
+                )
+                return
             if path == "/api/backtests/capital-sensitivity":
                 values = parse_qs(parsed.query).get("base_run_id", [])
                 if not values or not values[0].strip():
@@ -189,6 +209,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._json(200, _capital_sensitivity_catalog(values[0].strip()))
                 return
             parts = [unquote(part) for part in path.split("/") if part]
+            if len(parts) == 4 and parts[:2] == ["api", "backtests"] and parts[3] == "diagnostics.md":
+                markdown = render_diagnostic_markdown(_cached_report(parts[2]))
+                safe_run_id = "".join(char for char in parts[2] if char.isalnum() or char in "-_")[:80] or "run"
+                self._send(
+                    200,
+                    markdown.encode("utf-8"),
+                    "text/markdown; charset=utf-8",
+                    {"Content-Disposition": f'attachment; filename="backtest-{safe_run_id}.md"'},
+                )
+                return
             if len(parts) == 4 and parts[:2] == ["api", "backtests"] and parts[3] == "diagnostics":
                 self._json(200, _cached_report(parts[2]))
                 return

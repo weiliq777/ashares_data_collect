@@ -103,6 +103,10 @@
     .capital-chip.pending { opacity: .52; cursor: not-allowed; }
     .capital-chip:disabled { cursor: not-allowed; }
     .capital-compare-hint { color: var(--muted); font-size: 11px; margin: 7px 0 0; }
+    .download-button { display: inline-flex; align-items: center; border: 1px solid #315170; border-radius: 9px;
+      padding: 9px 12px; color: var(--text); background: #0d2035; text-decoration: none; font-weight: 700; white-space: nowrap; }
+    .download-button:hover { border-color: var(--cyan); background: #12314b; }
+    .download-button.disabled { opacity: .5; pointer-events: none; }
     .table-wrap { overflow: auto; border: 1px solid rgba(77, 112, 148, .25); border-radius: 10px; }
     .compact-table table { min-width: 760px; }
     table { border-collapse: collapse; width: 100%; min-width: 930px; }
@@ -127,6 +131,8 @@
       <div class="capital-toolbar-title"><strong>资金场景切换</strong><span>同一策略 · 不同初始资金</span></div>
       <div id="capital-switcher" class="capital-switcher"><span class="chip">加载资金场景中…</span></div>
       <button id="compare-all" type="button">对比已完成</button>
+      <a id="download-markdown" class="download-button disabled" target="_blank" download="backtest-diagnostic.md">导出 AI Markdown</a>
+      <a id="download-comparison-markdown" class="download-button disabled" target="_blank" download="capital-sensitivity.md">导出资金对比 Markdown</a>
     </div>
     <div id="capital-compare-hint" class="capital-compare-hint">点击资金档位即可切换整张看板；“对比已完成”查看五档横向结果。</div>
   </header>
@@ -294,6 +300,9 @@
       bars($("quarter-bars"), (calendar.quarter || []).map(x=>({label:x.period,value:x.strategy_return,negative:(x.strategy_return||0)<0})), {format:v=>pct(v)});
       $("limitations").innerHTML = (data.limitations||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join("");
       renderStandardEvaluation(data);
+      const markdownLink = $("download-markdown");
+      markdownLink.href = `/api/backtests/${encodeURIComponent(data.run.run_id)}/diagnostics.md`;
+      markdownLink.classList.remove("disabled");
       loadCapitalCatalog(data.run.run_id);
     }
 
@@ -328,6 +337,7 @@
       if (!scenarios.length) {
         $("capital-switcher").innerHTML = '<span class="chip">当前策略暂无资金敏感性 Run</span>';
         $("capital-compare-hint").textContent = "需要先完成对应资金场景回测。";
+        $("download-comparison-markdown").classList.add("disabled");
         return;
       }
       $("capital-switcher").innerHTML = scenarios.map(s => {
@@ -341,6 +351,16 @@
       }));
       const completed = scenarios.filter(s => String(s.status || "").toUpperCase() === "SUCCEEDED").length;
       $("capital-compare-hint").textContent = `已发现 ${scenarios.length} 个资金场景，${completed} 个已完成；点击档位切换整张看板。`;
+      const comparisonLink = $("download-comparison-markdown");
+      const completedIds = scenarios
+        .filter(s => String(s.status || "").toUpperCase() === "SUCCEEDED")
+        .map(s => s.run_id);
+      if (completedIds.length) {
+        comparisonLink.href = `/api/backtests/compare.md?run_ids=${encodeURIComponent(completedIds.join(","))}`;
+        comparisonLink.classList.remove("disabled");
+      } else {
+        comparisonLink.classList.add("disabled");
+      }
     }
 
     async function loadCapitalCatalog(baseRunId) {

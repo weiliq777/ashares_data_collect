@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import date, datetime
 import json
 import math
+from pathlib import Path
 from statistics import mean, median
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import uuid4
@@ -20,7 +21,8 @@ from uuid import uuid4
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
-from data_collect.evaluation.standard import build_standard_evaluation
+from data_collect.evaluation.markdown import render_diagnostic_markdown
+from data_collect.evaluation.standard import build_capital_sensitivity, build_standard_evaluation
 
 
 _FORWARD_HORIZONS = (5, 10, 20, 40)
@@ -587,8 +589,39 @@ def diagnose_run(run_id: str) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Read-only Backtest Run diagnostic report")
     parser.add_argument("--run-id", required=True, help="Backtest Run UUID")
+    parser.add_argument(
+        "--format", choices=("json", "markdown"), default="json",
+        help="Report format; JSON remains the default for backward compatibility",
+    )
+    parser.add_argument(
+        "--output",
+        help="Optional output file. Markdown is written as UTF-8; otherwise stdout is used",
+    )
+    parser.add_argument(
+        "--capital-run-ids",
+        help="Optional comma-separated capital-sensitivity Run IDs to append to Markdown",
+    )
     args = parser.parse_args(argv)
-    print(json.dumps(diagnose_run(args.run_id), ensure_ascii=False, indent=2, default=str))
+    report = diagnose_run(args.run_id)
+    capital_sensitivity = None
+    if args.capital_run_ids:
+        reports = [
+            diagnose_run(run_id.strip())
+            for run_id in args.capital_run_ids.split(",")
+            if run_id.strip()
+        ]
+        capital_sensitivity = build_capital_sensitivity(reports)
+    if args.format == "markdown":
+        output = render_diagnostic_markdown(report, capital_sensitivity=capital_sensitivity)
+    else:
+        payload: Any = report
+        if capital_sensitivity is not None:
+            payload = {"report": report, "capital_sensitivity": capital_sensitivity}
+        output = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    if args.output:
+        Path(args.output).write_text(output + "\n", encoding="utf-8")
+        return
+    print(output)
 
 
 if __name__ == "__main__":

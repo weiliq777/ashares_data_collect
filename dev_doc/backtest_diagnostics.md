@@ -63,3 +63,22 @@ GET /api/backtests/compare?run_ids=<run_id_10k>,<run_id_30k>,<run_id_50k>,<run_i
 2. `forward_returns` 只用于观察入场后的价格路径，不代表策略净收益，也不参与历史信号生成；未来行情读取限制在每笔实际买入后的 120 个自然日内，并只保留第 5/10/20/40 个交易日。
 3. 所有数据库访问仍经过 `BacktestRunRepository → DataAccessKernel`；诊断任务不持有 Connection/Cursor，不手写 SQL。
 4. 当前模型没有独立的 `realized_trade`（已实现交易）表，因此诊断结果默认即时生成。若未来需要长期保存报告，应将报告作为带 `run_id`、`input_hash`、`report_hash` 的独立不可变审计产物，而不是把它混入回测事实表。
+## Markdown（供 AI 分析）
+
+同一份只读诊断报告也可以输出为 UTF-8 Markdown。Markdown 只是 JSON 诊断报告的格式化出口，不另建查询口径、不写入数据库，也不会重新运行策略。
+
+```powershell
+python -m data_collect.jobs.backtest_diagnostics `
+  --run-id <run_id> `
+  --format markdown `
+  --output .\artifacts\backtest-diagnostic.md
+```
+
+Dashboard（看板）加载回测后，也可以点击“导出 AI Markdown”。资金敏感性对比可使用：
+
+```text
+GET /api/backtests/<run_id>/diagnostics.md
+GET /api/backtests/compare.md?run_ids=<run_id_10k>,<run_id_30k>,<run_id_50k>,<run_id_70k>,<run_id_100k>
+```
+
+文档会保留回测身份、输入哈希、核心指标、订单拒绝归因、逐笔交易、退出原因、入场 RET60、未来价格路径、年月/市场状态/滚动评估和资金敏感性，并明确标识事后 Evaluation（评估），避免把未来信息误当成历史信号。
