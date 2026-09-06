@@ -45,3 +45,18 @@ def test_dashboard_capital_comparison_is_cached_and_read_only(monkeypatch):
     assert result["rows"][0]["run_id"] == "run-10k"
     assert result["rows"][1]["run_id"] == "run-30k"
     assert len(backtest_dashboard._COMPARISON_CACHE) == 1
+
+
+def test_dashboard_does_not_cache_running_reports(monkeypatch):
+    running = _report(100_000, "run-running")
+    running["run"]["status"] = "RUNNING"
+    reports = iter([running, {**running, "run": {**running["run"], "status": "SUCCEEDED"}}])
+    backtest_dashboard._REPORT_CACHE.clear()
+    monkeypatch.setattr(backtest_dashboard, "diagnose_run", lambda _run_id: next(reports))
+
+    first = backtest_dashboard._cached_report("run-running")
+    second = backtest_dashboard._cached_report("run-running")
+
+    assert first["run"]["status"] == "RUNNING"
+    assert second["run"]["status"] == "SUCCEEDED"
+    assert "run-running" in backtest_dashboard._REPORT_CACHE

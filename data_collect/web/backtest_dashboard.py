@@ -21,6 +21,7 @@ _STATIC_FILE = Path(__file__).with_name("static") / "backtest_dashboard.html"
 _REPORT_CACHE: dict[str, dict[str, Any]] = {}
 _COMPARISON_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 _CACHE_LOCK = Lock()
+_TERMINAL_RUN_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED"})
 
 
 def _service(label: str):
@@ -41,8 +42,10 @@ def _cached_report(run_id: str) -> dict[str, Any]:
     if cached is not None:
         return cached
     report = diagnose_run(run_id)
-    with _CACHE_LOCK:
-        _REPORT_CACHE[run_id] = report
+    status = str((report.get("run") or {}).get("status") or "").upper()
+    if status in _TERMINAL_RUN_STATUSES:
+        with _CACHE_LOCK:
+            _REPORT_CACHE[run_id] = report
     return report
 
 
@@ -56,8 +59,13 @@ def _cached_capital_comparison(run_ids: Sequence[str]) -> dict[str, Any]:
         return cached
     reports = [_cached_report(run_id) for run_id in normalized]
     result = build_capital_sensitivity(reports)
-    with _CACHE_LOCK:
-        _COMPARISON_CACHE[normalized] = result
+    if all(
+        str((report.get("run") or {}).get("status") or "").upper()
+        in _TERMINAL_RUN_STATUSES
+        for report in reports
+    ):
+        with _CACHE_LOCK:
+            _COMPARISON_CACHE[normalized] = result
     return result
 
 
