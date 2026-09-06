@@ -1,4 +1,5 @@
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -480,6 +481,17 @@ def test_foundation_lineage_clone_rebuilds_only_financial_reference():
     # reconstruction or retain the legacy V1 financial source in the bundle.
     assert "feature.company_financial_v1" not in lower
     assert "insert into research.snapshot_lineage\n" not in lower
+
+
+def test_foundation_replacement_clone_is_code_bounded():
+    source = Path(
+        "data_collect/data_access/repository/research_snapshot_repository.py"
+    ).read_text(encoding="utf-8")
+    method = source.split(
+        "    def build_financial_replacement_snapshot(", 1,
+    )[1].split("    def build_snapshot(", 1)[0]
+    assert "s.ts_code=ANY(%s)" in method
+    assert "range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE)" in method
 
 
 def test_legacy_lineage_bundle_is_format_migration_only():

@@ -186,10 +186,6 @@ def repair_dataset(
                 target_manifest["quality_report"],
                 target_manifest["quality_hash"],
             )
-            if target_manifest["status"] == "BUILDING":
-                raise RuntimeError(
-                    f"replacement Snapshot is BUILDING; resume is ambiguous: {target_id}"
-                )
             if target_manifest["status"] in {"DRAFT", "FAILED"}:
                 pending_build.append((target_id, source_by_date[row["research_date"]]))
         for offset in range(0, len(pending_build), batch_size):

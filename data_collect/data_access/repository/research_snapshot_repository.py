@@ -1717,6 +1717,7 @@ class ResearchSnapshotRepository(BaseRepository):
                       FROM research.stock_snapshot_daily s
                      WHERE s.snapshot_id=%s
                        AND s.research_date=%s
+                       AND s.ts_code=ANY(%s)
                 """
                 clone_plan = SqlPlan(
                     operation=Operation.REBUILD,
@@ -1724,12 +1725,15 @@ class ResearchSnapshotRepository(BaseRepository):
                     scope=scope,
                     expected_mode="SET_BASED",
                     allow_insert_select=True,
-                    estimated_rows=len(codes),
+                    estimated_rows=self.SNAPSHOT_CODE_BATCH_SIZE,
                 )
-                cloned = self.kernel.rebuild.run_insert_select(
-                    clone_stock_sql, clone_plan, context,
-                    (snapshot_id, source_snapshot_id, cutoff),
-                )
+                cloned = 0
+                for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
+                    code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
+                    cloned += self.kernel.rebuild.run_insert_select(
+                        clone_stock_sql, clone_plan, context,
+                        (snapshot_id, source_snapshot_id, cutoff, list(code_batch)),
+                    )
                 if cloned != len(codes):
                     raise RuntimeError(
                         "replacement stock row count mismatch: "
