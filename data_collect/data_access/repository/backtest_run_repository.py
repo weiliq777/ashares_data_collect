@@ -222,6 +222,7 @@ class BacktestRunRepository(BaseRepository):
 
     def diagnostic_trade_chart(
         self,
+        dataset_id: str,
         ts_code: str,
         date_from: date,
         date_to: date,
@@ -238,14 +239,18 @@ class BacktestRunRepository(BaseRepository):
         return self.kernel.read._repository_query(
             context,
             "research.stock_snapshot_daily",
-            """SELECT research_date, ts_code, name, raw_close,
-                             adj_close_base, ma20, ma60, return_60d,
-                             is_st_asof, quality_status
-                        FROM research.stock_snapshot_daily
-                       WHERE ts_code=%s
-                         AND research_date BETWEEN %s AND %s
-                       ORDER BY research_date""",
-            (ts_code, date_from, date_to), scope, 5_000,
+            """SELECT s.research_date, s.ts_code, s.name, s.raw_close,
+                             s.adj_close_base, s.ma20, s.ma60, s.return_60d,
+                             s.is_st_asof, s.quality_status
+                        FROM backtest.dataset_member m
+                        JOIN research.stock_snapshot_daily s
+                          ON s.snapshot_id=m.research_snapshot_id
+                         AND s.research_date=m.research_date
+                         AND s.ts_code=%s
+                       WHERE m.dataset_id=%s
+                         AND s.research_date BETWEEN %s AND %s
+                       ORDER BY s.research_date""",
+            (ts_code, dataset_id, date_from, date_to), scope, 5_000,
         )
 
     def diagnostic_metrics(self, run_id: str, context: RunContext) -> list[dict[str, Any]]:

@@ -51,3 +51,24 @@ def test_diagnostic_future_closes_is_bounded_to_dataset_and_date_window():
         assert "row_number() OVER" in query
     finally:
         kernel.close()
+
+
+def test_diagnostic_trade_chart_binds_to_dataset_members():
+    from datetime import date
+
+    connection = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(),
+        connection_factory=lambda: connection,
+    )
+    try:
+        rows = BacktestRunRepository(kernel).diagnostic_trade_chart(
+            "dataset-1", "000001.SZ", date(2024, 1, 1), date(2024, 3, 31), _context()
+        )
+        assert rows == []
+        query = connection.executed[-1]["sql"]
+        assert "m.dataset_id=%s" in query
+        assert "JOIN research.stock_snapshot_daily s" in query
+        assert "s.snapshot_id=m.research_snapshot_id" in query
+    finally:
+        kernel.close()

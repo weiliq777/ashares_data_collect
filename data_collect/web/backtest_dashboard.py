@@ -54,7 +54,11 @@ def _trade_chart(run_id: str, lot_id: str) -> dict[str, Any]:
     kernel, repository, context = _service("chart")
     try:
         rows = repository.diagnostic_trade_chart(
-            str(trade["ts_code"]), buy_date - timedelta(days=90), sell_date + timedelta(days=5), context
+            str(report["run"]["dataset_id"]),
+            str(trade["ts_code"]),
+            buy_date - timedelta(days=90),
+            sell_date + timedelta(days=5),
+            context,
         )
     finally:
         kernel.close()
