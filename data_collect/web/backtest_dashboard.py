@@ -13,7 +13,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
-from data_collect.evaluation.markdown import render_capital_sensitivity_markdown, render_diagnostic_markdown
+from data_collect.evaluation.markdown import (
+    render_capital_sensitivity_bundle_markdown,
+    render_capital_sensitivity_markdown,
+    render_diagnostic_markdown,
+)
 from data_collect.evaluation.standard import DEFAULT_CAPITALS, build_capital_sensitivity
 from data_collect.jobs.backtest_diagnostics import diagnose_run
 
@@ -101,6 +105,20 @@ def _capital_sensitivity_catalog(base_run_id: str) -> dict[str, Any]:
         }
     finally:
         kernel.close()
+
+
+def _capital_sensitivity_bundle(base_run_id: str) -> str:
+    catalog = _capital_sensitivity_catalog(base_run_id)
+    run_ids = [
+        str(row["run_id"])
+        for row in catalog.get("scenarios") or []
+        if str(row.get("status") or "").upper() == "SUCCEEDED"
+    ]
+    if not run_ids:
+        raise LookupError("当前策略没有已完成的资金场景 Run")
+    comparison = _cached_capital_comparison(run_ids)
+    reports = [_cached_report(run_id) for run_id in run_ids]
+    return render_capital_sensitivity_bundle_markdown(reports, comparison)
 
 
 def _trade_chart(run_id: str, lot_id: str) -> dict[str, Any]:
@@ -200,6 +218,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     markdown.encode("utf-8"),
                     "text/markdown; charset=utf-8",
                     {"Content-Disposition": 'attachment; filename="capital-sensitivity.md"'},
+                )
+                return
+            if path == "/api/backtests/capital-sensitivity/diagnostics.md":
+                values = parse_qs(parsed.query).get("base_run_id", [])
+                if not values or not values[0].strip():
+                    raise ValueError("缺少 base_run_id")
+                markdown = _capital_sensitivity_bundle(values[0].strip())
+                self._send(
+                    200,
+                    markdown.encode("utf-8"),
+                    "text/markdown; charset=utf-8",
+                    {"Content-Disposition": 'attachment; filename="all-capital-diagnostics.md"'},
                 )
                 return
             if path == "/api/backtests/capital-sensitivity":

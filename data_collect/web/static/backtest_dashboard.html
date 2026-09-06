@@ -133,6 +133,7 @@
       <button id="compare-all" type="button">对比已完成</button>
       <a id="download-markdown" class="download-button disabled" target="_blank" download="backtest-diagnostic.md">导出 AI Markdown</a>
       <a id="download-comparison-markdown" class="download-button disabled" target="_blank" download="capital-sensitivity.md">导出资金对比 Markdown</a>
+      <a id="download-all-capital-markdown" class="download-button disabled" target="_blank" download="all-capital-diagnostics.md">导出全部资金 AI Markdown</a>
     </div>
     <div id="capital-compare-hint" class="capital-compare-hint">点击资金档位即可切换整张看板；“对比已完成”查看五档横向结果。</div>
   </header>
@@ -338,6 +339,7 @@
         $("capital-switcher").innerHTML = '<span class="chip">当前策略暂无资金敏感性 Run</span>';
         $("capital-compare-hint").textContent = "需要先完成对应资金场景回测。";
         $("download-comparison-markdown").classList.add("disabled");
+        $("download-all-capital-markdown").classList.add("disabled");
         return;
       }
       $("capital-switcher").innerHTML = scenarios.map(s => {
@@ -358,8 +360,12 @@
       if (completedIds.length) {
         comparisonLink.href = `/api/backtests/compare.md?run_ids=${encodeURIComponent(completedIds.join(","))}`;
         comparisonLink.classList.remove("disabled");
+        const bundleLink = $("download-all-capital-markdown");
+        bundleLink.href = `/api/backtests/capital-sensitivity/diagnostics.md?base_run_id=${encodeURIComponent(catalog.base_run_id)}`;
+        bundleLink.classList.remove("disabled");
       } else {
         comparisonLink.classList.add("disabled");
+        $("download-all-capital-markdown").classList.add("disabled");
       }
     }
 

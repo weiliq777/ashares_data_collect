@@ -411,3 +411,156 @@ def render_capital_sensitivity_markdown(result: Mapping[str, Any]) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def render_capital_sensitivity_bundle_markdown(
+    reports: Sequence[Mapping[str, Any]],
+    comparison: Mapping[str, Any],
+    *,
+    max_trade_rows_per_run: int = 1000,
+) -> str:
+    """Render one AI document containing all available capital scenarios.
+
+    The bundle uses the same already reconstructed reports as the dashboard;
+    it does not run a second backtest or query a different data source.  Each
+    scenario keeps its own identity and diagnostics so an AI can distinguish
+    capital constraints from strategy behavior.
+    """
+    ordered_reports = sorted(
+        reports,
+        key=lambda report: float((report.get("run") or {}).get("initial_cash") or 0),
+    )
+    lines = [
+        "# 全部资金场景 AI 分析数据文档",
+        "",
+        "> 本文自动汇总同一 Strategy（策略）、Dataset（回测数据集）、Evaluation（评估）和执行引擎下的多个 Scenario（交易场景）。它是只读诊断导出，不会重新运行回测，也不会修改数据库。",
+        "> 资金是唯一允许变化的实验变量；分析时必须先检查身份一致性，再区分资金约束和策略规则本身的影响。",
+        "",
+        "## 1. 实验一致性",
+        "",
+        f"- 可比性：**{_value(comparison.get('comparable'))}**",
+        f"- Evaluation（评估）版本：`{_value(comparison.get('evaluation_version'))}`",
+        f"- 已读取 Run 数：`{_value(comparison.get('available_run_count'))}`",
+        f"- 请求资金档位：`{', '.join(_money(value) for value in comparison.get('requested_capitals') or [])}`",
+        "",
+        *_table(
+            ("初始资金", "Run ID", "状态", "策略", "Dataset ID", "输入哈希", "执行引擎", "代码提交"),
+            (
+                (
+                    _money((report.get("run") or {}).get("initial_cash")),
+                    (report.get("run") or {}).get("run_id"),
+                    (report.get("run") or {}).get("status"),
+                    f"{_value((report.get('run') or {}).get('strategy_id'))} / {_value((report.get('run') or {}).get('strategy_version'))}",
+                    (report.get("run") or {}).get("dataset_id"),
+                    (report.get("run") or {}).get("input_hash"),
+                    (report.get("run") or {}).get("execution_model_version"),
+                    (report.get("run") or {}).get("git_commit"),
+                )
+                for report in ordered_reports
+            ),
+        ),
+        "",
+        "## 2. 资金敏感性总表",
+        "",
+        *render_capital_sensitivity_markdown(comparison).splitlines()[7:],
+        "",
+        "## 3. 各资金场景详细事实",
+        "",
+    ]
+
+    all_trades: list[tuple[Any, Mapping[str, Any]]] = []
+    for report in ordered_reports:
+        run = report.get("run") or {}
+        capital = _money(run.get("initial_cash"))
+        metrics = report.get("persisted_metrics") or {}
+        summary = report.get("trade_summary") or {}
+        rejection = report.get("order_rejections") or {}
+        entry = report.get("entry_diagnostics") or {}
+        ret60 = entry.get("ret60") or {}
+        exit_attribution = report.get("exit_attribution") or {}
+        exit_table = (
+            _table(
+                ("退出原因", "交易数", "净盈亏", "平均净收益率"),
+                (
+                    (reason, value.get("trade_count"), _money(value.get("net_pnl")), _percent(value.get("average_net_return")))
+                    for reason, value in sorted(exit_attribution.items())
+                ),
+            )
+            if exit_attribution else ["暂无完整交易。"]
+        )
+        lines += [
+            f"### {capital}（Run `{_value(run.get('run_id'))}`）",
+            "",
+            *_table(
+                ("指标", "值"),
+                (
+                    ("状态", run.get("status")),
+                    ("期末权益", _money(metrics.get("final_equity"))),
+                    ("累计收益", _percent(metrics.get("total_return"))),
+                    ("CAGR", _percent(metrics.get("cagr"))),
+                    ("最大回撤", _percent(metrics.get("max_drawdown"))),
+                    ("Sharpe", _number(metrics.get("sharpe"), 4)),
+                    ("基准收益", _percent(metrics.get("benchmark_total_return"))),
+                    ("完整交易数", summary.get("trade_count")),
+                    ("胜率", _percent(summary.get("win_rate"))),
+                    ("拒单率", _percent(rejection.get("rejected_orders", 0) / rejection.get("total_orders", 0) if rejection.get("total_orders") else None)),
+                    ("平均现金占比", _percent(sum(row.get("cash_ratio") or 0 for row in report.get("equity_curve") or []) / len(report.get("equity_curve") or []) if report.get("equity_curve") else None)),
+                    ("入场 RET60 中位数", _percent(ret60.get("median"))),
+                ),
+            ),
+            "",
+            "**订单拒绝分类**",
+            "",
+            *_table(
+                ("分类", "数量", "原因示例"),
+                (
+                    (category, count, "; ".join((rejection.get("examples") or {}).get(category, [])) or _MISSING)
+                    for category, count in sorted((rejection.get("by_category") or {}).items(), key=lambda item: (-item[1], item[0]))
+                ),
+            ),
+            "",
+            "**退出原因分类**",
+            "",
+            *exit_table,
+            "",
+            "**年度表现**",
+            "",
+            *_calendar_table(report.get("evaluation") or {}, "year"),
+            "",
+            "**市场状态表现（仅事后评价）**",
+            "",
+            *_regime_table(report.get("evaluation") or {}),
+            "",
+        ]
+        all_trades.extend((capital, trade) for trade in (report.get("trades") or [])[:max_trade_rows_per_run])
+
+    trade_rows = [
+        (
+            capital, trade.get("ts_code"), trade.get("name"), trade.get("buy_date"), trade.get("sell_date"),
+            trade.get("holding_trading_days"), _money(trade.get("buy_price")), _money(trade.get("sell_price")),
+            _money(trade.get("net_pnl")), _percent(trade.get("net_return")), trade.get("exit_reason"),
+        )
+        for capital, trade in all_trades
+    ]
+    trade_table = _table(
+        ("初始资金", "代码", "名称", "买入日", "卖出日", "持有交易日", "买入价", "卖出价", "净盈亏", "净收益率", "退出原因"),
+        trade_rows,
+    ) if trade_rows else ["暂无完整交易。"]
+    lines += [
+        "## 4. 全部资金场景逐笔交易",
+        "",
+        "股票身份以 `ts_code` 为准，名称仅作展示；每行属于对应资金 Scenario（场景）的完整成交交易。",
+        "",
+        *trade_table,
+        *(["", f"> 各资金场景最多展示 {max_trade_rows_per_run} 笔交易；当前合并输出 {len(trade_rows)} 笔。"] if len(trade_rows) > max_trade_rows_per_run * max(1, len(ordered_reports)) else []),
+        "",
+        "## 5. 给 AI 分析的固定边界",
+        "",
+        "1. 先确认所有 Run 的 Dataset、Strategy、Evaluation、执行引擎、输入哈希和代码身份一致。",
+        "2. 先分析拒单率、平均现金占比、成交数量，再判断收益差异是否来自资金规模。",
+        "3. 结合逐笔交易、退出原因、年度和市场状态表现，区分执行约束与策略失败机制。",
+        "4. 未来价格路径和市场状态属于事后 Evaluation（评估），不能参与历史信号重算。",
+        "5. 不要自动调参；任何改进建议都必须形成新 StrategyVersion（策略版本）并进行单变量对照实验。",
+        "",
+    ]
+    return "\n".join(lines)

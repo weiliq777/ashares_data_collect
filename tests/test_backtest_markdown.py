@@ -1,4 +1,5 @@
 from data_collect.evaluation.markdown import (
+    render_capital_sensitivity_bundle_markdown,
     render_capital_sensitivity_markdown,
     render_diagnostic_markdown,
 )
@@ -120,3 +121,24 @@ def test_capital_sensitivity_markdown_is_compact_and_read_only():
     assert "# 资金敏感性对比" in output
     assert "¥10,000.00" in output
     assert "不会重新运行回测" in output
+
+
+def test_capital_sensitivity_bundle_contains_each_run_and_trade():
+    report = _report()
+    report["run"]["initial_cash"] = 30000
+    report["run"]["run_id"] = "run-30k"
+    comparison = {
+        "comparable": True,
+        "evaluation_version": "standard-evaluation-v1",
+        "available_run_count": 1,
+        "requested_capitals": [30000],
+        "rows": [{"initial_capital": 30000, "status": "SUCCEEDED", "final_equity": 9000, "total_return": -0.7}],
+    }
+
+    output = render_capital_sensitivity_bundle_markdown([report], comparison)
+
+    assert "# 全部资金场景 AI 分析数据文档" in output
+    assert "¥30,000.00" in output
+    assert "run-30k" in output
+    assert "全部资金场景逐笔交易" in output
+    assert "000001.SZ" in output

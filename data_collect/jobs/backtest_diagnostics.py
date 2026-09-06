@@ -21,7 +21,10 @@ from uuid import uuid4
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
-from data_collect.evaluation.markdown import render_diagnostic_markdown
+from data_collect.evaluation.markdown import (
+    render_capital_sensitivity_bundle_markdown,
+    render_diagnostic_markdown,
+)
 from data_collect.evaluation.standard import build_capital_sensitivity, build_standard_evaluation
 
 
@@ -604,15 +607,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     report = diagnose_run(args.run_id)
     capital_sensitivity = None
+    capital_reports = [report]
     if args.capital_run_ids:
-        reports = [
-            diagnose_run(run_id.strip())
-            for run_id in args.capital_run_ids.split(",")
-            if run_id.strip()
-        ]
-        capital_sensitivity = build_capital_sensitivity(reports)
+        known_ids = {str((report.get("run") or {}).get("run_id"))}
+        for run_id in args.capital_run_ids.split(","):
+            normalized = run_id.strip()
+            if normalized and normalized not in known_ids:
+                capital_reports.append(diagnose_run(normalized))
+                known_ids.add(normalized)
+        capital_sensitivity = build_capital_sensitivity(capital_reports)
     if args.format == "markdown":
-        output = render_diagnostic_markdown(report, capital_sensitivity=capital_sensitivity)
+        output = (
+            render_capital_sensitivity_bundle_markdown(capital_reports, capital_sensitivity)
+            if capital_sensitivity is not None
+            else render_diagnostic_markdown(report)
+        )
     else:
         payload: Any = report
         if capital_sensitivity is not None:

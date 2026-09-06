@@ -82,3 +82,10 @@ GET /api/backtests/compare.md?run_ids=<run_id_10k>,<run_id_30k>,<run_id_50k>,<ru
 ```
 
 文档会保留回测身份、输入哈希、核心指标、订单拒绝归因、逐笔交易、退出原因、入场 RET60、未来价格路径、年月/市场状态/滚动评估和资金敏感性，并明确标识事后 Evaluation（评估），避免把未来信息误当成历史信号。
+### 全部资金合并导出
+
+Dashboard（看板）中的“导出全部资金 AI Markdown”会自动发现当前策略已经完成的资金场景，并将各场景的身份、核心指标、订单拒绝归因、逐笔交易、退出原因和年度/市场状态评估合并为一份文档。对应接口为：
+
+```text
+GET /api/backtests/capital-sensitivity/diagnostics.md?base_run_id=<run_id>
+```
