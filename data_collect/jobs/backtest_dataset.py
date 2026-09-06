@@ -561,8 +561,15 @@ def create_dataset(
         if any(row["status"] != "FROZEN" for row in rows):
             raise ValueError("Backtest Dataset 只能引用 FROZEN Research Snapshot")
         schema_versions = {row["schema_version"] for row in rows}
-        if len(schema_versions) != 1 or not schema_versions <= SUPPORTED_RESEARCH_SCHEMA_VERSIONS:
+        if not schema_versions <= SUPPORTED_RESEARCH_SCHEMA_VERSIONS:
             raise ValueError(f"Research Snapshot schema_version 不兼容: {sorted(schema_versions)}")
+        if len(schema_versions) > 1 and not all(
+            is_foundation_schema(version) for version in schema_versions
+        ):
+            raise ValueError(
+                "Dataset 只能混合 Foundation Research Snapshot schema；"
+                f"实际={sorted(schema_versions)}"
+            )
         foundation_contract_issues = _foundation_contract_issues(
             rows, repository, context,
         )
@@ -578,6 +585,11 @@ def create_dataset(
             raise ValueError("Research Snapshot 绑定的 Raw 来源边界与 Dataset 基线不一致")
         if not any(evaluation_start <= day <= evaluation_end for day in dates):
             raise ValueError("没有覆盖 evaluation 区间的 Research Snapshot")
+        availability_rules = dict(AVAILABILITY_RULES)
+        availability_rules["research_snapshot_schema_versions"] = sorted(schema_versions)
+        availability_rules["research_snapshot_schema_policy"] = (
+            "same_schema_or_mixed_foundation_schema_versions"
+        )
         manifest = {
             "dataset_id": dataset_id, "dataset_version": dataset_version, "dataset_name": dataset_name,
             "data_baseline_tag": baseline_tag, "baseline_quality_report_hash": baseline["quality_report_hash"],
@@ -588,7 +600,7 @@ def create_dataset(
             "market_rule_version": market_rule_version, "fee_rule_version": fee_rule_version,
             "benchmark_code": benchmark_code, "selection_predicate": SELECTION_PREDICATE,
             "selected_columns": _json_param(SELECTED_COLUMNS), "hash_algorithm": HASH_ALGORITHM,
-            "availability_rules": _json_param(AVAILABILITY_RULES),
+            "availability_rules": _json_param(availability_rules),
         }
         repository.create_manifest(manifest, context)
         members = []

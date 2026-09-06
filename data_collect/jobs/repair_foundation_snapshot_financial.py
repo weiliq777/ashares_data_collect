@@ -1,0 +1,206 @@
+"""Create immutable Foundation-v2.1 replacements for invalid Snapshot dates.
+
+This job never updates or deletes an existing Research Snapshot/Dataset.  It
+consumes the read-only audit JSON, verifies that the listed snapshot IDs still
+match the frozen Dataset, and then delegates creation/build/validation/freeze
+to the existing Research Snapshot series workflow.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import date
+from pathlib import Path
+from uuid import uuid4
+
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.dataset_repository import DatasetRepository
+from data_collect.data_access.research_contract import (
+    STRATEGY_NEUTRAL_SCHEMA_VERSION,
+    is_foundation_schema,
+)
+from data_collect.jobs.research_snapshot_series import create_snapshot_series
+
+
+AUDIT_VERSION = "foundation-financial-contract-v1"
+
+
+def _read_dataset_contract(dataset_id: str) -> tuple[dict, list[dict]]:
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"repair-foundation-snapshot-read-{uuid4().hex}",
+        job_name="repair_foundation_snapshot_financial",
+        code_version="unknown",
+        config_hash="unknown",
+        pipeline_version="data-access-v1",
+    )
+    try:
+        repository = DatasetRepository(kernel)
+        return (
+            repository.manifest(dataset_id, context),
+            repository.research_snapshot_contracts(dataset_id, context),
+        )
+    finally:
+        kernel.close()
+
+
+def _load_issue_dates(audit_path: str | Path, dataset_id: str) -> list[dict]:
+    payload = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+    if payload.get("audit_version") != AUDIT_VERSION:
+        raise ValueError(
+            "unsupported audit version: "
+            f"{payload.get('audit_version')!r}; expected {AUDIT_VERSION!r}"
+        )
+    if str(payload.get("dataset_id")) != str(dataset_id):
+        raise ValueError("audit dataset_id does not match the requested Dataset")
+    if payload.get("status") != "FAIL":
+        raise ValueError("repair requires a failing audit result")
+    rows = list(payload.get("issue_rows") or [])
+    if not rows:
+        raise ValueError("audit has no issue rows to repair")
+    rows.sort(key=lambda row: (str(row.get("research_date")), str(row.get("snapshot_id"))))
+    dates = [row.get("research_date") for row in rows]
+    if any(not value for value in dates) or len(set(dates)) != len(dates):
+        raise ValueError("audit issue dates must be non-empty and unique")
+    if any(int(row.get("non_v2_source_rows") or 0) <= 0 for row in rows):
+        raise ValueError("audit contains an issue without a non-V2 source row")
+    return rows
+
+
+def prepare_repair(dataset_id: str, audit_path: str | Path) -> dict:
+    manifest, members = _read_dataset_contract(dataset_id)
+    if manifest["status"] != "FROZEN":
+        raise RuntimeError(
+            f"source Dataset must remain FROZEN during repair: {manifest['status']}"
+        )
+    member_by_date = {
+        row["research_date"].isoformat(): row for row in members
+    }
+    issue_rows = _load_issue_dates(audit_path, dataset_id)
+    missing = [row["research_date"] for row in issue_rows if row["research_date"] not in member_by_date]
+    if missing:
+        raise RuntimeError(f"audit dates are not Dataset members: {missing[:5]}")
+    for row in issue_rows:
+        member = member_by_date[row["research_date"]]
+        if str(member["research_snapshot_id"]) != str(row["snapshot_id"]):
+            raise RuntimeError(
+                "audit snapshot identity changed for "
+                f"{row['research_date']}: {row['snapshot_id']} != "
+                f"{member['research_snapshot_id']}"
+            )
+        if member["snapshot_status"] != "FROZEN":
+            raise RuntimeError(
+                f"source snapshot is no longer FROZEN: {row['research_date']}"
+            )
+        if not is_foundation_schema(str(member["research_schema_version"])):
+            raise RuntimeError(
+                f"source snapshot schema is not Foundation: {row['research_date']}"
+            )
+    return {
+        "dataset_id": str(dataset_id),
+        "source_dataset_status": manifest["status"],
+        "baseline_tag": manifest["baseline"],
+        "source_schema_versions": sorted({
+            str(row["research_schema_version"]) for row in members
+        }),
+        "target_schema_version": STRATEGY_NEUTRAL_SCHEMA_VERSION,
+        "issue_count": len(issue_rows),
+        "issue_rows": issue_rows,
+    }
+
+
+def repair_dataset(
+    dataset_id: str,
+    audit_path: str | Path,
+    *,
+    batch_size: int = 10,
+    freeze: bool = True,
+    code_archive_path: str | None = None,
+    output_path: str | Path | None = None,
+) -> dict:
+    plan = prepare_repair(dataset_id, audit_path)
+    target_schema = plan["target_schema_version"]
+    if target_schema != "research-v2.1":
+        raise RuntimeError(f"unexpected replacement schema: {target_schema}")
+    issue_rows = plan["issue_rows"]
+    dates = [date.fromisoformat(row["research_date"]) for row in issue_rows]
+    print(
+        f"creating immutable Foundation replacement snapshots: "
+        f"{len(dates)} dates, schema={target_schema}",
+        flush=True,
+    )
+    created = create_snapshot_series(
+        dates,
+        plan["baseline_tag"],
+        schema_version=target_schema,
+        notes_prefix=(
+            f"versioned replacement for Dataset {dataset_id}; "
+            "source audit foundation-financial-contract-v1"
+        ),
+        build=True,
+        validate=True,
+        freeze=freeze,
+        code_archive_path=code_archive_path,
+        max_snapshots=None,
+        batch_size=batch_size,
+        verify_source_manifest=False,
+    )
+    replacements = [
+        {
+            "research_date": item["research_cutoff_date"],
+            "old_snapshot_id": row["snapshot_id"],
+            "new_snapshot_id": item["snapshot_id"],
+            "new_schema_version": target_schema,
+        }
+        for row, item in zip(issue_rows, created)
+    ]
+    result = {
+        "repair_version": "foundation-financial-replacement-v1",
+        "dataset_id": str(dataset_id),
+        "source_dataset_status": plan["source_dataset_status"],
+        "baseline_tag": plan["baseline_tag"],
+        "source_schema_versions": plan["source_schema_versions"],
+        "replacement_schema_version": target_schema,
+        "freeze": freeze,
+        "replacement_count": len(replacements),
+        "replacements": replacements,
+        "status": "FROZEN" if freeze else "VALIDATED",
+    }
+    if output_path:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+    return result
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Create immutable Foundation-v2.1 replacement Snapshots"
+    )
+    parser.add_argument("--dataset-id", required=True)
+    parser.add_argument("--audit", required=True)
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--no-freeze", action="store_true")
+    parser.add_argument("--code-archive-path")
+    parser.add_argument("--output")
+    args = parser.parse_args(argv)
+    if args.batch_size <= 0 or args.batch_size > 20:
+        parser.error("--batch-size must be between 1 and 20")
+    result = repair_dataset(
+        args.dataset_id,
+        args.audit,
+        batch_size=args.batch_size,
+        freeze=not args.no_freeze,
+        code_archive_path=args.code_archive_path,
+        output_path=args.output,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
