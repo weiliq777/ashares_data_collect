@@ -16,9 +16,17 @@ from uuid import uuid4
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.dataset_repository import DatasetRepository
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchSnapshotRepository,
+)
 from data_collect.data_access.research_contract import (
     STRATEGY_NEUTRAL_SCHEMA_VERSION,
     is_foundation_schema,
+)
+from data_collect.jobs.research_snapshot import (
+    _baseline,
+    freeze_snapshots_batch,
+    validate_snapshots_batch,
 )
 from data_collect.jobs.research_snapshot_series import create_snapshot_series
 
@@ -126,10 +134,13 @@ def repair_dataset(
     issue_rows = plan["issue_rows"]
     dates = [date.fromisoformat(row["research_date"]) for row in issue_rows]
     print(
-        f"creating immutable Foundation replacement snapshots: "
+        f"creating immutable Foundation replacement manifests: "
         f"{len(dates)} dates, schema={target_schema}",
         flush=True,
     )
+    # Manifest creation is cheap and resumable.  The actual materialization
+    # uses the specialized clone/enrich path below; the generic builder would
+    # rescan every input group for every date.
     created = create_snapshot_series(
         dates,
         plan["baseline_tag"],
@@ -138,14 +149,109 @@ def repair_dataset(
             f"versioned replacement for Dataset {dataset_id}; "
             "source audit foundation-financial-contract-v1"
         ),
-        build=True,
-        validate=True,
-        freeze=freeze,
-        code_archive_path=code_archive_path,
+        build=False,
+        validate=False,
+        freeze=False,
+        code_archive_path=None,
         max_snapshots=None,
         batch_size=batch_size,
         verify_source_manifest=False,
     )
+    kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = RunContext(
+        run_id=f"repair-foundation-snapshot-build-{uuid4().hex}",
+        job_name="repair_foundation_snapshot_financial",
+        code_version="unknown",
+        config_hash="unknown",
+        pipeline_version="data-access-v1",
+    )
+    repository = ResearchSnapshotRepository(kernel)
+    replacements_by_date = {
+        item["research_cutoff_date"]: item["snapshot_id"] for item in created
+    }
+    source_by_date = {row["research_date"]: row["snapshot_id"] for row in issue_rows}
+    statuses = {}
+    quality_reports: dict[str, tuple[dict, str]] = {}
+    try:
+        pending_build = []
+        for row in issue_rows:
+            target_id = replacements_by_date[row["research_date"]]
+            target_manifest = repository.manifest(target_id, context)
+            statuses[target_id] = target_manifest["status"]
+            if not target_manifest.get("quality_report") or not target_manifest.get("quality_hash"):
+                raise RuntimeError(
+                    f"replacement Snapshot lacks its immutable quality evidence: {target_id}"
+                )
+            quality_reports[target_id] = (
+                target_manifest["quality_report"],
+                target_manifest["quality_hash"],
+            )
+            if target_manifest["status"] == "BUILDING":
+                raise RuntimeError(
+                    f"replacement Snapshot is BUILDING; resume is ambiguous: {target_id}"
+                )
+            if target_manifest["status"] in {"DRAFT", "FAILED"}:
+                pending_build.append((target_id, source_by_date[row["research_date"]]))
+        for offset in range(0, len(pending_build), batch_size):
+            batch = pending_build[offset:offset + batch_size]
+            for target_id, source_id in batch:
+                result = repository.build_financial_replacement_snapshot(
+                    target_id, source_id, context,
+                )
+                if result["stock_rows"] != result["lineage_rows"]:
+                    raise RuntimeError(
+                        "replacement lineage row count mismatch: "
+                        f"snapshot_id={target_id}, result={result}"
+                    )
+            print(
+                f"replacement snapshot build progress "
+                f"{min(offset + len(batch), len(pending_build))}/{len(pending_build)}",
+                flush=True,
+            )
+        for item in created:
+            target_id = item["snapshot_id"]
+            statuses[target_id] = repository.manifest(target_id, context)["status"]
+    finally:
+        kernel.close()
+
+    baseline = _baseline(max(dates), plan["baseline_tag"], verify_source_manifest=False)
+    pending_validate = [
+        item["snapshot_id"] for item in created
+        if statuses[item["snapshot_id"]] == "BUILDING"
+    ]
+    for offset in range(0, len(pending_validate), batch_size):
+        batch = pending_validate[offset:offset + batch_size]
+        validate_snapshots_batch(
+            batch,
+            baseline=baseline,
+            quality_reports={target_id: quality_reports[target_id] for target_id in batch},
+        )
+        for target_id in batch:
+            statuses[target_id] = "VALIDATED"
+        print(
+            f"replacement snapshot validate progress "
+            f"{min(offset + len(batch), len(pending_validate))}/{len(pending_validate)}",
+            flush=True,
+        )
+    pending_freeze = [
+        item["snapshot_id"] for item in created
+        if statuses[item["snapshot_id"]] == "VALIDATED"
+    ]
+    if freeze:
+        for offset in range(0, len(pending_freeze), batch_size):
+            batch = pending_freeze[offset:offset + batch_size]
+            freeze_snapshots_batch(
+                batch,
+                code_archive_path=code_archive_path,
+                baseline=baseline,
+                quality_report=next(iter(quality_reports.values()))[0],
+                verify_source_manifest=False,
+            )
+            print(
+                f"replacement snapshot freeze progress "
+                f"{min(offset + len(batch), len(pending_freeze))}/{len(pending_freeze)}",
+                flush=True,
+            )
     replacements = [
         {
             "research_date": item["research_cutoff_date"],

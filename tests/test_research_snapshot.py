@@ -466,6 +466,22 @@ def test_lineage_bundle_preserves_ten_groups_and_is_replay_safe():
     assert "INSERT INTO research.snapshot_lineage\n" not in sql
 
 
+def test_foundation_lineage_clone_rebuilds_only_financial_reference():
+    sql = ResearchSnapshotRepository.foundation_lineage_clone_sql()
+    lower = sql.lower()
+    assert "feature.company_financial_v2" in lower
+    assert "from research.snapshot_lineage_bundle b" in lower
+    assert "from research.stock_snapshot_daily s" in lower
+    assert "insert into research.lineage_source_record" in lower
+    assert "insert into research.snapshot_lineage_bundle" in lower
+    assert "on conflict (research_date, snapshot_id, ts_code) do update" in lower
+    assert "source_bundle_hash" in lower
+    # The repair must not invoke the expensive ten-group PIT/Feature lineage
+    # reconstruction or retain the legacy V1 financial source in the bundle.
+    assert "feature.company_financial_v1" not in lower
+    assert "insert into research.snapshot_lineage\n" not in lower
+
+
 def test_legacy_lineage_bundle_is_format_migration_only():
     sql = ResearchSnapshotRepository.legacy_lineage_bundle_sql()
     lower = sql.lower()

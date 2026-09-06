@@ -72,6 +72,51 @@ class ResearchSnapshotRepository(BaseRepository):
     # arbitrary SQL operation.  25 keeps the fallback bounded on the most
     # expensive Foundation-v2 joins while avoiding one-row thrashing.
     MIN_ADAPTIVE_CODE_BATCH_SIZE = 25
+    # The Foundation replacement path runs a relatively expensive lineage
+    # CTE against the snapshot and its source dictionary.  Keep this path
+    # deliberately smaller than the normal builder's batch: a replacement
+    # must be restartable and must never leave an orphaned, multi-minute
+    # statement holding the database I/O queue hostage on WSL/PostgreSQL.
+    REPLACEMENT_LINEAGE_CODE_BATCH_SIZE = 100
+    # All persisted stock fields are copied from the immutable source Snapshot
+    # before the Foundation-v2 financial enrichment runs.  Keeping this
+    # allowlisted projection explicit avoids SELECT * drift when the table is
+    # extended by a later migration.
+    REPLACEMENT_STOCK_COLUMNS = (
+        "research_date", "ts_code", "symbol", "name", "market", "list_status",
+        "list_date", "delist_date", "is_listed_asof", "is_st_asof",
+        "is_suspended_asof", "eligible_by_market", "is_tradeable", "can_buy",
+        "can_sell", "limit_status", "raw_open", "raw_high", "raw_low",
+        "raw_close", "raw_volume", "raw_amount", "up_limit", "down_limit",
+        "adj_close_base", "price_feature_version", "price_adjustment_mode",
+        "return_1d", "return_20d", "return_60d", "ma20", "ma60", "ma120",
+        "volume_ratio_20d", "available_observation_count", "ma20_observation_count",
+        "ma60_observation_count", "ma120_observation_count", "pe_ttm", "pb",
+        "ps_ttm", "dv_ratio", "total_mv", "circ_mv", "pe_pct_3y", "pe_pct_5y",
+        "pb_pct_3y", "pb_pct_5y", "is_pe_meaningful", "valuation_observation_count",
+        "pe_window_start_date_5y", "has_full_pe_5y_history", "report_date",
+        "effective_announce_date", "financial_version_available_date",
+        "financial_record_version", "financial_source_record_key",
+        "financial_payload_hash", "financial_vintage_quality",
+        "financial_source_observed_at", "roe", "roa", "debt_to_assets",
+        "revenue_yoy", "tr_yoy", "q_sales_yoy", "netprofit_yoy",
+        "operating_cashflow", "net_profit", "cash_div_12m",
+        "dividend_event_count_3y", "dividend_year_count_3y", "annual_report_count_5y",
+        "roe_above_15_years_5y", "roe_5y_min", "roe_5y_all_above_15",
+        "ocf_report_count_3y", "ocf_positive_years_3y", "ocf_3y_all_positive",
+        "quarterly_report_count_4q", "q_sales_yoy_above_30_quarters_4q",
+        "q_sales_yoy_4q_all_above_30", "instrument_source_record_key",
+        "instrument_source_record_version", "instrument_source_payload_hash",
+        "financial_feature_contract_version", "financial_data_available_timestamp",
+        "net_profit_consolidated_ttm", "net_profit_parent_ttm",
+        "operating_cashflow_ttm", "ocf_to_net_profit_consolidated_ttm",
+        "roe_ttm", "gross_margin_ttm", "net_margin_consolidated_ttm",
+        "revenue_growth_yoy", "profit_growth_yoy", "cashflow_quality_status",
+        "roe_quality_status", "growth_quality_status", "ttm_complete", "dv_ttm",
+        "dv_ttm_percentile_5y", "dv_ttm_source", "dv_window_start", "dv_window_end",
+        "dv_observation_days", "dv_window_complete", "financial_component_lineage",
+        "financial_source_fingerprint", "quality_status",
+    )
 
     @classmethod
     def lineage_target(cls, manifest: dict[str, Any]) -> str:
@@ -584,6 +629,156 @@ class ResearchSnapshotRepository(BaseRepository):
             source_bundle_hash=EXCLUDED.source_bundle_hash
         """
         return sql.replace(final_select, bundle_select, 1)
+
+    @staticmethod
+    def foundation_lineage_clone_sql() -> str:
+        """Return the bounded financial-only lineage replacement statement.
+
+        A Foundation repair reuses an immutable source Snapshot whose nine
+        non-financial lineage references are already validated.  Recomputing
+        all ten lineage groups from PIT/Feature for every replacement date
+        would turn a format/materialization repair into a full rebuild.  This
+        statement therefore copies the nine existing references, creates only
+        the V2 financial source dictionary entries from the repaired stock
+        rows, and recomputes the deterministic bundle hash.
+        """
+        return """
+        WITH params AS (
+            SELECT %s::uuid AS target_snapshot_id,
+                   %s::uuid AS source_snapshot_id,
+                   %s::date AS research_date,
+                   %s::text[] AS codes
+        ), financial AS (
+            SELECT s.ts_code,
+                   'feature.company_financial_v2'::varchar AS source_table,
+                   COALESCE(
+                       s.financial_source_record_key,
+                       s.ts_code || ':' || s.research_date::text || ':missing'
+                   ) AS source_record_key,
+                   s.financial_record_version AS source_record_version,
+                   s.financial_payload_hash AS source_payload_hash,
+                   digest(convert_to(jsonb_build_object(
+                       'source_table', 'feature.company_financial_v2',
+                       'source_record_key', COALESCE(
+                           s.financial_source_record_key,
+                           s.ts_code || ':' || s.research_date::text || ':missing'
+                       ),
+                       'source_record_version', s.financial_record_version,
+                       'source_payload_hash', s.financial_payload_hash
+                   )::text, 'UTF8'), 'sha256') AS source_identity_hash
+              FROM research.stock_snapshot_daily s
+              JOIN params p
+                ON p.target_snapshot_id=s.snapshot_id
+               AND p.research_date=s.research_date
+               AND s.ts_code=ANY(p.codes)
+        ), source_rows AS (
+            SELECT DISTINCT source_table, source_record_key,
+                            source_record_version, source_payload_hash,
+                            source_identity_hash
+              FROM financial
+        ), inserted_source AS (
+            INSERT INTO research.lineage_source_record
+                (source_identity_hash, source_table, source_record_key,
+                 source_record_version, source_payload_hash)
+            SELECT source_identity_hash, source_table, source_record_key,
+                   source_record_version, source_payload_hash
+              FROM source_rows
+            ON CONFLICT (source_identity_hash) DO NOTHING
+            RETURNING source_ref_id, source_identity_hash
+        ), resolved_financial AS (
+            SELECT f.ts_code, f.source_identity_hash,
+                   COALESCE(i.source_ref_id, d.source_ref_id) AS source_ref_id
+              FROM financial f
+              LEFT JOIN inserted_source i
+                ON i.source_identity_hash=f.source_identity_hash
+              LEFT JOIN research.lineage_source_record d
+                ON d.source_identity_hash=f.source_identity_hash
+        ), source_bundle AS (
+            SELECT b.ts_code,
+                   b.universe_source_ref_id,
+                   b.tradeability_source_ref_id,
+                   b.price_source_ref_id,
+                   b.valuation_source_ref_id,
+                   b.shareholder_return_source_ref_id,
+                   b.lifecycle_source_ref_id,
+                   b.instrument_source_ref_id,
+                   b.market_facts_source_ref_id,
+                   b.fundamental_history_source_ref_id,
+                   u.source_identity_hash AS universe_identity_hash,
+                   t.source_identity_hash AS tradeability_identity_hash,
+                   pr.source_identity_hash AS price_identity_hash,
+                   v.source_identity_hash AS valuation_identity_hash,
+                   sr.source_identity_hash AS shareholder_return_identity_hash,
+                   l.source_identity_hash AS lifecycle_identity_hash,
+                   i.source_identity_hash AS instrument_identity_hash,
+                   mf.source_identity_hash AS market_facts_identity_hash,
+                   fh.source_identity_hash AS fundamental_history_identity_hash
+              FROM research.snapshot_lineage_bundle b
+              JOIN params p
+                ON p.source_snapshot_id=b.snapshot_id
+               AND p.research_date=b.research_date
+               AND b.ts_code=ANY(p.codes)
+              JOIN research.lineage_source_record u
+                ON u.source_ref_id=b.universe_source_ref_id
+              JOIN research.lineage_source_record t
+                ON t.source_ref_id=b.tradeability_source_ref_id
+              JOIN research.lineage_source_record pr
+                ON pr.source_ref_id=b.price_source_ref_id
+              JOIN research.lineage_source_record v
+                ON v.source_ref_id=b.valuation_source_ref_id
+              JOIN research.lineage_source_record sr
+                ON sr.source_ref_id=b.shareholder_return_source_ref_id
+              JOIN research.lineage_source_record l
+                ON l.source_ref_id=b.lifecycle_source_ref_id
+              JOIN research.lineage_source_record i
+                ON i.source_ref_id=b.instrument_source_ref_id
+              JOIN research.lineage_source_record mf
+                ON mf.source_ref_id=b.market_facts_source_ref_id
+              JOIN research.lineage_source_record fh
+                ON fh.source_ref_id=b.fundamental_history_source_ref_id
+        )
+        INSERT INTO research.snapshot_lineage_bundle
+            (snapshot_id, research_date, ts_code,
+             universe_source_ref_id, tradeability_source_ref_id,
+             price_source_ref_id, valuation_source_ref_id,
+             financial_source_ref_id, shareholder_return_source_ref_id,
+             lifecycle_source_ref_id, instrument_source_ref_id,
+             market_facts_source_ref_id, fundamental_history_source_ref_id,
+             source_bundle_hash)
+        SELECT p.target_snapshot_id, p.research_date, b.ts_code,
+               b.universe_source_ref_id, b.tradeability_source_ref_id,
+               b.price_source_ref_id, b.valuation_source_ref_id,
+               f.source_ref_id, b.shareholder_return_source_ref_id,
+               b.lifecycle_source_ref_id, b.instrument_source_ref_id,
+               b.market_facts_source_ref_id, b.fundamental_history_source_ref_id,
+               encode(digest(convert_to(jsonb_build_object(
+                   'universe', encode(b.universe_identity_hash, 'hex'),
+                   'tradeability', encode(b.tradeability_identity_hash, 'hex'),
+                   'price', encode(b.price_identity_hash, 'hex'),
+                   'valuation', encode(b.valuation_identity_hash, 'hex'),
+                   'financial', encode(f.source_identity_hash, 'hex'),
+                   'shareholder_return', encode(b.shareholder_return_identity_hash, 'hex'),
+                   'lifecycle', encode(b.lifecycle_identity_hash, 'hex'),
+                   'instrument', encode(b.instrument_identity_hash, 'hex'),
+                   'market_facts', encode(b.market_facts_identity_hash, 'hex'),
+                   'fundamental_history', encode(b.fundamental_history_identity_hash, 'hex')
+               )::text, 'UTF8'), 'sha256'), 'hex')::char(64)
+          FROM params p
+          JOIN source_bundle b ON TRUE
+          JOIN resolved_financial f ON f.ts_code=b.ts_code
+        ON CONFLICT (research_date, snapshot_id, ts_code) DO UPDATE SET
+            universe_source_ref_id=EXCLUDED.universe_source_ref_id,
+            tradeability_source_ref_id=EXCLUDED.tradeability_source_ref_id,
+            price_source_ref_id=EXCLUDED.price_source_ref_id,
+            valuation_source_ref_id=EXCLUDED.valuation_source_ref_id,
+            financial_source_ref_id=EXCLUDED.financial_source_ref_id,
+            shareholder_return_source_ref_id=EXCLUDED.shareholder_return_source_ref_id,
+            lifecycle_source_ref_id=EXCLUDED.lifecycle_source_ref_id,
+            instrument_source_ref_id=EXCLUDED.instrument_source_ref_id,
+            market_facts_source_ref_id=EXCLUDED.market_facts_source_ref_id,
+            fundamental_history_source_ref_id=EXCLUDED.fundamental_history_source_ref_id,
+            source_bundle_hash=EXCLUDED.source_bundle_hash
+        """
 
     @staticmethod
     def legacy_lineage_bundle_sql() -> str:
@@ -1456,6 +1651,188 @@ class ResearchSnapshotRepository(BaseRepository):
             if any(values[key] for key in values if key != "snapshot_rows"):
                 issues[str(row["snapshot_id"])] = values
         return issues
+
+    def build_financial_replacement_snapshot(
+        self,
+        snapshot_id: str,
+        source_snapshot_id: str,
+        context: RunContext,
+    ) -> dict[str, int]:
+        """Build a V2.1 replacement by reusing an immutable frozen Snapshot.
+
+        The source Snapshot is known to have correct non-financial fields; the
+        repair only changes the financial V2 projection and its compact
+        lineage. Input manifests are copied verbatim because the source
+        Snapshot already records the exact baseline-bounded inputs. This is a
+        set-based replacement operation, not a generic full Snapshot rebuild.
+        """
+        target = self.manifest(snapshot_id, context)
+        source = self.manifest(source_snapshot_id, context)
+        if target["status"] not in {"DRAFT", "FAILED"}:
+            raise RuntimeError(
+                f"replacement target must be DRAFT/FAILED: {snapshot_id} ({target['status']})"
+            )
+        if source["status"] != "FROZEN":
+            raise RuntimeError(
+                f"replacement source must be FROZEN: {source_snapshot_id} ({source['status']})"
+            )
+        if not is_foundation_schema(target["schema_version"]):
+            raise RuntimeError(
+                f"replacement target must be Foundation schema: {target['schema_version']}"
+            )
+        if target["cutoff"] != source["cutoff"] or target["baseline"] != source["baseline"]:
+            raise RuntimeError("replacement target/source cutoff or baseline mismatch")
+        cutoff = target["cutoff"]
+        scope = self._snapshot_scope(snapshot_id, cutoff)
+        if self.lineage_target(target) != self.BUNDLE_LINEAGE_TARGET:
+            raise RuntimeError("Foundation replacement requires compact lineage v2")
+        try:
+            with self.kernel.lock_manager.session_exclusive(
+                "research.snapshot", str(snapshot_id),
+            ):
+                changed = self.kernel.write.transition_snapshot_manifest(
+                    context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
+                    {"failure_reason": None},
+                )
+                if changed != 1:
+                    raise RuntimeError("replacement Snapshot lifecycle changed before build")
+                for child in (
+                    self.BUNDLE_LINEAGE_TARGET,
+                    "research.stock_snapshot_daily",
+                    "research.snapshot_input",
+                ):
+                    self._delete_snapshot_rows(snapshot_id, context, child, cutoff)
+
+                codes = self.snapshot_codes(source_snapshot_id, cutoff, context)
+                if not codes:
+                    raise RuntimeError("replacement source has no stock rows")
+                columns = ", ".join(self.REPLACEMENT_STOCK_COLUMNS)
+                source_columns = ", ".join(
+                    f"s.{column}" for column in self.REPLACEMENT_STOCK_COLUMNS
+                )
+                clone_stock_sql = f"""
+                    INSERT INTO research.stock_snapshot_daily
+                        (snapshot_id, {columns})
+                    SELECT %s, {source_columns}
+                      FROM research.stock_snapshot_daily s
+                     WHERE s.snapshot_id=%s
+                       AND s.research_date=%s
+                """
+                clone_plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="research.stock_snapshot_daily",
+                    scope=scope,
+                    expected_mode="SET_BASED",
+                    allow_insert_select=True,
+                    estimated_rows=len(codes),
+                )
+                cloned = self.kernel.rebuild.run_insert_select(
+                    clone_stock_sql, clone_plan, context,
+                    (snapshot_id, source_snapshot_id, cutoff),
+                )
+                if cloned != len(codes):
+                    raise RuntimeError(
+                        "replacement stock row count mismatch: "
+                        f"expected={len(codes)}, cloned={cloned}"
+                    )
+
+                clone_input_sql = """
+                    INSERT INTO research.snapshot_input
+                        (snapshot_id, schema_name, table_name,
+                         selection_predicate, selected_columns, hash_algorithm,
+                         row_count, min_date, max_date, content_hash)
+                    SELECT %s, schema_name, table_name,
+                           selection_predicate, selected_columns, hash_algorithm,
+                           row_count, min_date, max_date, content_hash
+                      FROM research.snapshot_input
+                     WHERE snapshot_id=%s
+                """
+                input_plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="research.snapshot_input",
+                    scope=scope,
+                    expected_mode="SET_BASED",
+                    allow_insert_select=True,
+                )
+                copied_inputs = self.kernel.rebuild.run_insert_select(
+                    clone_input_sql, input_plan, context,
+                    (snapshot_id, source_snapshot_id),
+                )
+                if copied_inputs <= 0 or not source["input_hash"]:
+                    raise RuntimeError("replacement input manifest is empty or unhashed")
+
+                foundation_sql = self.foundation_snapshot_sql().replace(
+                    "WHERE s.snapshot_id=%s",
+                    "WHERE s.snapshot_id=%s AND s.research_date=%s "
+                    "AND s.ts_code=ANY(%s)",
+                    1,
+                )
+                foundation_plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="research.stock_snapshot_daily",
+                    scope=scope,
+                    expected_mode="SET_BASED",
+                    estimated_rows=self.SNAPSHOT_CODE_BATCH_SIZE,
+                )
+                enriched = 0
+                for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
+                    code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
+                    enriched += self._run_adaptive_code_operation(
+                        code_batch,
+                        lambda batch: self.kernel.rebuild.run_scoped_merge(
+                            foundation_sql, foundation_plan, context,
+                            (snapshot_id, snapshot_id, cutoff, list(batch)),
+                        ),
+                    )
+
+                lineage_sql = self.foundation_lineage_clone_sql()
+                bundled = 0
+                for offset in range(
+                    0, len(codes), self.REPLACEMENT_LINEAGE_CODE_BATCH_SIZE,
+                ):
+                    code_batch = codes[
+                        offset:offset + self.REPLACEMENT_LINEAGE_CODE_BATCH_SIZE
+                    ]
+                    lineage_scope = WorkScope(
+                        date_from=cutoff, date_to=cutoff,
+                        codes=tuple(code_batch), partition=str(snapshot_id),
+                        dimensions={"snapshot_id": str(snapshot_id),
+                                    "source_snapshot_id": str(source_snapshot_id)},
+                    )
+                    lineage_plan = SqlPlan(
+                        operation=Operation.REBUILD,
+                        target=self.BUNDLE_LINEAGE_TARGET,
+                        scope=lineage_scope,
+                        expected_mode="SET_BASED",
+                        allow_insert_select=True,
+                        estimated_rows=len(code_batch),
+                    )
+                    bundled += self._run_adaptive_code_operation(
+                        code_batch,
+                        lambda batch: self.kernel.rebuild.run_snapshot_lineage_bundle(
+                            lineage_sql, lineage_plan, context,
+                            (snapshot_id, source_snapshot_id, cutoff, list(batch)),
+                        ),
+                    )
+                changed = self.kernel.write.transition_snapshot_manifest(
+                    context, scope, snapshot_id, ("BUILDING",), "BUILDING",
+                    {"input_manifest_hash": source["input_hash"]},
+                )
+                if changed != 1:
+                    raise RuntimeError("replacement input hash update failed")
+                return {
+                    "stock_rows": cloned,
+                    "input_rows": copied_inputs,
+                    "financial_rows": enriched,
+                    "lineage_rows": bundled,
+                }
+        except Exception as exc:
+            self.kernel.write.transition_snapshot_manifest(
+                context, scope, snapshot_id,
+                ("DRAFT", "BUILDING", "FAILED"), "FAILED",
+                {"failure_reason": str(exc)[:2000]},
+            )
+            raise
 
     def build_snapshot(
         self,
