@@ -1422,7 +1422,7 @@ class ResearchSnapshotRepository(BaseRepository):
          GROUP BY snapshot_id
         """
 
-    def _foundation_financial_contract_issues(
+    def foundation_financial_contract_issues(
         self, manifests: list[dict[str, Any]], context: RunContext,
     ) -> dict[str, dict[str, int]]:
         """Validate V2 financial source identity for a bounded snapshot batch."""
@@ -2297,7 +2297,7 @@ class ResearchSnapshotRepository(BaseRepository):
         issues = []
         if rows["row_count"] == 0 or rows["date_count"] != 1 or rows["min_date"] != cutoff or rows["max_date"] != cutoff:
             issues.append({"snapshot_rows": rows["row_count"], "distinct_dates": rows["date_count"], "min_date": rows["min_date"], "max_date": rows["max_date"]})
-        foundation_financial = self._foundation_financial_contract_issues(
+        foundation_financial = self.foundation_financial_contract_issues(
             [manifest], context,
         ).get(str(snapshot_id))
         if foundation_financial:
@@ -2643,7 +2643,7 @@ class ResearchSnapshotRepository(BaseRepository):
                     }
                 })
 
-        foundation_financial = self._foundation_financial_contract_issues(
+        foundation_financial = self.foundation_financial_contract_issues(
             manifests, context,
         )
         for snapshot_id, values in foundation_financial.items():

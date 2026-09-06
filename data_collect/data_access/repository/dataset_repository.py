@@ -785,6 +785,29 @@ class DatasetRepository(BaseRepository):
             max_rows=100_000,
         )
 
+    def research_snapshot_contracts(
+        self, dataset_id: str, context: RunContext,
+    ) -> list[dict[str, Any]]:
+        """Read Dataset members with their immutable Research contract identity."""
+        return self.kernel.read._repository_query(
+            context,
+            "backtest.dataset_member",
+            """
+                SELECT m.research_date, m.research_snapshot_id,
+                       s.status AS snapshot_status,
+                       s.schema_version AS research_schema_version,
+                       s.data_baseline_tag AS research_baseline
+                  FROM backtest.dataset_member m
+                  JOIN research.snapshot_manifest s
+                    ON s.snapshot_id=m.research_snapshot_id
+                 WHERE m.dataset_id=%s
+                 ORDER BY m.research_date, m.research_snapshot_id
+            """,
+            (dataset_id,),
+            WorkScope(partition=dataset_id, dimensions={"dataset_id": dataset_id}),
+            max_rows=100_000,
+        )
+
     def execution_page(
         self,
         dataset_id: str,

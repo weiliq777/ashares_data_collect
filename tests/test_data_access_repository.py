@@ -207,6 +207,21 @@ def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
     )
 
 
+def test_dataset_research_snapshot_contracts_are_joined_in_one_bounded_read():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    rows = DatasetRepository(kernel).research_snapshot_contracts("dataset-1", ctx())
+    assert rows == []
+    query = conn.executed[-1]
+    assert "JOIN research.snapshot_manifest" in query["sql"]
+    assert "WHERE m.dataset_id=%s" in query["sql"]
+    assert query["params"] == ("dataset-1",)
+
+
 def test_instrument_repository_keeps_legacy_raw_first_seen_only():
     from data_collect.data_access.repository.instrument_repository import InstrumentRepository
 
