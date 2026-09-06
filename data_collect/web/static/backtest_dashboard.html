@@ -281,7 +281,8 @@
 
     function render(data) {
       const m = data.persisted_metrics || {}, curve = data.equity_curve || [], labels = curve.map(x => x.date);
-      $("meta").innerHTML = `<span>策略 <strong>${esc(data.run.strategy_id)} / ${esc(data.run.strategy_version)}</strong></span><span>运行版本 <strong>${esc(data.run.run_version)}</strong></span><span>评估区间 <strong>${esc(data.scope.signal_date_from)} ～ ${esc(data.scope.signal_date_to)}</strong></span><span>状态 <strong class="positive">${esc(data.run.status)}</strong></span>`;
+      const scope = data.scope || {};
+      $("meta").innerHTML = `<span>策略 <strong>${esc(data.run.strategy_id)} / ${esc(data.run.strategy_version)}</strong></span><span>运行版本 <strong>${esc(data.run.run_version)}</strong></span><span>评估区间 <strong>${esc(scope.evaluation_date_from || scope.performance_date_from || scope.signal_date_from)} ～ ${esc(scope.evaluation_date_to || scope.performance_date_to || scope.signal_date_to)}</strong></span><span>信号区间 <strong>${esc(scope.signal_date_from)} ～ ${esc(scope.signal_date_to)}</strong></span><span>状态 <strong class="positive">${esc(data.run.status)}</strong></span>`;
       renderKpis(data);
       makeSvgChart($("equity-chart"), [{name:"策略净值",color:"#58a6ff",values:curve.map(x=>x.nav)},{name:"基准净值",color:"#9aabc0",values:curve.map(x=>x.benchmark_nav)}], {labels,format:v=>num(v,2)});
       makeSvgChart($("drawdown-chart"), [{name:"回撤",color:"#ff6b81",values:curve.map(x=>x.drawdown)}], {labels,format:v=>pct(v),zeroLine:true});

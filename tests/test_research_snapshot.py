@@ -421,6 +421,16 @@ def test_foundation_lineage_points_financial_group_to_selected_v2_record():
         assert column in enrichment
 
 
+def test_foundation_financial_contract_rejects_legacy_lineage_and_missing_identity():
+    sql = ResearchSnapshotRepository.foundation_financial_contract_sql()
+    assert "feature.company_financial_v2" in sql
+    assert "non_v2_source_rows" in sql
+    assert "invalid_v2_rows" in sql
+    assert "financial_source_fingerprint" in sql
+    assert "financial_source_record_key IS DISTINCT FROM source_record_key" in sql
+    assert "financial_data_available_timestamp IS NULL" in sql
+
+
 def test_lineage_contract_has_all_required_groups():
     assert set(REQUIRED_LINEAGE_GROUPS) == {
         "universe", "tradeability", "price", "valuation", "financial",

@@ -4,6 +4,7 @@ import pytest
 
 from data_collect.jobs.backtest_diagnostics import (
     aggregate_period_returns,
+    build_report_scope,
     build_entry_diagnostics,
     build_equity_curve,
     build_trade_records,
@@ -13,6 +14,26 @@ from data_collect.jobs.backtest_diagnostics import (
     summarize_rejections,
     summarize_trades,
 )
+
+
+def test_report_scope_separates_evaluation_window_from_signal_coverage():
+    run = {
+        "parameters": {
+            "evaluation": {
+                "evaluation_start": "2021-09-01",
+                "evaluation_end": "2026-08-21",
+            }
+        }
+    }
+    scope = build_report_scope(
+        run,
+        [{"signal_date": date(2021, 11, 5)}, {"signal_date": date(2023, 9, 8)}],
+        [{"trade_date": date(2021, 9, 1)}, {"trade_date": date(2026, 8, 21)}],
+    )
+    assert scope["evaluation_date_from"] == "2021-09-01"
+    assert scope["evaluation_date_to"] == "2026-08-21"
+    assert scope["signal_date_from"] == "2021-11-05"
+    assert scope["signal_date_to"] == "2023-09-08"
 
 
 def _trade_fixture():

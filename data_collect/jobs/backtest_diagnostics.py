@@ -81,6 +81,42 @@ def _date_value(value: Any) -> date | None:
         return None
 
 
+def build_report_scope(
+    run: Mapping[str, Any],
+    signals: Sequence[Mapping[str, Any]],
+    performance: Sequence[Mapping[str, Any]],
+) -> dict[str, str | None]:
+    """Return the configured evaluation window separately from signal coverage.
+
+    A strategy can stop emitting signals while the persisted equity curve keeps
+    running (for example, after a data gate rejects every candidate).  The
+    dashboard must not present the first/last signal date as the backtest
+    evaluation window because that hides precisely this kind of coverage gap.
+    """
+    signal_dates = sorted(
+        row.get("signal_date") for row in signals
+        if isinstance(row.get("signal_date"), date)
+    )
+    performance_dates = sorted(
+        row.get("trade_date") for row in performance
+        if isinstance(row.get("trade_date"), date)
+    )
+    run_parameters = _json_object(run.get("parameters"))
+    evaluation_parameters = _json_object(run_parameters.get("evaluation"))
+    evaluation_start = _date_value(evaluation_parameters.get("evaluation_start"))
+    evaluation_end = _date_value(evaluation_parameters.get("evaluation_end"))
+    evaluation_start = evaluation_start or (performance_dates[0] if performance_dates else None)
+    evaluation_end = evaluation_end or (performance_dates[-1] if performance_dates else None)
+    return {
+        "evaluation_date_from": _iso(evaluation_start),
+        "evaluation_date_to": _iso(evaluation_end),
+        "performance_date_from": _iso(performance_dates[0] if performance_dates else None),
+        "performance_date_to": _iso(performance_dates[-1] if performance_dates else None),
+        "signal_date_from": _iso(signal_dates[0] if signal_dates else None),
+        "signal_date_to": _iso(signal_dates[-1] if signal_dates else None),
+    }
+
+
 def _round(value: Any, digits: int = 8) -> float | None:
     number = _float(value)
     return None if number is None else round(number, digits)
@@ -458,8 +494,6 @@ def build_report(
         for row in metrics
         if row.get("metric_name")
     }
-    date_from = min((row.get("signal_date") for row in signals if isinstance(row.get("signal_date"), date)), default=None)
-    date_to = max((row.get("signal_date") for row in signals if isinstance(row.get("signal_date"), date)), default=None)
     entry_inputs = list(entry_inputs)
     entry = build_entry_diagnostics(trades, signal_by_id, entry_inputs)
     names_by_entry = {
@@ -488,7 +522,7 @@ def build_report(
             key: _iso(value) if key.endswith("_at") else value
             for key, value in run.items()
         },
-        "scope": {"signal_date_from": _iso(date_from), "signal_date_to": _iso(date_to)},
+        "scope": build_report_scope(run, signals, performance),
         "row_counts": {
             "signals": len(signals), "orders": len(orders), "fills": len(fills),
             "position_lots": len(lots), "performance_daily": len(performance),

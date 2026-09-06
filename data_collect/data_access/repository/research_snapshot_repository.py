@@ -1361,6 +1361,102 @@ class ResearchSnapshotRepository(BaseRepository):
         ]
         return stats, manifest_hash(stats)
 
+    @staticmethod
+    def foundation_financial_contract_sql() -> str:
+        """Return the bounded Foundation-v2 financial identity check.
+
+        Foundation snapshots may retain compatibility fields from V1, but the
+        financial field group consumed by Foundation-v2 must resolve to the
+        V2 feature record that was actually selected.  This check is kept in
+        the Repository because it joins the frozen snapshot and lineage
+        tables; callers only receive aggregate issues, never SQL or cursors.
+        """
+        return """
+        WITH requested AS (
+            SELECT *
+              FROM unnest(%s::uuid[], %s::date[])
+                   AS p(snapshot_id, research_date)
+        ), rows AS (
+            SELECT b.snapshot_id, b.research_date, b.ts_code,
+                   b.financial_source_ref_id,
+                   d.source_ref_id, d.source_table, d.source_record_key,
+                   d.source_record_version, d.source_payload_hash,
+                   s.financial_record_version, s.financial_source_record_key,
+                   s.financial_payload_hash, s.financial_source_fingerprint,
+                   s.financial_feature_contract_version,
+                   s.financial_data_available_timestamp
+              FROM requested p
+              JOIN research.snapshot_lineage_bundle b
+                ON b.snapshot_id=p.snapshot_id
+               AND b.research_date=p.research_date
+              JOIN research.stock_snapshot_daily s
+                ON s.snapshot_id=b.snapshot_id
+               AND s.research_date=b.research_date
+               AND s.ts_code=b.ts_code
+              LEFT JOIN research.lineage_source_record d
+                ON d.source_ref_id=b.financial_source_ref_id
+        )
+        SELECT snapshot_id,
+               COUNT(*)::integer AS snapshot_rows,
+               COUNT(*) FILTER (
+                   WHERE financial_source_ref_id IS NULL OR source_ref_id IS NULL
+               )::integer AS missing_lineage_rows,
+               COUNT(*) FILTER (
+                   WHERE source_record_key IS NOT NULL
+                     AND source_record_key NOT LIKE '%%:missing'
+                     AND source_table IS DISTINCT FROM 'feature.company_financial_v2'
+               )::integer AS non_v2_source_rows,
+               COUNT(*) FILTER (
+                   WHERE source_table='feature.company_financial_v2'
+                     AND source_record_key NOT LIKE '%%:missing'
+                     AND (
+                         financial_record_version IS NULL
+                         OR financial_source_record_key IS DISTINCT FROM source_record_key
+                         OR financial_payload_hash IS DISTINCT FROM source_payload_hash
+                         OR financial_source_fingerprint IS DISTINCT FROM source_payload_hash
+                         OR financial_feature_contract_version IS DISTINCT FROM 'feature-contract-v2.0'
+                         OR financial_data_available_timestamp IS NULL
+                     )
+               )::integer AS invalid_v2_rows
+          FROM rows
+         GROUP BY snapshot_id
+        """
+
+    def _foundation_financial_contract_issues(
+        self, manifests: list[dict[str, Any]], context: RunContext,
+    ) -> dict[str, dict[str, int]]:
+        """Validate V2 financial source identity for a bounded snapshot batch."""
+        if not manifests or not all(
+            is_foundation_schema(str(item.get("schema_version")))
+            for item in manifests
+        ):
+            return {}
+        snapshot_ids = [str(item["snapshot_id"]) for item in manifests]
+        cutoffs = [item["cutoff"] for item in manifests]
+        rows = self.kernel.read._repository_query(
+            context,
+            self.BUNDLE_LINEAGE_TARGET,
+            self.foundation_financial_contract_sql(),
+            (snapshot_ids, cutoffs),
+            WorkScope(
+                date_from=min(cutoffs), date_to=max(cutoffs),
+                partition="snapshot-foundation-financial-contract",
+            ),
+            max_rows=max(2, len(snapshot_ids) + 1),
+        )
+        issues: dict[str, dict[str, int]] = {}
+        for row in rows:
+            values = {
+                key: int(row.get(key) or 0)
+                for key in (
+                    "snapshot_rows", "missing_lineage_rows",
+                    "non_v2_source_rows", "invalid_v2_rows",
+                )
+            }
+            if any(values[key] for key in values if key != "snapshot_rows"):
+                issues[str(row["snapshot_id"])] = values
+        return issues
+
     def build_snapshot(
         self,
         snapshot_id: str,
@@ -2201,6 +2297,11 @@ class ResearchSnapshotRepository(BaseRepository):
         issues = []
         if rows["row_count"] == 0 or rows["date_count"] != 1 or rows["min_date"] != cutoff or rows["max_date"] != cutoff:
             issues.append({"snapshot_rows": rows["row_count"], "distinct_dates": rows["date_count"], "min_date": rows["min_date"], "max_date": rows["max_date"]})
+        foundation_financial = self._foundation_financial_contract_issues(
+            [manifest], context,
+        ).get(str(snapshot_id))
+        if foundation_financial:
+            issues.append({"foundation_financial_contract": foundation_financial})
         expected = self.kernel.read._repository_query(
             context, "pit.universe_daily", "SELECT COUNT(*) AS value FROM pit.universe_daily WHERE trade_date=%s", (cutoff,), scope, 2,
         )[0]["value"]
@@ -2541,6 +2642,12 @@ class ResearchSnapshotRepository(BaseRepository):
                         "universe_rows": universe_by_date.get(cutoff, 0),
                     }
                 })
+
+        foundation_financial = self._foundation_financial_contract_issues(
+            manifests, context,
+        )
+        for snapshot_id, values in foundation_financial.items():
+            add(snapshot_id, {"foundation_financial_contract": values})
 
         if lineage_target == self.BUNDLE_LINEAGE_TARGET:
             bundle_rows = self.kernel.read._repository_query(
