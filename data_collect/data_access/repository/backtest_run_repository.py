@@ -9,6 +9,9 @@ from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
 
 
+DIAGNOSTIC_ENTRY_BATCH_SIZE = 10
+
+
 class BacktestRunRepository(BaseRepository):
     def _scope(self, key: str, dataset_id: str | None = None) -> WorkScope:
         dimensions = {"run_id": key}
@@ -96,8 +99,9 @@ class BacktestRunRepository(BaseRepository):
             """SELECT run_id, dataset_id, strategy_id, strategy_version,
                              run_version, initial_cash, status, parameters,
                              parameters_hash, input_hash, code_version,
-                             git_commit, created_at, started_at, finished_at,
-                             failure_reason
+                             git_commit, git_dirty, diff_hash,
+                             execution_model_version, code_archive_sha256,
+                             created_at, started_at, finished_at, failure_reason
                         FROM backtest.run_manifest
                        WHERE run_id=%s
                        LIMIT 2""",
@@ -119,8 +123,9 @@ class BacktestRunRepository(BaseRepository):
             """SELECT run_id, dataset_id, strategy_id, strategy_version,
                              run_version, initial_cash, status, parameters,
                              parameters_hash, input_hash, code_version,
-                             git_commit, created_at, started_at, finished_at,
-                             failure_reason
+                             git_commit, git_dirty, diff_hash,
+                             execution_model_version, code_archive_sha256,
+                             created_at, started_at, finished_at, failure_reason
                         FROM backtest.run_manifest
                        WHERE dataset_id=%s
                          AND strategy_id=%s
@@ -338,45 +343,58 @@ class BacktestRunRepository(BaseRepository):
 
         The bounded 120-calendar-day window is deliberately conservative for
         40 A-share trading days and avoids a five-year scan for each trade.
+        Entries are deliberately read in small batches: this diagnostic runs
+        against a large frozen execution-bar table, and one large ``unnest``
+        join can make PostgreSQL choose a plan that exceeds the statement
+        timeout even though each entry is cheap to resolve.  Every batch is a
+        separate governed read, so this remains read-only and short-lived.
         """
         if not entries:
             return []
-        codes = [item[0] for item in entries]
-        dates = [item[1] for item in entries]
-        date_to = max(dates) + timedelta(days=120)
-        scope = WorkScope(
-            date_from=date_from,
-            date_to=date_to,
-            partition=dataset_id,
-            dimensions={"dataset_id": dataset_id},
-        )
-        return self.kernel.read._repository_query(
-            context,
-            "backtest.dataset_execution_bar",
-            """WITH entries(ts_code, buy_date) AS (
-                         SELECT * FROM unnest(%s::text[], %s::date[])
-                     ), ranked AS (
-                         SELECT e.ts_code, e.buy_date, b.trade_date,
-                                b.raw_close,
-                                row_number() OVER (
-                                    PARTITION BY e.ts_code, e.buy_date
-                                    ORDER BY b.trade_date
-                                ) AS horizon
-                           FROM entries e
-                           JOIN backtest.dataset_execution_bar b
-                             ON b.dataset_id=%s
-                            AND b.ts_code=e.ts_code
-                            AND b.trade_date>e.buy_date
-                            AND b.trade_date<=e.buy_date + INTERVAL '120 days'
-                          WHERE b.raw_close IS NOT NULL
-                     )
-                     SELECT ts_code, buy_date, trade_date, raw_close,
-                            horizon
-                       FROM ranked
-                      WHERE horizon IN (5, 10, 20, 40)
-                      ORDER BY buy_date, ts_code, horizon""",
-            (codes, dates, dataset_id), scope, 10_000,
-        )
+        unique_entries = list(dict.fromkeys(entries))
+        output: list[dict[str, Any]] = []
+        for start in range(0, len(unique_entries), DIAGNOSTIC_ENTRY_BATCH_SIZE):
+            batch = unique_entries[start:start + DIAGNOSTIC_ENTRY_BATCH_SIZE]
+            codes = [item[0] for item in batch]
+            dates = [item[1] for item in batch]
+            date_to = max(dates) + timedelta(days=120)
+            scope = WorkScope(
+                date_from=min(date_from, min(dates)),
+                date_to=date_to,
+                partition=dataset_id,
+                dimensions={"dataset_id": dataset_id},
+            )
+            output.extend(self.kernel.read._repository_query(
+                context,
+                "backtest.dataset_execution_bar",
+                """WITH entries(ts_code, buy_date) AS (
+                             SELECT * FROM unnest(%s::text[], %s::date[])
+                         ), ranked AS (
+                             SELECT e.ts_code, e.buy_date, b.trade_date,
+                                    b.raw_close,
+                                    row_number() OVER (
+                                        PARTITION BY e.ts_code, e.buy_date
+                                        ORDER BY b.trade_date
+                                    ) AS horizon
+                               FROM entries e
+                               JOIN backtest.dataset_execution_bar b
+                                 ON b.dataset_id=%s
+                                AND b.ts_code=e.ts_code
+                                AND b.trade_date>e.buy_date
+                                AND b.trade_date<=e.buy_date + INTERVAL '120 days'
+                              WHERE b.raw_close IS NOT NULL
+                         )
+                         SELECT ts_code, buy_date, trade_date, raw_close,
+                                horizon
+                           FROM ranked
+                          WHERE horizon IN (5, 10, 20, 40)
+                          ORDER BY buy_date, ts_code, horizon""",
+                (codes, dates, dataset_id), scope, 10_000,
+            ))
+        output.sort(key=lambda row: (
+            row.get("buy_date"), row.get("ts_code"), row.get("horizon"),
+        ))
+        return output
 
     def persist_result(self, run_id: str, result, context: RunContext) -> None:
         scope = self._scope(run_id)

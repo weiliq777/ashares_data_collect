@@ -358,6 +358,8 @@ def _comparison_identity(report: Mapping[str, Any]) -> dict[str, Any]:
         "execution_model_version": run.get("execution_model_version"),
         "code_version": run.get("code_version"),
         "git_commit": run.get("git_commit"),
+        "git_dirty": run.get("git_dirty"),
+        "diff_hash": run.get("diff_hash"),
         "code_archive_sha256": run.get("code_archive_sha256"),
         "evaluation_definition": evaluation,
         "base_parameters": base_parameters,

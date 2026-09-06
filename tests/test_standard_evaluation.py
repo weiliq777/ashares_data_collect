@@ -151,6 +151,14 @@ def test_capital_sensitivity_normalizes_legacy_evaluation_metadata():
     assert result["comparable"] is True
 
 
+def test_capital_sensitivity_rejects_different_execution_engine():
+    baseline = _capital_report(10_000, "run-10k")
+    changed_engine = _capital_report(30_000, "run-30k")
+    changed_engine["run"]["execution_model_version"] = "engine-2"
+    with pytest.raises(ValueError, match="不可比较"):
+        build_capital_sensitivity([baseline, changed_engine])
+
+
 def test_standard_evaluation_contains_all_fixed_dimensions():
     result = build_standard_evaluation(_performance([100, 101]), [])
     assert set(result["calendar"]) == {"month", "quarter", "year"}
