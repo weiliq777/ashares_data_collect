@@ -362,7 +362,6 @@ def _comparison_identity(report: Mapping[str, Any]) -> dict[str, Any]:
         "evaluation_definition": evaluation,
         "base_parameters": base_parameters,
         "scenario_without_capital": scenario,
-        "scope": report.get("scope"),
     }
 
 

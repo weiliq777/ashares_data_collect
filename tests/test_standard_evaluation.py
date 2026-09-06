@@ -146,6 +146,7 @@ def test_capital_sensitivity_normalizes_legacy_evaluation_metadata():
         "market_regime_definition": "BENCHMARK_MA120_SLOPE_V1",
         "market_regime_ma_window": 120,
     }
+    current["scope"] = {"signal_date_from": "2024-02-01", "signal_date_to": "2024-02-29"}
     result = build_capital_sensitivity([legacy, current])
     assert result["comparable"] is True
 
