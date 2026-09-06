@@ -53,6 +53,27 @@ def test_diagnostic_run_by_version_is_bounded_and_scoped():
         kernel.close()
 
 
+def test_diagnostic_capital_runs_uses_fixed_scope_and_small_limit():
+    connection = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(),
+        connection_factory=lambda: connection,
+    )
+    try:
+        rows = BacktestRunRepository(kernel).diagnostic_capital_runs(
+            "dataset-1", "strategy-1", [10_000, 30_000], _context()
+        )
+        assert rows == []
+        query = connection.executed[-1]["sql"]
+        assert "dataset_id=%s" in query
+        assert "strategy_id=%s" in query
+        assert "initial_cash = ANY(%s::numeric[])" in query
+        assert "capital-sensitivity-%%" in query
+        assert "LIMIT 10" in query
+    finally:
+        kernel.close()
+
+
 def test_diagnostic_future_closes_is_bounded_to_dataset_and_date_window():
     connection = FakeConnection()
     kernel = DataAccessKernel(

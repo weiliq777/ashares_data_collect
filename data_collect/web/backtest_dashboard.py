@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
-from data_collect.evaluation.standard import build_capital_sensitivity
+from data_collect.evaluation.standard import DEFAULT_CAPITALS, build_capital_sensitivity
 from data_collect.jobs.backtest_diagnostics import diagnose_run
 
 
@@ -67,6 +67,39 @@ def _cached_capital_comparison(run_ids: Sequence[str]) -> dict[str, Any]:
         with _CACHE_LOCK:
             _COMPARISON_CACHE[normalized] = result
     return result
+
+
+def _capital_sensitivity_catalog(base_run_id: str) -> dict[str, Any]:
+    """Return preset capital Runs for the same Dataset and Strategy."""
+    kernel, repository, context = _service("capital-catalog")
+    try:
+        base = repository.diagnostic_run(base_run_id, context)
+        if not base:
+            raise LookupError(f"未找到回测运行: {base_run_id}")
+        runs = repository.diagnostic_capital_runs(
+            str(base["dataset_id"]),
+            str(base["strategy_id"]),
+            list(DEFAULT_CAPITALS),
+            context,
+        )
+        return {
+            "base_run_id": base_run_id,
+            "dataset_id": base["dataset_id"],
+            "strategy_id": base["strategy_id"],
+            "strategy_version": base.get("strategy_version"),
+            "scenarios": [
+                {
+                    "run_id": row["run_id"],
+                    "run_version": row["run_version"],
+                    "initial_capital": row["initial_cash"],
+                    "status": row["status"],
+                    "finished_at": row.get("finished_at"),
+                }
+                for row in runs
+            ],
+        }
+    finally:
+        kernel.close()
 
 
 def _trade_chart(run_id: str, lot_id: str) -> dict[str, Any]:
@@ -148,6 +181,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 values = parse_qs(parsed.query).get("run_ids", [])
                 run_ids = [item for value in values for item in value.split(",")]
                 self._json(200, _cached_capital_comparison(run_ids))
+                return
+            if path == "/api/backtests/capital-sensitivity":
+                values = parse_qs(parsed.query).get("base_run_id", [])
+                if not values or not values[0].strip():
+                    raise ValueError("缺少 base_run_id")
+                self._json(200, _capital_sensitivity_catalog(values[0].strip()))
                 return
             parts = [unquote(part) for part in path.split("/") if part]
             if len(parts) == 4 and parts[:2] == ["api", "backtests"] and parts[3] == "diagnostics":

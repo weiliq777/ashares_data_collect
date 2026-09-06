@@ -60,6 +60,16 @@
     .chart { min-height: 280px; position: relative; }
     .chart svg { width: 100%; height: 280px; overflow: visible; }
     .chart .empty { display: grid; place-items: center; height: 250px; color: var(--muted); }
+    .chart-tooltip { position: absolute; z-index: 4; pointer-events: none; min-width: 150px; max-width: 260px;
+      padding: 9px 11px; border: 1px solid rgba(116, 170, 220, .55); border-radius: 9px;
+      background: rgba(5, 15, 28, .94); box-shadow: 0 10px 28px rgba(0,0,0,.35);
+      color: var(--text); font-size: 12px; line-height: 1.55; opacity: 0; transform: translate(10px, -8px); }
+    .chart-tooltip .tooltip-date { color: var(--cyan); font-weight: 700; margin-bottom: 3px; }
+    .chart-tooltip .tooltip-row { display: flex; justify-content: space-between; gap: 14px; }
+    .chart-tooltip .tooltip-name { color: var(--muted); }
+    .chart-tooltip .tooltip-value { font-variant-numeric: tabular-nums; }
+    .chart-crosshair { stroke: #c7e5ff; stroke-width: 1; stroke-dasharray: 3 4; opacity: .72; pointer-events: none; }
+    .chart-hit { fill: transparent; cursor: crosshair; }
     .axis { fill: #7890aa; font-size: 11px; }
     .gridline { stroke: #27405b; stroke-width: 1; stroke-dasharray: 3 5; }
     .legend { display: flex; flex-wrap: wrap; gap: 15px; margin: 1px 0 0 50px; color: var(--muted); font-size: 12px; }
@@ -75,6 +85,24 @@
     .chips { display: flex; flex-wrap: wrap; gap: 8px; }
     .chip { border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; color: var(--muted); background: rgba(4, 14, 27, .35); }
     .chip b { color: var(--text); margin-right: 4px; }
+    .legacy-comparison-toolbar { display: none; }
+    .capital-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 18px;
+      padding: 12px 14px; border: 1px solid rgba(77, 112, 148, .35); border-radius: 12px;
+      background: rgba(16, 34, 55, .72); max-width: 1120px; }
+    .capital-toolbar-title { display: flex; flex-direction: column; min-width: 112px; }
+    .capital-toolbar-title strong { font-size: 13px; }
+    .capital-toolbar-title span { color: var(--muted); font-size: 11px; }
+    .capital-switcher { display: flex; flex-wrap: wrap; gap: 7px; flex: 1; }
+    .capital-chip { display: inline-flex; flex-direction: column; align-items: center; gap: 1px; min-width: 76px;
+      padding: 7px 10px; border-radius: 9px; border: 1px solid #315170; background: #0d2035;
+      color: var(--text); line-height: 1.2; }
+    .capital-chip strong { font-size: 13px; }
+    .capital-chip span { color: var(--muted); font-size: 10px; font-weight: 500; }
+    .capital-chip:hover:not(:disabled) { border-color: var(--cyan); background: #12314b; filter: none; }
+    .capital-chip.active { border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(57, 213, 213, .16); background: #123b51; }
+    .capital-chip.pending { opacity: .52; cursor: not-allowed; }
+    .capital-chip:disabled { cursor: not-allowed; }
+    .capital-compare-hint { color: var(--muted); font-size: 11px; margin: 7px 0 0; }
     .table-wrap { overflow: auto; border: 1px solid rgba(77, 112, 148, .25); border-radius: 10px; }
     .compact-table table { min-width: 760px; }
     table { border-collapse: collapse; width: 100%; min-width: 930px; }
@@ -95,6 +123,12 @@
     <div class="brand"><div class="logo">↗</div><div><h1>回测诊断看板</h1><div class="subtitle">把策略表现、执行约束和每一笔交易放在同一张图上</div></div></div>
     <div class="toolbar"><input id="run-id" placeholder="输入 Backtest Run（回测运行）ID，例如 b97f6f67-..." autocomplete="off"><button id="load">加载回测结果</button></div>
     <div class="toolbar"><input id="comparison-run-ids" placeholder="资金敏感性：输入多个 Run ID，以逗号分隔（1万/3万/5万/7万/10万）" autocomplete="off"><button id="compare">加载资金对比</button></div>
+    <div class="capital-toolbar" id="capital-toolbar">
+      <div class="capital-toolbar-title"><strong>资金场景切换</strong><span>同一策略 · 不同初始资金</span></div>
+      <div id="capital-switcher" class="capital-switcher"><span class="chip">加载资金场景中…</span></div>
+      <button id="compare-all" type="button">对比已完成</button>
+    </div>
+    <div id="capital-compare-hint" class="capital-compare-hint">点击资金档位即可切换整张看板；“对比已完成”查看五档横向结果。</div>
   </header>
   <main>
     <div id="message" class="notice">这是只读诊断页面。数据来自已成功落库的回测运行，不会修改数据库。</div>
@@ -143,6 +177,7 @@
     const categoryNames = {FILLED:"成交", LOT_OR_CASH_LIMIT:"整手/现金约束", MAX_POSITIONS:"最大持仓数", PRICE_LIMIT_OR_NOT_TRADABLE:"涨跌停/不可交易", EXECUTION_RECALCULATION:"执行重算", SUSPENDED_OR_MISSING_BAR:"停牌/缺行情", ALREADY_HELD:"已有持仓", LIQUIDITY:"流动性", OTHER:"其他"};
     const exitNames = {MA60_EXIT:"MA60退出", RANK_EXIT:"排名退出", QUALITY_EXIT:"质量退出", ST_EXIT:"ST退出", DATA_EXIT:"数据保护退出", UNIVERSE_EXIT:"股票池退出", STOP_LOSS_EXIT:"止损退出"};
     let currentRun = "";
+    let capitalCatalog = null;
 
     function makeSvgChart(el, series, options = {}) {
       const clean = series.map(s => ({...s, values: s.values.map(v => v == null ? null : Number(v))}));
@@ -170,6 +205,40 @@
       out.push("</svg>");
       out.push(`<div class="legend">${clean.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("")}</div>`);
       el.innerHTML = out.join("");
+      const svg = el.querySelector("svg");
+      const crosshair = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      crosshair.setAttribute("class", "chart-crosshair");
+      crosshair.setAttribute("y1", String(T));
+      crosshair.setAttribute("y2", String(T + PH));
+      crosshair.style.display = "none";
+      const hit = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      hit.setAttribute("class", "chart-hit");
+      hit.setAttribute("x", String(L)); hit.setAttribute("y", String(T));
+      hit.setAttribute("width", String(PW)); hit.setAttribute("height", String(PH));
+      svg.appendChild(crosshair); svg.appendChild(hit);
+      const tooltip = document.createElement("div");
+      tooltip.className = "chart-tooltip";
+      el.appendChild(tooltip);
+      const hideTooltip = () => { tooltip.style.opacity = "0"; crosshair.style.display = "none"; };
+      hit.addEventListener("mousemove", (event) => {
+        const rect = svg.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+        const index = Math.max(0, Math.min(n - 1, Math.round(ratio * (n - 1))));
+        const xx = x(index);
+        crosshair.setAttribute("x1", String(xx)); crosshair.setAttribute("x2", String(xx));
+        crosshair.style.display = "block";
+        const title = labels[index] ?? "";
+        const rows = clean.map(s => {
+          const value = s.values[index];
+          return `<div class="tooltip-row"><span class="tooltip-name">${esc(s.name)}</span><span class="tooltip-value">${esc(Number.isFinite(value) ? fmt(value) : "—")}</span></div>`;
+        }).join("");
+        tooltip.innerHTML = `<div class="tooltip-date">${esc(title)}</div>${rows}`;
+        const left = Math.min(Math.max(4, el.clientWidth * ratio + 8), Math.max(4, el.clientWidth - 178));
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = "10px";
+        tooltip.style.opacity = "1";
+      });
+      hit.addEventListener("mouseleave", hideTooltip);
     }
 
     function bars(el, rows, options = {}) {
@@ -225,6 +294,7 @@
       bars($("quarter-bars"), (calendar.quarter || []).map(x=>({label:x.period,value:x.strategy_return,negative:(x.strategy_return||0)<0})), {format:v=>pct(v)});
       $("limitations").innerHTML = (data.limitations||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join("");
       renderStandardEvaluation(data);
+      loadCapitalCatalog(data.run.run_id);
     }
 
     function renderStandardEvaluation(data) {
@@ -247,16 +317,53 @@
       $("capital-table").innerHTML = `<table><thead><tr>${headers.map(esc).map(x=>`<th>${x}</th>`).join("")}</tr></thead><tbody>${cells}</tbody></table>`;
     }
 
-    async function loadCapitalComparison() {
-      const ids = $("comparison-run-ids").value.trim(); if (!ids) return;
-      $("compare").disabled = true; $("compare").textContent = "加载中…";
+    function capitalStatusLabel(status) {
+      const normalized = String(status || "").toUpperCase();
+      return normalized === "SUCCEEDED" ? "已完成" : normalized === "RUNNING" ? "运行中" : normalized || "未知";
+    }
+
+    function renderCapitalSwitcher(catalog) {
+      capitalCatalog = catalog;
+      const scenarios = catalog.scenarios || [];
+      if (!scenarios.length) {
+        $("capital-switcher").innerHTML = '<span class="chip">当前策略暂无资金敏感性 Run</span>';
+        $("capital-compare-hint").textContent = "需要先完成对应资金场景回测。";
+        return;
+      }
+      $("capital-switcher").innerHTML = scenarios.map(s => {
+        const done = String(s.status || "").toUpperCase() === "SUCCEEDED";
+        const active = String(s.run_id) === String(currentRun);
+        return `<button type="button" class="capital-chip ${active ? "active" : ""} ${done ? "" : "pending"}" data-capital-run="${esc(s.run_id)}" ${done ? "" : "disabled"}><strong>${money(s.initial_capital)}</strong><span>${capitalStatusLabel(s.status)}</span></button>`;
+      }).join("");
+      document.querySelectorAll("[data-capital-run]").forEach(button => button.addEventListener("click", () => {
+        const runId = button.dataset.capitalRun;
+        if (runId && runId !== currentRun) { $("run-id").value = runId; loadReport(); }
+      }));
+      const completed = scenarios.filter(s => String(s.status || "").toUpperCase() === "SUCCEEDED").length;
+      $("capital-compare-hint").textContent = `已发现 ${scenarios.length} 个资金场景，${completed} 个已完成；点击档位切换整张看板。`;
+    }
+
+    async function loadCapitalCatalog(baseRunId) {
+      try {
+        const res = await fetch(`/api/backtests/capital-sensitivity?base_run_id=${encodeURIComponent(baseRunId)}`);
+        const data = await res.json(); if (!res.ok) throw new Error(data.error || "资金场景读取失败");
+        renderCapitalSwitcher(data);
+      } catch (e) {
+        capitalCatalog = null;
+        $("capital-switcher").innerHTML = `<span class="chip">资金场景读取失败：${esc(e.message)}</span>`;
+      }
+    }
+
+    async function loadCapitalComparison(runIds = null) {
+      const ids = (runIds || $("comparison-run-ids").value).trim(); if (!ids) return;
+      $("compare-all").disabled = true; $("compare-all").textContent = "加载中…";
       try {
         const res = await fetch(`/api/backtests/compare?run_ids=${encodeURIComponent(ids)}`);
         const data = await res.json(); if (!res.ok) throw new Error(data.error || "读取失败");
         renderCapitalSensitivity(data);
       } catch (e) {
         $("capital-table").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
-      } finally { $("compare").disabled = false; $("compare").textContent = "加载资金对比"; }
+      } finally { $("compare-all").disabled = false; $("compare-all").textContent = "对比已完成"; }
     }
 
     async function loadReport() {
@@ -270,6 +377,14 @@
       try { const res = await fetch(`/api/backtests/${encodeURIComponent(currentRun)}/trades/${encodeURIComponent(lotId)}/chart`); const data = await res.json(); if (!res.ok) throw new Error(data.error || "读取失败"); $("selected-trade").textContent = `${data.ts_code}${data.name?` · ${data.name}`:""}`; $("trade-detail-meta").textContent = `买入 ${data.buy_point.date} @ ${num(data.buy_point.price,2)} · 卖出 ${data.sell_point.date} @ ${num(data.sell_point.price,2)} · ${exitNames[data.sell_point.reason]||data.sell_point.reason}`; const rows=data.series||[]; makeSvgChart($("trade-chart"), [{name:"基础复权价",color:"#58a6ff",values:rows.map(x=>x.adj_close_base)},{name:"MA20",color:"#f4b860",values:rows.map(x=>x.ma20)},{name:"MA60",color:"#ff6b81",values:rows.map(x=>x.ma60)}], {labels:rows.map(x=>x.date),format:v=>num(v,2),markers:[{date:data.buy_point.date,label:"买入",color:"#45d39c"},{date:data.sell_point.date,label:"卖出",color:"#ff6b81"}]}); $("trade-detail").scrollIntoView({behavior:"smooth",block:"start"}); } catch (e) { $("selected-trade").textContent = "读取失败"; $("trade-chart").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
     }
 
+    const legacyComparisonToolbar = $("comparison-run-ids")?.closest(".toolbar");
+    if (legacyComparisonToolbar) legacyComparisonToolbar.classList.add("legacy-comparison-toolbar");
+    $("compare-all").addEventListener("click", () => {
+      const ids = (capitalCatalog?.scenarios || [])
+        .filter(s => String(s.status || "").toUpperCase() === "SUCCEEDED")
+        .map(s => s.run_id);
+      if (ids.length) loadCapitalComparison(ids.join(","));
+    });
     $("load").addEventListener("click", loadReport); $("run-id").addEventListener("keydown", e => { if (e.key === "Enter") loadReport(); });
     $("compare").addEventListener("click", loadCapitalComparison); $("comparison-run-ids").addEventListener("keydown", e => { if (e.key === "Enter") loadCapitalComparison(); });
     const initial = new URLSearchParams(location.search).get("run_id"); if (initial) { $("run-id").value=initial; loadReport(); }

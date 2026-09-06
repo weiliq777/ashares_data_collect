@@ -139,6 +139,56 @@ class BacktestRunRepository(BaseRepository):
             raise RuntimeError(f"Run version is not unique: {dataset_id}/{strategy_id}/{run_version}")
         return rows[0] if rows else None
 
+    def diagnostic_capital_runs(
+        self,
+        dataset_id: str,
+        strategy_id: str,
+        capitals: list[float],
+        context: RunContext,
+    ) -> list[dict[str, Any]]:
+        """Locate the latest capital-sensitivity Run for each requested capital.
+
+        The dashboard uses this read-only catalog to offer preset switches.  A
+        capital may have multiple historical reruns, so successful terminal
+        Runs are preferred, then the newest finished/created Run is selected by
+        the SQL ranking.  No Run is started or mutated here.
+        """
+        normalized = sorted({float(value) for value in capitals if float(value) > 0})
+        if not normalized:
+            return []
+        rows = self.kernel.read._repository_query(
+            context,
+            "backtest.run_manifest",
+            """WITH ranked AS (
+                         SELECT run_id, dataset_id, strategy_id,
+                                strategy_version, run_version, initial_cash,
+                                status, created_at, started_at, finished_at,
+                                failure_reason,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY initial_cash
+                                    ORDER BY CASE WHEN status='SUCCEEDED' THEN 0 ELSE 1 END,
+                                             finished_at DESC NULLS LAST,
+                                             created_at DESC
+                                ) AS rank_no
+                           FROM backtest.run_manifest
+                          WHERE dataset_id=%s
+                            AND strategy_id=%s
+                            AND initial_cash = ANY(%s::numeric[])
+                            AND run_version LIKE 'capital-sensitivity-%%'
+                     )
+                     SELECT run_id, dataset_id, strategy_id, strategy_version,
+                            run_version, initial_cash, status, created_at,
+                            started_at, finished_at, failure_reason
+                       FROM ranked
+                      WHERE rank_no=1
+                      ORDER BY initial_cash
+                      LIMIT 10""",
+            (dataset_id, strategy_id, normalized),
+            self._scope(dataset_id, dataset_id),
+            10,
+        )
+        return rows
+
     def diagnostic_signals(self, run_id: str, context: RunContext) -> list[dict[str, Any]]:
         return self.kernel.read._repository_query(
             context,
