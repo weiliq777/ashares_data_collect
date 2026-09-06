@@ -156,6 +156,7 @@ def create_snapshot_series(
     exchange: str = "SSE",
     rebuild_building: bool = False,
     verify_source_manifest: bool = False,
+    check_building_completeness: bool = True,
 ) -> tuple[dict[str, str], ...]:
     """按日期创建一组 Snapshot，并返回每个阶段的确定结果。
 
@@ -202,22 +203,23 @@ def create_snapshot_series(
     # BUILDING is normally resumable, but an interrupted build may have
     # committed child rows before snapshot_input.  Detect that state once and
     # route it through the normal FAILED -> rebuild path.
-    building_ids = [
-        snapshot_id for cutoff in dates
-        if statuses[cutoff.isoformat()] == "BUILDING"
-        for snapshot_id in (snapshots[cutoff.isoformat()],)
-    ]
-    incomplete_ids = set(incomplete_building_snapshots(
-        building_ids, len(_inputs_for_schema(schema_version)),
-    ))
-    if incomplete_ids:
-        reset_building_snapshots(
-            incomplete_ids,
-            "构建完整性检查失败：Snapshot 输入清单不完整，必须重新构建",
-        )
-        for cutoff in dates:
-            if snapshots[cutoff.isoformat()] in incomplete_ids:
-                statuses[cutoff.isoformat()] = "FAILED"
+    if check_building_completeness:
+        building_ids = [
+            snapshot_id for cutoff in dates
+            if statuses[cutoff.isoformat()] == "BUILDING"
+            for snapshot_id in (snapshots[cutoff.isoformat()],)
+        ]
+        incomplete_ids = set(incomplete_building_snapshots(
+            building_ids, len(_inputs_for_schema(schema_version)),
+        ))
+        if incomplete_ids:
+            reset_building_snapshots(
+                incomplete_ids,
+                "构建完整性检查失败：Snapshot 输入清单不完整，必须重新构建",
+            )
+            for cutoff in dates:
+                if snapshots[cutoff.isoformat()] in incomplete_ids:
+                    statuses[cutoff.isoformat()] = "FAILED"
 
     # Create all missing manifests in one batch; each date remains an
     # independent immutable Snapshot and can still be resumed by date.

@@ -156,6 +156,7 @@ def repair_dataset(
         max_snapshots=None,
         batch_size=batch_size,
         verify_source_manifest=False,
+        check_building_completeness=False,
     )
     kernel = DataAccessKernel(policy_registry=build_default_registry())
     context = RunContext(
@@ -176,6 +177,7 @@ def repair_dataset(
         pending_build = []
         for row in issue_rows:
             target_id = replacements_by_date[row["research_date"]]
+            source_id = source_by_date[row["research_date"]]
             target_manifest = repository.manifest(target_id, context)
             statuses[target_id] = target_manifest["status"]
             if not target_manifest.get("quality_report") or not target_manifest.get("quality_hash"):
@@ -186,8 +188,56 @@ def repair_dataset(
                 target_manifest["quality_report"],
                 target_manifest["quality_hash"],
             )
-            if target_manifest["status"] in {"DRAFT", "FAILED"}:
-                pending_build.append((target_id, source_by_date[row["research_date"]]))
+            if target_manifest["status"] in {"BUILDING", "FAILED"}:
+                # A previous run can commit all children and then stop before
+                # lifecycle validation.  Conversely, it can stop halfway
+                # through the first child table.  Distinguish those states by
+                # bounded child counts so resume never rebuilds a complete
+                # replacement and never validates a partial one.
+                source_counts = repository.snapshot_materialization_counts(
+                    source_id, target_manifest["cutoff"], context,
+                )
+                target_counts = repository.snapshot_materialization_counts(
+                    target_id, target_manifest["cutoff"], context,
+                )
+                complete = (
+                    source_counts["stock_rows"] > 0
+                    and target_counts["stock_rows"] == source_counts["stock_rows"]
+                    and target_counts["bundle_rows"] == source_counts["stock_rows"]
+                    and target_counts["input_rows"] == source_counts["input_rows"]
+                )
+                if complete and target_manifest["status"] == "FAILED":
+                    changed = kernel.write.transition_snapshot_manifest(
+                        context,
+                        repository._snapshot_scope(target_id, target_manifest["cutoff"]),
+                        target_id,
+                        ("FAILED",),
+                        "BUILDING",
+                        {"failure_reason": None},
+                    )
+                    if changed != 1:
+                        raise RuntimeError(
+                            f"replacement lifecycle changed while resuming: {target_id}"
+                        )
+                    statuses[target_id] = "BUILDING"
+                elif not complete and target_manifest["status"] == "BUILDING":
+                    changed = kernel.write.transition_snapshot_manifest(
+                        context,
+                        repository._snapshot_scope(target_id, target_manifest["cutoff"]),
+                        target_id,
+                        ("BUILDING",),
+                        "FAILED",
+                        {"failure_reason": "replacement materialization incomplete; rebuild required"},
+                    )
+                    if changed != 1:
+                        raise RuntimeError(
+                            f"replacement lifecycle changed while resetting: {target_id}"
+                        )
+                    statuses[target_id] = "FAILED"
+                if not complete:
+                    pending_build.append((target_id, source_id))
+            elif target_manifest["status"] == "DRAFT":
+                pending_build.append((target_id, source_id))
         for offset in range(0, len(pending_build), batch_size):
             batch = pending_build[offset:offset + batch_size]
             for target_id, source_id in batch:
