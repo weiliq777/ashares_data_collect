@@ -31,6 +31,26 @@ def test_diagnostic_order_query_accepts_postgresql_reserved_identifier():
         kernel.close()
 
 
+def test_diagnostic_run_by_version_is_bounded_and_scoped():
+    connection = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(),
+        connection_factory=lambda: connection,
+    )
+    try:
+        rows = BacktestRunRepository(kernel).diagnostic_run_by_version(
+            "dataset-1", "strategy-1", "capital-sensitivity-30k-v1", _context()
+        )
+        assert rows is None
+        query = connection.executed[-1]["sql"]
+        assert "dataset_id=%s" in query
+        assert "strategy_id=%s" in query
+        assert "run_version=%s" in query
+        assert "LIMIT 2" in query
+    finally:
+        kernel.close()
+
+
 def test_diagnostic_future_closes_is_bounded_to_dataset_and_date_window():
     connection = FakeConnection()
     kernel = DataAccessKernel(

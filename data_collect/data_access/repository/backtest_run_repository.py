@@ -105,6 +105,35 @@ class BacktestRunRepository(BaseRepository):
         )
         return rows[0] if rows else None
 
+    def diagnostic_run_by_version(
+        self,
+        dataset_id: str,
+        strategy_id: str,
+        run_version: str,
+        context: RunContext,
+    ) -> dict[str, Any] | None:
+        """Locate one immutable Run without scanning unrelated run history."""
+        rows = self.kernel.read._repository_query(
+            context,
+            "backtest.run_manifest",
+            """SELECT run_id, dataset_id, strategy_id, strategy_version,
+                             run_version, initial_cash, status, parameters,
+                             parameters_hash, input_hash, code_version,
+                             git_commit, created_at, started_at, finished_at,
+                             failure_reason
+                        FROM backtest.run_manifest
+                       WHERE dataset_id=%s
+                         AND strategy_id=%s
+                         AND run_version=%s
+                       LIMIT 2""",
+            (dataset_id, strategy_id, run_version),
+            self._scope(run_version, dataset_id),
+            2,
+        )
+        if len(rows) > 1:
+            raise RuntimeError(f"Run version is not unique: {dataset_id}/{strategy_id}/{run_version}")
+        return rows[0] if rows else None
+
     def diagnostic_signals(self, run_id: str, context: RunContext) -> list[dict[str, Any]]:
         return self.kernel.read._repository_query(
             context,
