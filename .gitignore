@@ -221,6 +221,7 @@ config.yaml
 backups/
 data/
 tempdata/
+runtime_audit/
 news_spool/
 logs/
 code_archive_*.zip
