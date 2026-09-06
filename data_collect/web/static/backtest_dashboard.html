@@ -76,6 +76,7 @@
     .chip { border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; color: var(--muted); background: rgba(4, 14, 27, .35); }
     .chip b { color: var(--text); margin-right: 4px; }
     .table-wrap { overflow: auto; border: 1px solid rgba(77, 112, 148, .25); border-radius: 10px; }
+    .compact-table table { min-width: 760px; }
     table { border-collapse: collapse; width: 100%; min-width: 930px; }
     th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid rgba(77, 112, 148, .18); white-space: nowrap; }
     th { color: var(--muted); font-size: 12px; font-weight: 600; background: #102139; position: sticky; top: 0; }
@@ -93,6 +94,7 @@
   <header>
     <div class="brand"><div class="logo">↗</div><div><h1>回测诊断看板</h1><div class="subtitle">把策略表现、执行约束和每一笔交易放在同一张图上</div></div></div>
     <div class="toolbar"><input id="run-id" placeholder="输入 Backtest Run（回测运行）ID，例如 b97f6f67-..." autocomplete="off"><button id="load">加载回测结果</button></div>
+    <div class="toolbar"><input id="comparison-run-ids" placeholder="资金敏感性：输入多个 Run ID，以逗号分隔（1万/3万/5万/7万/10万）" autocomplete="off"><button id="compare">加载资金对比</button></div>
   </header>
   <main>
     <div id="message" class="notice">这是只读诊断页面。数据来自已成功落库的回测运行，不会修改数据库。</div>
@@ -123,6 +125,12 @@
         <section class="card section"><h2>年度收益</h2><div class="hint">年度收益由每日净值复合得出。</div><div id="annual-bars" class="bars"></div></section>
         <section class="card section"><h2>数据与审计说明</h2><div class="hint">页面显示的限制和数据边界。</div><div id="limitations" class="chips"></div></section>
       </div>
+      <section class="card section" style="margin-top:16px"><h2>季度收益</h2><div class="hint">季度收益使用标准 Evaluation（评估）口径复合每日收益。</div><div id="quarter-bars" class="bars"></div></section>
+      <div class="grid two" style="margin-top:16px">
+        <section class="card section"><h2>市场状态切片（仅评价，不改变策略）</h2><div class="hint">固定使用基准 MA120（120 个交易日均线）与均线方向；历史不足时标记 UNKNOWN（未知），不把缺失数据当震荡。</div><div id="regime-bars" class="bars"></div></section>
+        <section class="card section"><h2>滚动 12 个月表现</h2><div class="hint">252 个交易日窗口、每 21 个交易日一个观察点，用于判断策略是否只依赖某一段历史。</div><div id="rolling-chart" class="chart"></div></section>
+      </div>
+      <section class="card section" style="margin-top:16px"><h2>资金敏感性（Capital Sensitivity）</h2><div class="hint">必须使用相同 Strategy（策略）、Dataset（回测数据集）、Evaluation（评价口径）和交易参数，只允许 Scenario（交易场景）的 initial_capital（初始资金）不同；本区不自动触发回测。</div><div id="capital-table" class="table-wrap compact-table"><div class="empty">请输入多个已完成 Run ID 后加载。</div></div></section>
     </section>
   </main>
   <footer>Backtest Dashboard（回测看板）· 只读 · 所有数据库访问仍由 Repository（仓储层）→ Kernel（内核）完成</footer>
@@ -202,7 +210,8 @@
       makeSvgChart($("equity-chart"), [{name:"策略净值",color:"#58a6ff",values:curve.map(x=>x.nav)},{name:"基准净值",color:"#9aabc0",values:curve.map(x=>x.benchmark_nav)}], {labels,format:v=>num(v,2)});
       makeSvgChart($("drawdown-chart"), [{name:"回撤",color:"#ff6b81",values:curve.map(x=>x.drawdown)}], {labels,format:v=>pct(v),zeroLine:true});
       makeSvgChart($("cash-chart"), [{name:"现金占比",color:"#45d39c",values:curve.map(x=>x.cash_ratio)}], {labels,format:v=>pct(v)});
-      bars($("monthly-bars"), (data.monthly_returns||[]).map(x=>({label:x.period,value:x.return,negative:x.return<0})), {format:v=>pct(v)});
+      const calendar = data.evaluation?.calendar || {};
+      bars($("monthly-bars"), (calendar.month || data.monthly_returns || []).map(x=>({label:x.period,value:x.strategy_return ?? x.return,negative:(x.strategy_return ?? x.return)<0})), {format:v=>pct(v)});
       const rej = Object.entries(data.order_rejections?.by_category || {}).filter(x=>x[0]!=="FILLED").sort((a,b)=>b[1]-a[1]).map(x=>({label:categoryNames[x[0]]||x[0],value:x[1]}));
       bars($("rejection-bars"), rej, {format:v=>`${v} 笔`});
       const ex = Object.entries(data.exit_attribution || {}).sort((a,b)=>b[1].trade_count-a[1].trade_count).map(x=>({label:exitNames[x[0]]||x[0],value:x[1].trade_count,negative:(x[1].net_pnl||0)<0}));
@@ -212,8 +221,42 @@
       bars($("ret60-bars"), hist, {format:v=>`${v} 笔`});
       renderInsight(data); renderTable(data);
       $("annual-bars").innerHTML = "";
-      bars($("annual-bars"), (data.annual_returns||[]).map(x=>({label:x.period,value:x.return,negative:x.return<0})), {format:v=>pct(v)});
+      bars($("annual-bars"), (calendar.year || data.annual_returns || []).map(x=>({label:x.period,value:x.strategy_return ?? x.return,negative:(x.strategy_return ?? x.return)<0})), {format:v=>pct(v)});
+      bars($("quarter-bars"), (calendar.quarter || []).map(x=>({label:x.period,value:x.strategy_return,negative:(x.strategy_return||0)<0})), {format:v=>pct(v)});
       $("limitations").innerHTML = (data.limitations||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join("");
+      renderStandardEvaluation(data);
+    }
+
+    function renderStandardEvaluation(data) {
+      const evaluation = data.evaluation || {};
+      const regimes = evaluation.market_regime?.summary || [];
+      const regimeNames = {BULL:"上涨（BULL）", BEAR:"下跌（BEAR）", SIDEWAYS:"震荡（SIDEWAYS）", UNKNOWN:"未知（UNKNOWN）"};
+      bars($("regime-bars"), regimes.map(x => ({label:regimeNames[x.regime] || x.regime, value:x.strategy_return, negative:(x.strategy_return||0)<0})), {format:v=>pct(v)});
+      const rolling = evaluation.rolling_12m || [];
+      makeSvgChart($("rolling-chart"), [
+        {name:"策略滚动收益", color:"#58a6ff", values:rolling.map(x=>x.strategy_return)},
+        {name:"基准滚动收益", color:"#9aabc0", values:rolling.map(x=>x.benchmark_return)},
+      ], {labels:rolling.map(x=>x.window_end), format:v=>pct(v), zeroLine:true});
+    }
+
+    function renderCapitalSensitivity(data) {
+      const rows = data.rows || [];
+      if (!rows.length) { $("capital-table").innerHTML = '<div class="empty">没有可比较的 Run。</div>'; return; }
+      const headers = ["初始资金", "状态", "期末权益", "累计收益", "最大回撤", "Sharpe", "成交笔数", "拒单率", "平均现金占比"];
+      const cells = rows.map(row => `<tr><td>${money(row.initial_capital)}</td><td>${esc(row.status)}</td><td>${money(row.final_equity)}</td><td class="${(row.total_return||0)<0?'negative':'positive'}">${pct(row.total_return)}</td><td class="negative">${pct(row.max_drawdown)}</td><td>${num(row.sharpe,2)}</td><td>${esc(row.trade_count ?? "—")}</td><td>${pct(row.reject_rate)}</td><td>${pct(row.average_cash_ratio)}</td></tr>`).join("");
+      $("capital-table").innerHTML = `<table><thead><tr>${headers.map(esc).map(x=>`<th>${x}</th>`).join("")}</tr></thead><tbody>${cells}</tbody></table>`;
+    }
+
+    async function loadCapitalComparison() {
+      const ids = $("comparison-run-ids").value.trim(); if (!ids) return;
+      $("compare").disabled = true; $("compare").textContent = "加载中…";
+      try {
+        const res = await fetch(`/api/backtests/compare?run_ids=${encodeURIComponent(ids)}`);
+        const data = await res.json(); if (!res.ok) throw new Error(data.error || "读取失败");
+        renderCapitalSensitivity(data);
+      } catch (e) {
+        $("capital-table").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+      } finally { $("compare").disabled = false; $("compare").textContent = "加载资金对比"; }
     }
 
     async function loadReport() {
@@ -228,6 +271,7 @@
     }
 
     $("load").addEventListener("click", loadReport); $("run-id").addEventListener("keydown", e => { if (e.key === "Enter") loadReport(); });
+    $("compare").addEventListener("click", loadCapitalComparison); $("comparison-run-ids").addEventListener("keydown", e => { if (e.key === "Enter") loadCapitalComparison(); });
     const initial = new URLSearchParams(location.search).get("run_id"); if (initial) { $("run-id").value=initial; loadReport(); }
   </script>
 </body>

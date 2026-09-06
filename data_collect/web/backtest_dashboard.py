@@ -8,16 +8,18 @@ import json
 from pathlib import Path
 from threading import Lock
 from typing import Any, Sequence
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
+from data_collect.evaluation.standard import build_capital_sensitivity
 from data_collect.jobs.backtest_diagnostics import diagnose_run
 
 
 _STATIC_FILE = Path(__file__).with_name("static") / "backtest_dashboard.html"
 _REPORT_CACHE: dict[str, dict[str, Any]] = {}
+_COMPARISON_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 _CACHE_LOCK = Lock()
 
 
@@ -42,6 +44,21 @@ def _cached_report(run_id: str) -> dict[str, Any]:
     with _CACHE_LOCK:
         _REPORT_CACHE[run_id] = report
     return report
+
+
+def _cached_capital_comparison(run_ids: Sequence[str]) -> dict[str, Any]:
+    normalized = tuple(dict.fromkeys(item.strip() for item in run_ids if item.strip()))
+    if not 1 <= len(normalized) <= 10:
+        raise ValueError("资金敏感性比较必须提供 1 至 10 个 Run ID")
+    with _CACHE_LOCK:
+        cached = _COMPARISON_CACHE.get(normalized)
+    if cached is not None:
+        return cached
+    reports = [_cached_report(run_id) for run_id in normalized]
+    result = build_capital_sensitivity(reports)
+    with _CACHE_LOCK:
+        _COMPARISON_CACHE[normalized] = result
+    return result
 
 
 def _trade_chart(run_id: str, lot_id: str) -> dict[str, Any]:
@@ -118,6 +135,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/healthz":
                 self._json(200, {"status": "ok", "read_only": True})
+                return
+            if path == "/api/backtests/compare":
+                values = parse_qs(parsed.query).get("run_ids", [])
+                run_ids = [item for value in values for item in value.split(",")]
+                self._json(200, _cached_capital_comparison(run_ids))
                 return
             parts = [unquote(part) for part in path.split("/") if part]
             if len(parts) == 4 and parts[:2] == ["api", "backtests"] and parts[3] == "diagnostics":

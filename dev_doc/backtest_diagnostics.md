@@ -1,5 +1,18 @@
 # Backtest Diagnostic Trace（回测诊断追踪）
 
+## 标准 Evaluation（评估）边界
+
+诊断报告现在同时提供 `standard-evaluation-v1`（标准评估 v1）派生结果：
+
+- `calendar.month / quarter / year`：按自然月、自然季度和自然年复合策略/基准日收益；
+- `rolling_12m`：252 个交易日窗口、每 21 个交易日一个观察点；
+- `market_regime`：基准 `BENCHMARK_MA120_SLOPE_V1`，即收盘价相对 MA120（120 个交易日均线）及均线方向划分 BULL（上涨）、BEAR（下跌）、SIDEWAYS（震荡）；历史不足标记 UNKNOWN（未知），不当作震荡；
+- `build_capital_sensitivity()`：只汇总同一 Dataset（回测数据集）、Strategy（策略）、Evaluation（评价口径）和交易参数下的不同 Scenario（交易场景）Run，初始资金之外的身份不一致时拒绝比较。
+
+标准评估中的 `max_drawdown`（最大回撤）统一保存为非负的回撤幅度，与已持久化 Run 指标一致；收益率和超额收益率保留正负号。
+
+这些结果是只读派生视图，不写入 Raw（原始层）、Standard（标准层）、PIT（时点层）、Feature（特征层）或 Frozen Dataset（冻结数据集），也不改变 Strategy V1（策略 V1）的交易决策。
+
 `data_collect.jobs.backtest_diagnostics` 是针对已持久化 Backtest Run（回测运行）的只读诊断工具。它不重新运行策略、不修改任何回测子表，也不创建逐笔诊断副本。
 
 ## 使用
@@ -17,6 +30,7 @@ python -m data_collect.jobs.backtest_diagnostics `
 - `entry_diagnostics`：实际成交买入的 `RET60`、排名、历史 `is_st_asof`（时点 ST 状态）和输入快照；
 - `forward_returns`：从成交价到未来第 5/10/20/40 个交易日收盘价的纯价格路径；
 - `persisted_metrics`：数据库已保存的运行指标，供交叉核对。
+- `evaluation`：标准化年月、滚动 12 个月和市场状态切片；其中市场状态只用于事后评价。
 
 ## 前端看板
 
@@ -32,6 +46,14 @@ python -m data_collect.web.backtest_dashboard --port 8765
 - 月度/年度收益、拒单类别、退出原因和入场 `RET60`（60日收益率）分布；
 - 可点击的完整交易表；
 - 单笔交易的基础复权价格、MA20、MA60 与买卖点。
+
+资金敏感性接口：
+
+```text
+GET /api/backtests/compare?run_ids=<run_id_10k>,<run_id_30k>,<run_id_50k>,<run_id_70k>,<run_id_100k>
+```
+
+接口最多读取 10 个 Run，使用同一份只读诊断报告做身份校验和汇总，不会自动启动回测。
 
 服务只绑定 `127.0.0.1`（本机），API 只读，不提供数据库写入路由。
 

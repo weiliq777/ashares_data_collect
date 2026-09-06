@@ -146,6 +146,11 @@ class EvaluationConfig:
     annualization_factor: int = 252
     risk_free_rate: float = 0.0
     sharpe_ddof: int = 1
+    calendar_periods: tuple[str, ...] = ("month", "quarter", "year")
+    rolling_window_trading_days: int = 252
+    rolling_step_trading_days: int = 21
+    market_regime_definition: str = "BENCHMARK_MA120_SLOPE_V1"
+    market_regime_ma_window: int = 120
 
     def __post_init__(self):
         if not self.warmup_start <= self.evaluation_start <= self.evaluation_end:
@@ -154,6 +159,14 @@ class EvaluationConfig:
             raise ValueError("V1 Sharpe 只支持日收益率和 252 年化因子")
         if self.risk_free_rate != 0 or self.sharpe_ddof != 1:
             raise ValueError("V1 Sharpe 固定无风险利率 0 和样本标准差 ddof=1")
+        if set(self.calendar_periods) != {"month", "quarter", "year"}:
+            raise ValueError("Evaluation 必须固定包含 month、quarter、year 三种自然周期")
+        if self.rolling_window_trading_days <= 1 or self.rolling_step_trading_days <= 0:
+            raise ValueError("rolling window 必须大于 1，step 必须为正数")
+        if self.market_regime_definition != "BENCHMARK_MA120_SLOPE_V1":
+            raise ValueError("V1 市场状态定义固定为 BENCHMARK_MA120_SLOPE_V1")
+        if self.market_regime_ma_window != 120:
+            raise ValueError("V1 市场状态均线窗口固定为 MA120")
         if not self.primary_benchmark or not self.fallback_benchmark:
             raise ValueError("基准不能为空")
         if (
@@ -173,6 +186,11 @@ class EvaluationConfig:
             "annualization_factor": self.annualization_factor,
             "risk_free_rate": self.risk_free_rate,
             "sharpe_ddof": self.sharpe_ddof,
+            "calendar_periods": self.calendar_periods,
+            "rolling_window_trading_days": self.rolling_window_trading_days,
+            "rolling_step_trading_days": self.rolling_step_trading_days,
+            "market_regime_definition": self.market_regime_definition,
+            "market_regime_ma_window": self.market_regime_ma_window,
         }
 
     @property

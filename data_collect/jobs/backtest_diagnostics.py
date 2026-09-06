@@ -20,6 +20,7 @@ from uuid import uuid4
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.backtest_run_repository import BacktestRunRepository
+from data_collect.evaluation.standard import build_standard_evaluation
 
 
 _FORWARD_HORIZONS = (5, 10, 20, 40)
@@ -60,6 +61,19 @@ def _iso(value: Any) -> str | None:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     return str(value)
+
+
+def _date_value(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
 
 
 def _round(value: Any, digits: int = 8) -> float | None:
@@ -450,8 +464,20 @@ def build_report(
     for trade in trades:
         trade["name"] = names_by_entry.get((trade.get("ts_code"), trade.get("buy_date")))
     initial_cash = run.get("initial_cash")
+    run_parameters = _json_object(run.get("parameters"))
+    evaluation_parameters = _json_object(run_parameters.get("evaluation"))
+    try:
+        rolling_window = int(evaluation_parameters.get("rolling_window_trading_days", 252))
+        rolling_step = int(evaluation_parameters.get("rolling_step_trading_days", 21))
+        regime_window = int(evaluation_parameters.get("market_regime_ma_window", 120))
+    except (TypeError, ValueError):
+        rolling_window, rolling_step, regime_window = 252, 21, 120
+    benchmark_series = [
+        {"trade_date": _iso(row.get("trade_date")), "ts_code": row.get("ts_code"), "close": _round(row.get("close"), 6)}
+        for row in benchmark
+    ]
     return {
-        "report_version": "backtest-diagnostics-v1",
+        "report_version": "backtest-diagnostics-v2",
         "read_only": True,
         "run": {
             key: _iso(value) if key.endswith("_at") else value
@@ -465,6 +491,14 @@ def build_report(
         "equity_curve": build_equity_curve(performance, positions, benchmark, initial_cash),
         "monthly_returns": aggregate_period_returns(performance, "month"),
         "annual_returns": aggregate_period_returns(performance, "year"),
+        "benchmark_series": benchmark_series,
+        "evaluation": build_standard_evaluation(
+            performance,
+            benchmark,
+            rolling_window_trading_days=rolling_window,
+            rolling_step_trading_days=rolling_step,
+            market_regime_ma_window=regime_window,
+        ),
         "order_rejections": summarize_rejections(orders),
         "trade_summary": summarize_trades(trades),
         "exit_attribution": summarize_exit_attribution(trades),
@@ -531,9 +565,14 @@ def diagnose_run(run_id: str) -> dict[str, Any]:
             row.get("trade_date") for row in performance
             if isinstance(row.get("trade_date"), date)
         ]
+        benchmark_start = min(performance_dates) if performance_dates else date.today()
+        evaluation_parameters = _json_object(_json_object(run.get("parameters")).get("evaluation"))
+        configured_warmup = _date_value(evaluation_parameters.get("warmup_start"))
+        if configured_warmup is not None:
+            benchmark_start = min(benchmark_start, configured_warmup)
         benchmark = (
             repository.diagnostic_benchmark(
-                str(run["dataset_id"]), min(performance_dates), max(performance_dates), context
+                str(run["dataset_id"]), benchmark_start, max(performance_dates), context
             )
             if performance_dates else []
         )
