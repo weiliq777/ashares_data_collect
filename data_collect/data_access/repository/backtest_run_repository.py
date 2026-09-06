@@ -183,6 +183,71 @@ class BacktestRunRepository(BaseRepository):
             (run_id,), self._scope(run_id), 10_000,
         )
 
+    def diagnostic_positions(self, run_id: str, context: RunContext) -> list[dict[str, Any]]:
+        return self.kernel.read._repository_query(
+            context,
+            "backtest.position_daily",
+            """SELECT trade_date, ts_code, hold_shares, market_value,
+                             average_cost, raw_close, unrealized_pnl,
+                             valuation_status
+                        FROM backtest.position_daily
+                       WHERE run_id=%s
+                       ORDER BY trade_date, ts_code""",
+            (run_id,), self._scope(run_id), 100_000,
+        )
+
+    def diagnostic_benchmark(
+        self,
+        dataset_id: str,
+        date_from: date,
+        date_to: date,
+        context: RunContext,
+    ) -> list[dict[str, Any]]:
+        scope = WorkScope(
+            date_from=date_from,
+            date_to=date_to,
+            partition=dataset_id,
+            dimensions={"dataset_id": dataset_id},
+        )
+        return self.kernel.read._repository_query(
+            context,
+            "backtest.dataset_benchmark_bar",
+            """SELECT trade_date, ts_code, close
+                        FROM backtest.dataset_benchmark_bar
+                       WHERE dataset_id=%s
+                         AND trade_date BETWEEN %s AND %s
+                       ORDER BY trade_date""",
+            (dataset_id, date_from, date_to), scope, 10_000,
+        )
+
+    def diagnostic_trade_chart(
+        self,
+        ts_code: str,
+        date_from: date,
+        date_to: date,
+        context: RunContext,
+    ) -> list[dict[str, Any]]:
+        """Return one bounded stock chart series from the frozen snapshot."""
+        scope = WorkScope(
+            date_from=date_from,
+            date_to=date_to,
+            codes=(ts_code,),
+            partition=ts_code,
+            dimensions={"ts_code": ts_code},
+        )
+        return self.kernel.read._repository_query(
+            context,
+            "research.stock_snapshot_daily",
+            """SELECT research_date, ts_code, name, raw_close,
+                             adj_close_base, ma20, ma60, return_60d,
+                             is_st_asof, quality_status
+                        FROM research.stock_snapshot_daily
+                       WHERE ts_code=%s
+                         AND research_date BETWEEN %s AND %s
+                       ORDER BY research_date""",
+            (ts_code, date_from, date_to), scope, 5_000,
+        )
+
     def diagnostic_metrics(self, run_id: str, context: RunContext) -> list[dict[str, Any]]:
         return self.kernel.read._repository_query(
             context,
@@ -214,7 +279,7 @@ class BacktestRunRepository(BaseRepository):
             "research.stock_snapshot_daily",
             """SELECT s.signal_id, s.ts_code, s.signal_date,
                              s.research_snapshot_id,
-                             r.is_st_asof, r.quality_status,
+                             r.name, r.is_st_asof, r.quality_status,
                              r.research_date, r.snapshot_id
                         FROM backtest.signal s
                    LEFT JOIN research.stock_snapshot_daily r

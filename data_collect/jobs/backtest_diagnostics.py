@@ -293,6 +293,7 @@ def build_entry_diagnostics(
         row = {
             "ts_code": trade.get("ts_code"),
             "buy_date": trade.get("buy_date"),
+            "name": source.get("name"),
             "entry_ret60": _round(reason.get("ret60", trade.get("entry_ret60"))),
             "entry_rank": reason.get("rank", trade.get("entry_rank")),
             "avg_amount_20": _round(reason.get("avg_amount_20"), 2),
@@ -351,6 +352,69 @@ def summarize_forward_returns(
     return result
 
 
+def build_equity_curve(
+    performance: Sequence[Mapping[str, Any]],
+    positions: Sequence[Mapping[str, Any]],
+    benchmark: Sequence[Mapping[str, Any]],
+    initial_cash: Any,
+) -> list[dict[str, Any]]:
+    """Build the chart-ready daily series without changing persisted facts."""
+    cash = _float(initial_cash) or 0.0
+    benchmark_by_date = {
+        row.get("trade_date"): _float(row.get("close"))
+        for row in benchmark
+        if row.get("trade_date") is not None and _float(row.get("close")) is not None
+    }
+    first_benchmark = next(
+        (benchmark_by_date.get(row.get("trade_date")) for row in performance
+         if benchmark_by_date.get(row.get("trade_date")) not in (None, 0)),
+        None,
+    )
+    position_count: dict[Any, int] = defaultdict(int)
+    for row in positions:
+        if _int(row.get("hold_shares")) > 0:
+            position_count[row.get("trade_date")] += 1
+    curve: list[dict[str, Any]] = []
+    for row in performance:
+        equity = _float(row.get("total_equity"))
+        if equity is None:
+            continue
+        trade_date = row.get("trade_date")
+        strategy_nav = equity / cash if cash else None
+        benchmark_close = benchmark_by_date.get(trade_date)
+        benchmark_nav = benchmark_close / first_benchmark if first_benchmark and benchmark_close else None
+        curve.append({
+            "date": _iso(trade_date),
+            "nav": _round(strategy_nav),
+            "benchmark_nav": _round(benchmark_nav),
+            "excess_nav": _round(strategy_nav / benchmark_nav if strategy_nav and benchmark_nav else None),
+            "drawdown": _round(row.get("drawdown")),
+            "daily_return": _round(row.get("daily_return")),
+            "cash": _round(row.get("cash_balance"), 6),
+            "market_value": _round(row.get("position_value"), 6),
+            "cash_ratio": _round((_float(row.get("cash_balance")) or 0.0) / equity if equity else None),
+            "position_count": position_count.get(trade_date, 0),
+            "valuation_status": row.get("valuation_status"),
+        })
+    return curve
+
+
+def aggregate_period_returns(performance: Sequence[Mapping[str, Any]], period: str) -> list[dict[str, Any]]:
+    """Compound persisted daily returns into calendar-month/year bars."""
+    groups: dict[str, list[float]] = defaultdict(list)
+    for row in performance:
+        trade_date = row.get("trade_date")
+        daily_return = _float(row.get("daily_return"))
+        if not isinstance(trade_date, date) or daily_return is None:
+            continue
+        key = trade_date.strftime("%Y-%m" if period == "month" else "%Y")
+        groups[key].append(daily_return)
+    return [
+        {"period": key, "return": _round(math.prod(1.0 + value for value in values) - 1.0)}
+        for key, values in sorted(groups.items())
+    ]
+
+
 def build_report(
     run: Mapping[str, Any],
     signals: Sequence[Mapping[str, Any]],
@@ -361,6 +425,8 @@ def build_report(
     metrics: Sequence[Mapping[str, Any]],
     entry_inputs: Sequence[Mapping[str, Any]],
     future_rows: Sequence[Mapping[str, Any]],
+    positions: Sequence[Mapping[str, Any]] = (),
+    benchmark: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     signal_by_id = {str(row.get("signal_id")): row for row in signals}
     performance_dates = sorted({
@@ -377,6 +443,13 @@ def build_report(
     date_to = max((row.get("signal_date") for row in signals if isinstance(row.get("signal_date"), date)), default=None)
     entry_inputs = list(entry_inputs)
     entry = build_entry_diagnostics(trades, signal_by_id, entry_inputs)
+    names_by_entry = {
+        (row.get("ts_code"), row.get("buy_date")): row.get("name")
+        for row in entry.get("entries", [])
+    }
+    for trade in trades:
+        trade["name"] = names_by_entry.get((trade.get("ts_code"), trade.get("buy_date")))
+    initial_cash = run.get("initial_cash")
     return {
         "report_version": "backtest-diagnostics-v1",
         "read_only": True,
@@ -389,6 +462,9 @@ def build_report(
             "signals": len(signals), "orders": len(orders), "fills": len(fills),
             "position_lots": len(lots), "performance_daily": len(performance),
         },
+        "equity_curve": build_equity_curve(performance, positions, benchmark, initial_cash),
+        "monthly_returns": aggregate_period_returns(performance, "month"),
+        "annual_returns": aggregate_period_returns(performance, "year"),
         "order_rejections": summarize_rejections(orders),
         "trade_summary": summarize_trades(trades),
         "exit_attribution": summarize_exit_attribution(trades),
@@ -427,6 +503,7 @@ def diagnose_run(run_id: str) -> dict[str, Any]:
         fills = repository.diagnostic_fills(run_id, context)
         lots = repository.diagnostic_lots(run_id, context)
         performance = repository.diagnostic_performance(run_id, context)
+        positions = repository.diagnostic_positions(run_id, context)
         metrics = repository.diagnostic_metrics(run_id, context)
         signal_dates = [row.get("signal_date") for row in signals if isinstance(row.get("signal_date"), date)]
         entry_inputs = (
@@ -450,8 +527,19 @@ def diagnose_run(run_id: str) -> dict[str, Any]:
             min(row[1] for row in actual_entries) if actual_entries else date.today(),
             context,
         )
+        performance_dates = [
+            row.get("trade_date") for row in performance
+            if isinstance(row.get("trade_date"), date)
+        ]
+        benchmark = (
+            repository.diagnostic_benchmark(
+                str(run["dataset_id"]), min(performance_dates), max(performance_dates), context
+            )
+            if performance_dates else []
+        )
         return build_report(
-            run, signals, orders, fills, lots, performance, metrics, entry_inputs, future_rows
+            run, signals, orders, fills, lots, performance, metrics, entry_inputs,
+            future_rows, positions, benchmark,
         )
     finally:
         kernel.close()

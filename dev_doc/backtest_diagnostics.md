@@ -18,6 +18,23 @@ python -m data_collect.jobs.backtest_diagnostics `
 - `forward_returns`：从成交价到未来第 5/10/20/40 个交易日收盘价的纯价格路径；
 - `persisted_metrics`：数据库已保存的运行指标，供交叉核对。
 
+## 前端看板
+
+启动本地只读 Dashboard（回测看板）：
+
+```powershell
+python -m data_collect.web.backtest_dashboard --port 8765
+```
+
+浏览器打开 `http://127.0.0.1:8765/?run_id=<run_id>`，或在页面输入 `run_id`。看板提供：
+
+- 策略净值、基准净值、回撤、现金占比和持仓数量曲线；
+- 月度/年度收益、拒单类别、退出原因和入场 `RET60`（60日收益率）分布；
+- 可点击的完整交易表；
+- 单笔交易的基础复权价格、MA20、MA60 与买卖点。
+
+服务只绑定 `127.0.0.1`（本机），API 只读，不提供数据库写入路由。
+
 ## 口径与边界
 
 1. 交易归因是对现有不可变事实的重建：`signal（信号）→ order（订单）→ fill（成交）→ position_lot（持仓批次）`。部分成交或一笔成交对应多个持仓批次时，费用按成交股数比例分摊。

@@ -1,7 +1,11 @@
 from datetime import date
 
+import pytest
+
 from data_collect.jobs.backtest_diagnostics import (
+    aggregate_period_returns,
     build_entry_diagnostics,
+    build_equity_curve,
     build_trade_records,
     classify_rejection,
     summarize_exit_attribution,
@@ -117,3 +121,38 @@ def test_entry_diagnostics_flags_historical_st_only_when_pit_says_true():
     )
     assert diagnostics["historical_st_violations"] == []
     assert diagnostics["entries"][0]["is_st_asof"] is False
+
+
+def test_equity_curve_contains_benchmark_cash_and_position_utilization():
+    performance = [
+        {"trade_date": date(2024, 1, 2), "total_equity": 10000, "cash_balance": 7000,
+         "position_value": 3000, "drawdown": 0, "daily_return": None, "valuation_status": "VALID"},
+        {"trade_date": date(2024, 1, 3), "total_equity": 9500, "cash_balance": 6500,
+         "position_value": 3000, "drawdown": -0.05, "daily_return": -0.05, "valuation_status": "VALID"},
+    ]
+    positions = [
+        {"trade_date": date(2024, 1, 2), "ts_code": "000001.SZ", "hold_shares": 100},
+        {"trade_date": date(2024, 1, 3), "ts_code": "000001.SZ", "hold_shares": 100},
+    ]
+    benchmark = [
+        {"trade_date": date(2024, 1, 2), "close": 100},
+        {"trade_date": date(2024, 1, 3), "close": 102},
+    ]
+    curve = build_equity_curve(performance, positions, benchmark, 10000)
+    assert curve[0]["nav"] == 1.0
+    assert curve[1]["benchmark_nav"] == 1.02
+    assert curve[1]["cash_ratio"] == pytest.approx(6500 / 9500, abs=1e-8)
+    assert curve[1]["position_count"] == 1
+
+
+def test_period_returns_compound_daily_returns():
+    performance = [
+        {"trade_date": date(2024, 1, 2), "daily_return": 0.10},
+        {"trade_date": date(2024, 1, 3), "daily_return": -0.10},
+        {"trade_date": date(2024, 2, 1), "daily_return": 0.05},
+    ]
+    monthly = aggregate_period_returns(performance, "month")
+    annual = aggregate_period_returns(performance, "year")
+    assert monthly[0] == {"period": "2024-01", "return": -0.01}
+    assert annual[0]["period"] == "2024"
+    assert annual[0]["return"] == 0.0395
