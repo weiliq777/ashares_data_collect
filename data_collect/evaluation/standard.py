@@ -335,10 +335,21 @@ def _comparison_identity(report: Mapping[str, Any]) -> dict[str, Any]:
     scenario = _parameters(params.get("scenario"))
     scenario.pop("initial_capital", None)
     scenario.pop("scenario_id", None)
+    evaluation = _parameters(params.get("evaluation"))
+    # The 1 万元 baseline may have been persisted before the standard
+    # evaluation dimensions were added.  Normalize omitted fields to the
+    # frozen V1 defaults instead of comparing an obsolete hash string.
+    evaluation.setdefault("calendar_periods", ["month", "quarter", "year"])
+    evaluation.setdefault("rolling_window_trading_days", 252)
+    evaluation.setdefault("rolling_step_trading_days", 21)
+    evaluation.setdefault("market_regime_definition", MARKET_REGIME_DEFINITION)
+    evaluation.setdefault("market_regime_ma_window", 120)
     base_parameters = dict(params)
     base_parameters.pop("scenario", None)
     base_parameters.pop("scenario_hash", None)
     base_parameters.pop("backtest_fingerprint", None)
+    base_parameters.pop("evaluation", None)
+    base_parameters.pop("evaluation_hash", None)
     return {
         "dataset_id": run.get("dataset_id"),
         "strategy_id": run.get("strategy_id"),
@@ -348,7 +359,7 @@ def _comparison_identity(report: Mapping[str, Any]) -> dict[str, Any]:
         "code_version": run.get("code_version"),
         "git_commit": run.get("git_commit"),
         "code_archive_sha256": run.get("code_archive_sha256"),
-        "evaluation_hash": params.get("evaluation_hash"),
+        "evaluation_definition": evaluation,
         "base_parameters": base_parameters,
         "scenario_without_capital": scenario,
         "scope": report.get("scope"),

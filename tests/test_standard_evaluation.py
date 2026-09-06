@@ -128,6 +128,28 @@ def test_capital_sensitivity_requires_same_experiment_identity_and_reports_missi
         build_capital_sensitivity([_capital_report(10_000, "run-10k"), incompatible])
 
 
+def test_capital_sensitivity_normalizes_legacy_evaluation_metadata():
+    legacy = _capital_report(10_000, "run-legacy")
+    legacy["run"]["parameters"] = {
+        "evaluation_hash": "legacy-hash",
+        "scenario": {
+            "scenario_id": "legacy-10k",
+            "initial_capital": 10_000,
+            "target_positions": 3,
+        },
+    }
+    current = _capital_report(30_000, "run-current")
+    current["run"]["parameters"]["evaluation"] = {
+        "calendar_periods": ["month", "quarter", "year"],
+        "rolling_window_trading_days": 252,
+        "rolling_step_trading_days": 21,
+        "market_regime_definition": "BENCHMARK_MA120_SLOPE_V1",
+        "market_regime_ma_window": 120,
+    }
+    result = build_capital_sensitivity([legacy, current])
+    assert result["comparable"] is True
+
+
 def test_standard_evaluation_contains_all_fixed_dimensions():
     result = build_standard_evaluation(_performance([100, 101]), [])
     assert set(result["calendar"]) == {"month", "quarter", "year"}
