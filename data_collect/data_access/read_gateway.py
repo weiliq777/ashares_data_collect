@@ -196,10 +196,26 @@ class ReadGateway:
         # consumers must use the canonical qualified Standard relation
         # ``std.daily_kline``; this branch cannot broaden access.
         if "." in target:
-            relation = re.escape(target)
+            parts = target.split(".")
+            relation_candidates = (
+                target,
+                f'{parts[0]}."{parts[1]}"',
+                f'"{parts[0]}".{parts[1]}',
+                f'"{parts[0]}"."{parts[1]}"',
+            )
+            relation = "|".join(
+                re.escape(candidate)
+                for candidate in relation_candidates
+            )
         else:
-            relation = rf"(?:public\.)?{re.escape(target)}"
-        relation_pattern = re.compile(rf"\b(?:FROM|JOIN)\s+{relation}\b", re.I)
+            relation_candidates = (
+                rf"(?:public\.)?{re.escape(target)}",
+                rf"(?:public\.)?{re.escape(chr(34) + target + chr(34))}",
+            )
+            relation = "|".join(relation_candidates)
+        relation_pattern = re.compile(
+            rf"\b(?:FROM|JOIN)\s+(?:{relation})(?=\s|$)", re.I
+        )
         if not relation_pattern.search(normalized):
             raise ValueError(f"Repository read SQL 未包含 source={source}")
         if max_rows <= 0:
