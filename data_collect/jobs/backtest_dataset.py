@@ -36,7 +36,13 @@ from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.context import WorkScope
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.dataset_repository import DatasetRepository
-from data_collect.data_access.research_contract import STRATEGY_NEUTRAL_SCHEMA_VERSION
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchSnapshotRepository,
+)
+from data_collect.data_access.research_contract import (
+    STRATEGY_NEUTRAL_SCHEMA_VERSION,
+    is_foundation_schema,
+)
 
 
 SCHEMA_VERSION = "backtest-dataset-v2"
@@ -47,6 +53,7 @@ SUPPORTED_RESEARCH_SCHEMA_VERSIONS = frozenset(
 )
 HASH_ALGORITHM = "sha256"
 MARKET_COVERAGE_POLICY = "validated_baseline_quality_report_equivalent_for_dates_without_gate"
+FOUNDATION_CONTRACT_BATCH_SIZE = 10
 
 # Historical contract assertions retained as documentation while the runtime
 # implementation is Repository -> Kernel only.
@@ -76,6 +83,103 @@ def _read_service(label: str):
         config_hash="unknown", pipeline_version="data-access-v1",
     )
     return kernel, DatasetRepository(kernel), context
+
+
+def _foundation_contract_manifest(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Dataset/Research contract rows for the Repository gate.
+
+    The two callers intentionally use different read projections: Dataset
+    creation starts from ``snapshot_manifests`` while validation and runtime
+    loading start from Dataset members.  Keeping this normalization in the
+    job layer avoids exposing SQL or cursor details to either caller.
+    """
+    snapshot_id = row.get("snapshot_id", row.get("research_snapshot_id"))
+    cutoff = row.get(
+        "cutoff",
+        row.get("research_cutoff_date", row.get("research_date")),
+    )
+    schema_version = row.get(
+        "schema_version", row.get("research_schema_version")
+    )
+    if snapshot_id is None or cutoff is None or schema_version is None:
+        raise RuntimeError(
+            "Research Snapshot contract row is incomplete: "
+            f"snapshot_id={snapshot_id!r}, cutoff={cutoff!r}, "
+            f"schema_version={schema_version!r}"
+        )
+    return {
+        "snapshot_id": str(snapshot_id),
+        "cutoff": cutoff,
+        "schema_version": str(schema_version),
+    }
+
+
+def _foundation_contract_issues(
+    rows: Sequence[dict[str, Any]],
+    repository: DatasetRepository,
+    context: RunContext,
+) -> dict[str, dict[str, int]]:
+    """Run the bounded Foundation financial identity gate for Snapshot rows.
+
+    This is deliberately a lifecycle gate, not a broad repair query.  It
+    reads at most ``FOUNDATION_CONTRACT_BATCH_SIZE`` snapshots per Repository
+    call and returns aggregate issues only.  Legacy Research schemas do not
+    use the Foundation V2 financial contract and are therefore left to their
+    existing compatibility checks.
+    """
+    normalized = [_foundation_contract_manifest(row) for row in rows]
+    if not normalized or not all(
+        is_foundation_schema(item["schema_version"]) for item in normalized
+    ):
+        return {}
+
+    snapshot_repository = ResearchSnapshotRepository(repository.kernel)
+    issues: dict[str, dict[str, int]] = {}
+    for offset in range(0, len(normalized), FOUNDATION_CONTRACT_BATCH_SIZE):
+        batch = normalized[offset : offset + FOUNDATION_CONTRACT_BATCH_SIZE]
+        issues.update(
+            snapshot_repository.foundation_financial_contract_issues(
+                batch, context,
+            )
+        )
+    return issues
+
+
+def _format_foundation_contract_failure(
+    issues: dict[str, dict[str, int]],
+) -> str:
+    """Produce a bounded error message without dumping a large audit result."""
+    examples = []
+    for snapshot_id, details in list(sorted(issues.items()))[:5]:
+        examples.append(f"{snapshot_id}: {details}")
+    suffix = "" if len(issues) <= 5 else f"; plus {len(issues) - 5} more"
+    return (
+        "Foundation V2 financial contract failed for "
+        f"{len(issues)} Research Snapshot(s): "
+        + "; ".join(examples)
+        + suffix
+    )
+
+
+def _foundation_contract_audit_is_present(manifest: dict[str, Any]) -> bool:
+    """Return whether a Dataset validation recorded the Foundation gate.
+
+    Frozen Datasets created before this gate was introduced have no trustworthy
+    pass marker.  They must not silently enter a new formal backtest; the
+    caller should rebuild/validate a replacement Dataset instead.
+    """
+    quality = manifest.get("quality_report")
+    if isinstance(quality, str):
+        try:
+            quality = json.loads(quality)
+        except (TypeError, ValueError):
+            return False
+    contract = quality.get("foundation_financial_contract") if isinstance(quality, dict) else None
+    return (
+        isinstance(contract, dict)
+        and contract.get("status") == "PASS"
+        and contract.get("audit_version") == "foundation-financial-contract-v1"
+    )
 
 
 SELECTION_PREDICATE = (
@@ -459,6 +563,13 @@ def create_dataset(
         schema_versions = {row["schema_version"] for row in rows}
         if len(schema_versions) != 1 or not schema_versions <= SUPPORTED_RESEARCH_SCHEMA_VERSIONS:
             raise ValueError(f"Research Snapshot schema_version 不兼容: {sorted(schema_versions)}")
+        foundation_contract_issues = _foundation_contract_issues(
+            rows, repository, context,
+        )
+        if foundation_contract_issues:
+            raise RuntimeError(
+                _format_foundation_contract_failure(foundation_contract_issues)
+            )
         if any(row["data_baseline_tag"] != baseline_tag for row in rows):
             raise ValueError("Dataset 基线必须与所有 Research Snapshot 的 data_baseline_tag 一致")
         if any(row["baseline_quality_report_hash"] != baseline["quality_report_hash"] for row in rows):
@@ -649,6 +760,27 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
         members = repository.member_validation_rows(dataset_id, context)
         if not members:
             issues.append("dataset_member 为空")
+        contract_rows = repository.research_snapshot_contracts(dataset_id, context)
+        foundation_contract_issues = _foundation_contract_issues(
+            contract_rows, repository, context,
+        )
+        if foundation_contract_issues:
+            issues.append(_format_foundation_contract_failure(foundation_contract_issues))
+        contract_schemas = {
+            str(row["research_schema_version"]) for row in contract_rows
+        }
+        foundation_contract_quality = {
+            "status": (
+                "PASS"
+                if contract_rows
+                and all(is_foundation_schema(schema) for schema in contract_schemas)
+                and not foundation_contract_issues
+                else "NOT_APPLICABLE"
+            ),
+            "audit_version": "foundation-financial-contract-v1",
+            "snapshot_count": len(contract_rows),
+            "issue_snapshot_count": len(foundation_contract_issues),
+        }
         materialized = _materialized_hashes(dataset_id)
         benchmark_repair = manifest.get("benchmark_source_manifest")
         benchmark_repair_hash = manifest.get("benchmark_source_manifest_hash")
@@ -699,6 +831,7 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
             "benchmark_rows": len(materialized["benchmark_rows"]), "out_of_sample_start": manifest.get("out_of_sample_start"),
             "baseline_quality_report_hash": manifest.get("baseline_quality_report_hash"),
             "baseline_source_manifest_hash": manifest.get("baseline_source_manifest_hash"),
+            "foundation_financial_contract": foundation_contract_quality,
         }
         report_hash = _quality_report_hash(quality)
         if issues:
@@ -751,6 +884,16 @@ def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
         manifest = repository.manifest(dataset_id, context)
         if manifest["status"] != "VALIDATED":
             raise RuntimeError(f"只有 VALIDATED Dataset 可冻结: {manifest['status']}")
+        contract_rows = repository.research_snapshot_contracts(dataset_id, context)
+        contract_schemas = {
+            str(row["research_schema_version"]) for row in contract_rows
+        }
+        if contract_rows and all(is_foundation_schema(schema) for schema in contract_schemas):
+            if not _foundation_contract_audit_is_present(manifest):
+                raise RuntimeError(
+                    "Foundation V2 Dataset 缺少通过财务来源身份门禁的验收记录，"
+                    "必须重新 validate 后才能冻结"
+                )
         _check_baseline(manifest["baseline"], manifest["evaluation_end"], expected_quality_report_hash=manifest.get("baseline_quality_report_hash"), expected_source_manifest_hash=manifest.get("baseline_source_manifest_hash"))
         _assert_build_code_current(manifest, metadata)
         changed = repository.transition_manifest(
@@ -827,6 +970,16 @@ def _resolve_frozen_window(
     manifest = repository.manifest(dataset_id, context)
     if manifest["status"] != "FROZEN":
         raise RuntimeError(f"鍙湁 FROZEN Dataset 鍙互鐢ㄤ簬姝ｅ紡鍥炴祴: {manifest['status']}")
+    contract_rows = repository.research_snapshot_contracts(dataset_id, context)
+    contract_schemas = {
+        str(row["research_schema_version"]) for row in contract_rows
+    }
+    if contract_rows and all(is_foundation_schema(schema) for schema in contract_schemas):
+        if not _foundation_contract_audit_is_present(manifest):
+            raise RuntimeError(
+                "Foundation V2 Dataset 未记录财务来源身份门禁通过结果，"
+                "禁止正式回测；请创建并验收修复后的 Dataset"
+            )
     effective_warmup_start = manifest["warmup_start"]
     effective_evaluation_start = manifest["evaluation_start"]
     effective_evaluation_end = manifest["evaluation_end"]

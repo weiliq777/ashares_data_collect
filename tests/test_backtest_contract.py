@@ -5,6 +5,8 @@ from data_collect.jobs.backtest_dataset import (
     FEATURE_VERSION,
     SUPPORTED_RESEARCH_SCHEMA_VERSIONS,
     _assert_build_code_current,
+    _foundation_contract_audit_is_present,
+    _foundation_contract_issues,
     missing_snapshot_dates,
 )
 from data_collect.jobs.research_snapshot import FOUNDATION_SCHEMA_VERSION, SCHEMA_VERSION
@@ -160,6 +162,55 @@ def test_dataset_accepts_current_and_foundation_research_contracts():
     assert "ocf_to_net_profit_consolidated_ttm" in source
     assert "financial_source_fingerprint" in source
     assert len(FEATURE_VERSION) <= 80
+
+
+def test_dataset_foundation_gate_is_bounded_and_ignores_legacy_schema(monkeypatch):
+    calls = []
+
+    def fake_gate(self, manifests, context):
+        calls.append(manifests)
+        return {"snapshot-1": {"non_v2_source_rows": 1}}
+
+    from data_collect.data_access.repository.research_snapshot_repository import (
+        ResearchSnapshotRepository,
+    )
+
+    monkeypatch.setattr(
+        ResearchSnapshotRepository,
+        "foundation_financial_contract_issues",
+        fake_gate,
+    )
+
+    class FakeDatasetRepository:
+        kernel = object()
+
+    rows = [
+        {
+            "snapshot_id": "snapshot-1",
+            "research_cutoff_date": date(2026, 8, 20),
+            "schema_version": FOUNDATION_SCHEMA_VERSION,
+        }
+    ]
+    issues = _foundation_contract_issues(rows, FakeDatasetRepository(), object())
+    assert issues == {"snapshot-1": {"non_v2_source_rows": 1}}
+    assert len(calls) == 1
+    assert calls[0][0]["cutoff"] == date(2026, 8, 20)
+
+    legacy = [{**rows[0], "schema_version": SCHEMA_VERSION}]
+    assert _foundation_contract_issues(legacy, FakeDatasetRepository(), object()) == {}
+    assert len(calls) == 1
+
+
+def test_foundation_contract_pass_marker_is_required_for_formal_use():
+    assert _foundation_contract_audit_is_present({
+        "quality_report": {
+            "foundation_financial_contract": {
+                "status": "PASS",
+                "audit_version": "foundation-financial-contract-v1",
+            }
+        }
+    })
+    assert not _foundation_contract_audit_is_present({"quality_report": "{}"})
 
 
 def test_dataset_handoff_selects_only_requested_snapshot_range():
