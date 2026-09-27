@@ -53,6 +53,14 @@ def _money(value: Any) -> str:
     return _MISSING if rendered == _MISSING else f"¥{rendered}"
 
 
+def _activity_label(value: Any) -> str:
+    return {
+        "INVESTED": "有持仓",
+        "CASH_ONLY": "现金期（无持仓）",
+        "UNKNOWN": "未知（缺持仓字段）",
+    }.get(str(value or "").upper(), _value(value))
+
+
 def _table(headers: Sequence[str], rows: Iterable[Sequence[Any]]) -> list[str]:
     output = [
         "| " + " | ".join(_cell(header) for header in headers) + " |",
@@ -83,7 +91,9 @@ def _run_identity(report: Mapping[str, Any]) -> list[str]:
         ("运行版本", run.get("run_version")),
         ("Dataset ID", run.get("dataset_id")),
         ("初始资金", _money(run.get("initial_cash"))),
-        ("评估区间", f"{_value(scope.get('signal_date_from'))} ～ {_value(scope.get('signal_date_to'))}"),
+        ("评估区间", f"{_value(scope.get('evaluation_date_from'))} ～ {_value(scope.get('evaluation_date_to'))}"),
+        ("净值区间", f"{_value(scope.get('performance_date_from'))} ～ {_value(scope.get('performance_date_to'))}"),
+        ("信号区间", f"{_value(scope.get('signal_date_from'))} ～ {_value(scope.get('signal_date_to'))}"),
         ("输入哈希", run.get("input_hash")),
         ("执行引擎版本", run.get("execution_model_version")),
         ("代码版本", run.get("code_version")),
@@ -99,7 +109,7 @@ def _calendar_table(evaluation: Mapping[str, Any], period: str) -> list[str]:
     if not rows:
         return ["暂无该维度数据。"]
     return _table(
-        ("期间", "策略收益", "基准收益", "超额收益", "最大回撤", "交易日"),
+        ("期间", "策略收益", "基准收益", "超额收益", "最大回撤", "观察日", "持仓日", "现金期", "活动状态"),
         (
             (
                 row.get("period"),
@@ -107,7 +117,10 @@ def _calendar_table(evaluation: Mapping[str, Any], period: str) -> list[str]:
                 _percent(row.get("benchmark_return")),
                 _percent(row.get("excess_return")),
                 _percent(row.get("max_drawdown")),
-                row.get("trading_days"),
+                row.get("observation_days"),
+                row.get("invested_days"),
+                row.get("cash_only_days"),
+                _activity_label(row.get("activity_status")),
             )
             for row in rows
         ),
@@ -180,6 +193,54 @@ def _forward_return_lines(forward: Mapping[str, Any]) -> list[str]:
             )
         )
     return _table(("持有窗口", "样本数", "平均价格收益", "中位数", "最小", "最大"), rows) if rows else ["暂无未来价格路径数据。"]
+
+
+def _decision_reason_lines(decision_log: Mapping[str, Any]) -> list[str]:
+    """Render the compact decision explanation without expanding raw JSON blindly."""
+    summary = decision_log.get("summary") or {}
+    rows = decision_log.get("rows") or []
+    reason_counts = summary.get("reason_counts") or {}
+    dominant_counts = summary.get("dominant_failure_counts") or {}
+    reason_table = _table(
+        ("原因代码", "天数"),
+        sorted(reason_counts.items(), key=lambda item: (-item[1], item[0])),
+    ) if reason_counts else ["暂无原因代码。"]
+    dominant_table = _table(
+        ("主导失败门禁", "信号日数"),
+        sorted(dominant_counts.items(), key=lambda item: (-item[1], item[0])),
+    ) if dominant_counts else ["暂无候选门禁失败统计。"]
+    lines = [
+        f"共记录 **{_value(summary.get('days'))}** 个评价日，其中明确无动作 **{_value(summary.get('no_action_days'))}** 天。",
+        "`decision_reason` 是回测事实的解释字段，不参与策略决策；信号日会记录候选门禁失败计数，普通日期会记录未触发信号的原因。",
+        "",
+        "### 无动作/门禁原因汇总",
+        "",
+        *reason_table,
+        "",
+        "### 信号日主导失败门禁",
+        "",
+        *dominant_table,
+    ]
+    daily_rows = []
+    for row in rows[:500]:
+        reason = row.get("reason") or {}
+        daily_rows.append((
+            row.get("trade_date"),
+            reason.get("decision_type"),
+            reason.get("no_action_reason_code") or reason.get("reason_code") or _MISSING,
+            reason.get("dominant_failure_code") or _MISSING,
+            reason.get("eligible_candidate_count", _MISSING),
+            reason.get("buy_signal_count", 0),
+            reason.get("sell_signal_count", 0),
+        ))
+    daily_table = _table(
+        ("日期", "决策", "无动作原因", "主导失败门禁", "合格候选", "买入信号", "卖出信号"),
+        daily_rows,
+    ) if daily_rows else ["暂无逐日决策记录。"]
+    lines += ["", "### 每日决策摘要", "", *daily_table]
+    if len(rows) > 500:
+        lines += ["", f"> 逐日决策共 {len(rows)} 条，本文展示前 500 条；完整记录保留在 JSON 诊断报告和 `backtest.performance_daily.decision_reason`。"]
+    return lines
 
 
 def render_diagnostic_markdown(
@@ -330,18 +391,20 @@ def render_diagnostic_markdown(
         *_calendar_table(evaluation, "year"),
     ])
 
+    lines += _section("10. 每日决策与空仓原因", _decision_reason_lines(report.get("decision_log") or {}))
+
     regime = evaluation.get("market_regime") or {}
-    lines += _section("10. 市场状态切片（仅事后评价）", [
+    lines += _section("11. 市场状态切片（仅事后评价）", [
         f"定义：`{_value(regime.get('definition'))}`；MA 窗口：`{_value(regime.get('ma_window'))}` 个交易日。该标签不会改变 Strategy（策略）V1 的交易决策。",
         "",
         *_regime_table(evaluation),
     ])
 
-    lines += _section("11. 滚动 12 个月表现", _rolling_table(evaluation))
+    lines += _section("12. 滚动 12 个月表现", _rolling_table(evaluation))
 
     if capital_sensitivity:
         capital_rows = capital_sensitivity.get("rows") or []
-        lines += _section("12. 资金敏感性", [
+        lines += _section("13. 资金敏感性", [
             f"可比性：**{_value(capital_sensitivity.get('comparable'))}**；Evaluation（评估）版本：`{_value(capital_sensitivity.get('evaluation_version'))}`。只有身份一致、仅 Scenario（场景）初始资金不同的 Run 才能比较。",
             "仅允许把初始资金作为 Scenario（场景）变量；策略、Dataset（回测数据集）、Evaluation（评估）口径和执行引擎必须保持一致。",
             "",
@@ -359,7 +422,7 @@ def render_diagnostic_markdown(
         ])
 
     limitations = report.get("limitations") or []
-    lines += _section("12. 数据边界与分析注意事项" if not capital_sensitivity else "13. 数据边界与分析注意事项", [
+    lines += _section("13. 数据边界与分析注意事项" if not capital_sensitivity else "14. 数据边界与分析注意事项", [
         *[f"- {item}" for item in limitations],
         "- 本文是诊断事实文档，不是自动调参建议；任何策略修改都必须创建新的 StrategyVersion（策略版本）并独立回测。",
         "- Raw（原始层）、Standard（标准层）、PIT（时点层）、Feature（特征层）和 Frozen Dataset（冻结数据集）均未被本文修改。",

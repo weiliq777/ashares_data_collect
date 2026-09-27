@@ -10,10 +10,27 @@ from data_collect.data_access.context import Operation, RunContext, SqlPlan, Wor
 from data_collect.data_access.repository.base import BaseRepository
 from data_collect.data_access.repository.foundation_quality_repository import FoundationQualityRepository
 from data_collect.data_access.repository.quality_inspection_repository import QualityInspectionRepository
+from data_collect.data_access.release_delta_impact import (
+    DeltaImpactPlan,
+    resolve_delta_impact,
+)
+from data_collect.data_access.repository.market_activity_repository import MarketActivityRepository
+from data_collect.market_activity.contracts import MarketActivityReport, MarketActivityRequest
+from data_collect.market_activity.monitor import MarketActivityMonitor
 
 
 class ReleaseRepository(BaseRepository):
     _MANIFEST_WINDOW_DAYS = 180
+    RESEARCH_DOMAIN = "RESEARCH"
+    MARKET_ACTIVITY_DOMAIN = "MARKET_ACTIVITY"
+
+    @classmethod
+    def _baseline_domain(cls, schema_version: str | None) -> str:
+        return (
+            cls.MARKET_ACTIVITY_DOMAIN
+            if str(schema_version or "").strip() == "market-activity-v1"
+            else cls.RESEARCH_DOMAIN
+        )
 
     def create(
         self,
@@ -31,8 +48,10 @@ class ReleaseRepository(BaseRepository):
             raise ValueError("data_cutoff_timestamp must be timezone-aware")
         if temporal_evidence_level not in {"OFFICIAL_BUSINESS_PIT", "WAREHOUSE_OBSERVED", "LEGACY"}:
             raise ValueError("unsupported temporal_evidence_level")
+        baseline_domain = self._baseline_domain(schema_version)
         row = {
             "release_tag": tag,
+            "baseline_domain": baseline_domain,
             "baseline_cutoff_date": cutoff,
             "status": "draft",
             "notes": notes,
@@ -44,7 +63,7 @@ class ReleaseRepository(BaseRepository):
         return self.kernel.write.upsert(
             context=context, scope=WorkScope(date_to=cutoff, partition=f"release:{tag}"),
             target="ops.tushare_data_release", rows=[row], key=("release_tag",),
-            update_columns=("baseline_cutoff_date", "status", "notes", "schema_version",
+            update_columns=("baseline_domain", "baseline_cutoff_date", "status", "notes", "schema_version",
                             "data_cutoff_timestamp", "temporal_evidence_level",
                             "visibility_policy_version"),
         )
@@ -80,7 +99,13 @@ class ReleaseRepository(BaseRepository):
         encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
         return manifest, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-    def _market_versions_manifest(self, cutoff: date, context: RunContext) -> dict[str, dict]:
+    def _market_versions_manifest(
+        self,
+        cutoff: date,
+        context: RunContext,
+        *,
+        start_date: date | None = None,
+    ) -> dict[str, dict]:
         """Aggregate all versioned market datasets in shared date windows.
 
         ``tushare_market_raw_version`` stores daily, daily_basic and adj_factor
@@ -101,24 +126,36 @@ class ReleaseRepository(BaseRepository):
             }
             for dataset in datasets
         }
+        if start_date is not None and start_date > cutoff:
+            raise ValueError("market manifest start_date must not be after cutoff")
+        if start_date is None:
+            date_predicate = "trade_date IS NOT NULL AND trade_date <= %s"
+            date_params = [cutoff]
+        else:
+            date_predicate = "trade_date IS NOT NULL AND trade_date BETWEEN %s AND %s"
+            date_params = [start_date, cutoff]
         minimum_rows = self.kernel.read._repository_query(
             context,
             "tushare_market_raw_version",
-            """SELECT dataset, min_date FROM (
+            f"""SELECT dataset, min_date FROM (
                     SELECT 'daily'::text AS dataset,
                            (SELECT MIN(trade_date) FROM tushare_market_raw_version
-                             WHERE dataset='daily' AND trade_date IS NOT NULL) AS min_date
+                             WHERE dataset='daily' AND {date_predicate}) AS min_date
                     UNION ALL
                     SELECT 'daily_basic',
                            (SELECT MIN(trade_date) FROM tushare_market_raw_version
-                             WHERE dataset='daily_basic' AND trade_date IS NOT NULL)
+                             WHERE dataset='daily_basic' AND {date_predicate})
                     UNION ALL
                     SELECT 'adj_factor',
                            (SELECT MIN(trade_date) FROM tushare_market_raw_version
-                             WHERE dataset='adj_factor' AND trade_date IS NOT NULL)
+                             WHERE dataset='adj_factor' AND {date_predicate})
                 ) minima WHERE min_date IS NOT NULL""",
-            params=(),
-            scope=WorkScope(date_to=cutoff, partition="release:market:minimum"),
+            params=date_params * 3,
+            scope=WorkScope(
+                date_from=start_date,
+                date_to=cutoff,
+                partition="release:market:minimum",
+            ),
             max_rows=10,
         )
         minimums = {
@@ -224,6 +261,8 @@ class ReleaseRepository(BaseRepository):
                 failures[f"checkpoint:{name}"] = value
         if lifecycle or duplicates:
             failures.update({"lifecycle_overlap": lifecycle, "dividend_business_key_duplicates": duplicates})
+        if missing_ex_date:
+            failures["implementation_without_ex_date"] = missing_ex_date
         foundation = None
         run_count = None
         if include_foundation_v2:
@@ -238,11 +277,199 @@ class ReleaseRepository(BaseRepository):
                 failures["foundation_v2:validated_production_run"] = 0
         return {"cutoff_date": cutoff.isoformat() if cutoff else None, "invariants": invariants, "skipped_invariants": sorted(skipped_invariants), "checkpoints": checkpoints, "lifecycle_overlap": lifecycle, "dividend_business_key_duplicates": duplicates, "implementation_without_ex_date": missing_ex_date, "foundation_v2": foundation, "foundation_v2_validated_run_count": run_count, "failures": failures}
 
+    def market_activity_quality_gate(
+        self,
+        cutoff: date,
+        context: RunContext,
+        report: MarketActivityReport | None = None,
+    ) -> dict:
+        """Validate only the inputs required by the Market Activity release.
+
+        A market-only release must not be blocked by unrelated financial,
+        dividend or lifecycle invariants.  It still fails closed on the two
+        facts consumed by the observation domain: the market coverage gate and
+        the materialized Standard daily bars for the release cutoff.
+        """
+        gate_rows = self.kernel.read._repository_query(
+            context,
+            "ops.market_data_quality_gate",
+            """
+                SELECT dataset, trade_date, actual_rows, expected_rows,
+                       status, batch_id, reason, created_at
+                  FROM ops.market_data_quality_gate
+                 WHERE dataset='daily' AND trade_date=%s
+                 ORDER BY created_at DESC, gate_id DESC
+                 LIMIT 1
+            """,
+            (cutoff,),
+            WorkScope(date_to=cutoff, partition=f"release:market-activity:gate:{cutoff}"),
+            2,
+        )
+        failures: dict[str, object] = {}
+        gate = gate_rows[0] if gate_rows else None
+        if gate is None:
+            failures["market_data_gate_missing"] = {
+                "dataset": "daily",
+                "trade_date": cutoff.isoformat(),
+            }
+        elif str(gate.get("status") or "").upper() != "PASS":
+            failures["market_data_gate_not_pass"] = {
+                "dataset": "daily",
+                "trade_date": cutoff.isoformat(),
+                "status": gate.get("status"),
+                "reason": gate.get("reason"),
+            }
+
+        standard_rows = self.kernel.read._repository_query(
+            context,
+            "std.daily_kline",
+            """
+                SELECT COUNT(*) AS row_count,
+                       COUNT(DISTINCT stock_code) AS stock_count,
+                       COUNT(*) FILTER (
+                           WHERE stock_code IS NULL
+                              OR close IS NULL
+                              OR volume IS NULL
+                              OR amount IS NULL
+                       ) AS invalid_count
+                  FROM std.daily_kline
+                 WHERE trade_date=%s
+            """,
+            (cutoff,),
+            WorkScope(date_from=cutoff, date_to=cutoff, partition=f"release:market-activity:standard:{cutoff}"),
+            2,
+        )
+        standard = standard_rows[0] if standard_rows else {
+            "row_count": 0, "stock_count": 0, "invalid_count": 0,
+        }
+        row_count = int(standard.get("row_count") or 0)
+        stock_count = int(standard.get("stock_count") or 0)
+        invalid_count = int(standard.get("invalid_count") or 0)
+        if row_count <= 0 or stock_count <= 0:
+            failures["standard_daily_kline_empty"] = {
+                "trade_date": cutoff.isoformat(),
+                "row_count": row_count,
+                "stock_count": stock_count,
+            }
+        if invalid_count:
+            failures["standard_daily_kline_invalid_rows"] = invalid_count
+        if gate is not None and str(gate.get("status") or "").upper() == "PASS":
+            expected = int(gate.get("actual_rows") or 0)
+            if expected > 0 and stock_count != expected:
+                failures["standard_daily_kline_coverage_mismatch"] = {
+                    "market_gate_actual_rows": expected,
+                    "standard_stock_count": stock_count,
+                }
+        result = {
+            "cutoff_date": cutoff.isoformat(),
+            "market_data_gate": gate,
+            "standard_daily_kline": {
+                "row_count": row_count,
+                "stock_count": stock_count,
+                "invalid_count": invalid_count,
+            },
+            "market_activity_report": None,
+            "failures": failures,
+        }
+        return self._include_market_activity_report(result, cutoff, report) if report else result
+
+    @staticmethod
+    def _include_market_activity_report(
+        gate: dict, cutoff: date, report: MarketActivityReport,
+    ) -> dict:
+        if report.trade_date != cutoff:
+            raise ValueError("market activity report date must match release cutoff")
+        result = {**gate, "failures": dict(gate["failures"])}
+        result["market_activity_report"] = report.quality_summary()
+        failures = result["failures"]
+        standard_stock_count = int(result["standard_daily_kline"]["stock_count"])
+        if report.quality_status not in {"VALID", "PARTIAL_HISTORY"}:
+            failures["market_activity_report_quality"] = report.quality_status
+        if report.invalid_target_row_count:
+            failures["market_activity_invalid_target_rows"] = report.invalid_target_row_count
+        if report.target_row_count != standard_stock_count or len(report.rows) != standard_stock_count:
+            failures["market_activity_report_coverage_mismatch"] = {
+                "report_target_rows": report.target_row_count,
+                "report_valid_rows": len(report.rows),
+                "standard_stock_count": standard_stock_count,
+            }
+        if len(report.input_manifest_hash) != 64 or len(report.activity_hash) != 64:
+            failures["market_activity_report_hash_missing"] = True
+        return result
+
+    def market_activity_source_manifest(
+        self, cutoff: date, report: MarketActivityReport,
+    ) -> tuple[dict, str]:
+        """Hash exactly the Standard rows consumed by the Market Activity report."""
+        if report.trade_date != cutoff:
+            raise ValueError("market activity manifest date must match release cutoff")
+        manifest = {
+            "schema_version": "market-activity-input-v2",
+            "cutoff_date": cutoff.isoformat(),
+            "input_window": {
+                "source": "std.daily_kline",
+                "date_from": report.lookback_start.isoformat(),
+                "date_to": cutoff.isoformat(),
+                "row_count": report.input_row_count,
+            },
+            "report": report.quality_summary(),
+        }
+        encoded = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str,
+        )
+        return manifest, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     def validate(self, tag: str, quality_report_hash: str, context: RunContext) -> dict:
-        rows = self.kernel.read._repository_query(context, "ops.tushare_data_release", "SELECT baseline_cutoff_date, schema_version, data_cutoff_timestamp, temporal_evidence_level, visibility_policy_version FROM ops.tushare_data_release WHERE release_tag=%s AND status='draft'", (tag,), WorkScope(partition=f"release:{tag}"), 2)
+        rows = self.kernel.read._repository_query(context, "ops.tushare_data_release", "SELECT baseline_domain, baseline_cutoff_date, schema_version, data_cutoff_timestamp, temporal_evidence_level, visibility_policy_version FROM ops.tushare_data_release WHERE release_tag=%s AND status='draft'", (tag,), WorkScope(partition=f"release:{tag}"), 2)
         if not rows:
             raise RuntimeError(f"draft release not found: {tag}")
         cutoff, schema_version = rows[0]["baseline_cutoff_date"], rows[0]["schema_version"]
+        expected_domain = self._baseline_domain(schema_version)
+        if rows[0]["baseline_domain"] != expected_domain:
+            raise RuntimeError(
+                f"release domain/schema mismatch for {tag}: "
+                f"domain={rows[0]['baseline_domain']!r}, expected={expected_domain!r}"
+            )
+        # When transactional change capture is enabled, fence the full audit
+        # with start/end event watermarks. Any source write during the audit
+        # makes publication fail closed and requires a fresh audit.
+        release_change_watermark = self.kernel.write.begin_release_validation_boundary(
+            context, WorkScope(partition=f"release:validation-boundary:{tag}"),
+        )
+        if schema_version == "market-activity-v1":
+            # Run the cheap, one-day coverage checks first. If the market gate
+            # is absent/blocked or today's Standard partition is empty, do not
+            # stream the 45-day monitor input at all.
+            gate = self.market_activity_quality_gate(cutoff, context)
+            if gate["failures"]:
+                raise RuntimeError(f"release quality gate failed: {gate['failures']}")
+            request = MarketActivityRequest(trade_date=cutoff)
+            report = MarketActivityMonitor(
+                MarketActivityRepository(self.kernel)
+            ).daily(request, context)
+            gate = self._include_market_activity_report(gate, cutoff, report)
+            if gate["failures"]:
+                raise RuntimeError(f"release quality gate failed: {gate['failures']}")
+            encoded = json.dumps(gate, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+            quality_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if quality_report_hash and quality_report_hash != quality_hash:
+                raise ValueError("quality_report_hash mismatch")
+            manifest, manifest_hash = self.market_activity_source_manifest(cutoff, report)
+            return {
+                "tag": tag,
+                "baseline_domain": expected_domain,
+                "cutoff": cutoff,
+                "schema_version": schema_version,
+                "data_cutoff_timestamp": rows[0]["data_cutoff_timestamp"],
+                "temporal_evidence_level": rows[0]["temporal_evidence_level"],
+                "visibility_policy_version": rows[0]["visibility_policy_version"],
+                "release_change_watermark": release_change_watermark,
+                "gate": gate,
+                "quality_hash": quality_hash,
+                "source_manifest": manifest,
+                "source_manifest_hash": manifest_hash,
+            }
         gate = self.quality_gate(cutoff, schema_version == "feature-contract-v2.0", context)
         if gate["failures"]:
             raise RuntimeError(f"release quality gate failed: {gate['failures']}")
@@ -252,10 +479,12 @@ class ReleaseRepository(BaseRepository):
             raise ValueError("quality_report_hash mismatch")
         manifest, manifest_hash = self.source_manifest(cutoff, context)
         return {
-            "tag": tag, "cutoff": cutoff, "schema_version": schema_version,
+            "tag": tag, "baseline_domain": expected_domain,
+            "cutoff": cutoff, "schema_version": schema_version,
             "data_cutoff_timestamp": rows[0]["data_cutoff_timestamp"],
             "temporal_evidence_level": rows[0]["temporal_evidence_level"],
             "visibility_policy_version": rows[0]["visibility_policy_version"],
+            "release_change_watermark": release_change_watermark,
             "gate": gate, "quality_hash": digest,
             "source_manifest": manifest, "source_manifest_hash": manifest_hash,
         }
@@ -272,7 +501,7 @@ class ReleaseRepository(BaseRepository):
         )
 
     def status_rows(self, context: RunContext) -> list[dict]:
-        return self.kernel.read._repository_query(context, "ops.tushare_data_release", "SELECT release_tag, baseline_cutoff_date, status, data_cutoff_timestamp, temporal_evidence_level, quality_report_hash, created_at, validated_at, revoked_at, revocation_reason FROM ops.tushare_data_release ORDER BY release_id", scope=WorkScope(partition="release:status"), max_rows=100_000)
+        return self.kernel.read._repository_query(context, "ops.tushare_data_release", "SELECT release_tag, baseline_domain, baseline_cutoff_date, status, data_cutoff_timestamp, temporal_evidence_level, quality_report_hash, created_at, validated_at, revoked_at, revocation_reason FROM ops.tushare_data_release ORDER BY release_id", scope=WorkScope(partition="release:status"), max_rows=100_000)
 
     def revoke(self, tag: str, reason: str, evidence_hash: str, actor: str, context: RunContext) -> int:
         """Quarantine a contaminated release without deleting its audit record."""
@@ -283,12 +512,110 @@ class ReleaseRepository(BaseRepository):
             tag, reason[:4000], evidence_hash.lower(), actor[:120],
         )
 
+    def capture_delta_candidate(
+        self,
+        baseline_release_id: int,
+        baseline_domain: str,
+        context: RunContext,
+        *,
+        max_events: int = 1_000,
+    ) -> dict:
+        """Seal a bounded event candidate; quality validation remains separate."""
+        return self.kernel.write.capture_release_delta_candidate(
+            context,
+            WorkScope(partition=f"release-delta:{baseline_domain}:{baseline_release_id}"),
+            baseline_release_id,
+            baseline_domain,
+            max_events=max_events,
+        )
+
+    def delta_candidate(self, package_id: str, context: RunContext) -> dict | None:
+        """Read one bounded candidate and its exact event evidence for validation."""
+        scope = WorkScope(
+            partition=f"release-delta:{package_id}",
+            dimensions={"package_id": package_id},
+        )
+        packages = self.kernel.read._repository_query(
+            context,
+            "ops.release_delta_package",
+            """SELECT package_id, baseline_release_id, baseline_domain,
+                      event_from_id, event_through_id, event_count,
+                      event_manifest_hash, scope_manifest, captured_run_id,
+                      package_status, created_at
+                 FROM ops.release_delta_package
+                WHERE package_id=%s::uuid""",
+            (package_id,), scope, 2,
+        )
+        if not packages:
+            return None
+        if len(packages) != 1:
+            raise RuntimeError(f"duplicate release delta package id: {package_id}")
+        package = packages[0]
+        events = self.kernel.read._repository_query(
+            context,
+            "ops.release_delta_event",
+            """SELECT l.event_id, e.event_key, e.run_id, e.job_name,
+                      e.code_version, e.pipeline_version, e.target, e.operation,
+                      e.scope_hash, s.scope, s.scope_precision, s.delta_eligible,
+                      s.full_audit_reason, e.input_hash, e.input_row_count,
+                      e.affected_rows, e.created_at, r.status AS producer_run_status
+                 FROM ops.release_delta_event l
+                 JOIN ops.release_change_event e USING (event_id)
+                 JOIN ops.release_change_scope s USING (scope_hash)
+                 LEFT JOIN ops.run_manifest r USING (run_id)
+                WHERE l.package_id=%s::uuid AND l.baseline_domain=%s
+                ORDER BY l.event_id
+                LIMIT 1001""",
+            (package_id, package["baseline_domain"]), scope, 1_001,
+        )
+        if len(events) != int(package["event_count"]):
+            raise RuntimeError(
+                f"release delta event membership mismatch for {package_id}: "
+                f"expected={package['event_count']} actual={len(events)}"
+            )
+        return {**package, "events": events}
+
+    def plan_delta_impact(
+        self, package_id: str, context: RunContext,
+    ) -> DeltaImpactPlan | None:
+        """Resolve an immutable candidate using bounded control-plane reads only.
+
+        This is a preflight planner, not a quality gate.  It intentionally
+        reads no Standard/PIT/Feature facts; a later implementation must add a
+        separate bounded checker before any delta can be validated/published.
+        """
+        candidate = self.delta_candidate(package_id, context)
+        if candidate is None:
+            return None
+        scope = WorkScope(
+            partition=f"release-delta:{package_id}",
+            dimensions={"package_id": package_id},
+        )
+        parents = self.kernel.read._repository_query(
+            context,
+            "ops.tushare_data_release",
+            """SELECT baseline_cutoff_date
+                 FROM ops.tushare_data_release
+                WHERE release_id=%s AND baseline_domain=%s AND status='validated'""",
+            (candidate["baseline_release_id"], candidate["baseline_domain"]),
+            scope,
+            2,
+        )
+        if len(parents) != 1:
+            raise RuntimeError(
+                f"delta candidate parent is not exactly one current validated release: {package_id}"
+            )
+        cutoff = parents[0]["baseline_cutoff_date"]
+        if isinstance(cutoff, str):
+            cutoff = date.fromisoformat(cutoff[:10])
+        return resolve_delta_impact(candidate, cutoff=cutoff)
+
     def _aggregate(self, source, sql, params, context, partition):
         return self.kernel.read._repository_query(context, source, sql, params=params, scope=WorkScope(partition=partition), max_rows=2)[0]
 
     def _manifest_date_ranges(
         self, table: str, date_column: str, cutoff: date, context: RunContext,
-        *, dataset: str | None = None, include_record_id: bool,
+        *, start_date: date | None = None, dataset: str | None = None, include_record_id: bool,
         partition: str,
     ) -> dict:
         """Aggregate an append-only source in adaptive bounded date windows.
@@ -302,12 +629,20 @@ class ReleaseRepository(BaseRepository):
         """
         if date_column not in {"trade_date", "cal_date"}:
             raise ValueError("unsupported source-manifest date column")
+        if start_date is not None and start_date > cutoff:
+            raise ValueError("source manifest start_date must not be after cutoff")
         dataset_clause = " AND dataset=%s" if dataset is not None else ""
+        if start_date is None:
+            date_clause = f"{date_column} IS NOT NULL AND {date_column} <= %s"
+            minimum_params = (cutoff,) + ((dataset,) if dataset is not None else ())
+        else:
+            date_clause = f"{date_column} IS NOT NULL AND {date_column} BETWEEN %s AND %s"
+            minimum_params = (start_date, cutoff) + ((dataset,) if dataset is not None else ())
         minimum = self._aggregate(
             table,
             f"SELECT MIN({date_column}) AS min_date FROM {table} "
-            f"WHERE {date_column} IS NOT NULL{dataset_clause}",
-            ((dataset,) if dataset is not None else ()),
+            f"WHERE {date_clause}{dataset_clause}",
+            minimum_params,
             context, f"{partition}:minimum",
         )["min_date"]
         if minimum is None or minimum > cutoff:
@@ -358,7 +693,7 @@ class ReleaseRepository(BaseRepository):
         total = 0
         max_record_id = None
         max_fetched_at = None
-        window_start = minimum
+        window_start = max(minimum, start_date) if start_date is not None else minimum
         while window_start <= cutoff:
             window_end = min(
                 cutoff,

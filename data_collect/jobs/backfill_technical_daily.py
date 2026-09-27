@@ -90,12 +90,22 @@ def run(start: str | date, end: str | date, *, run_id: str | None = None) -> dic
                     )
                     if prices.empty:
                         continue
-                    dividends = pd.DataFrame(
-                        repository.divid_factors(
+                    adjustment_factors = pd.DataFrame(
+                        repository.price_adjustment_factors(
                             code_batch, context, start_date=input_start, end_date=sub_end
                         )
                     )
-                    features = calculate_technical_features(prices, dividends)
+                    expected = prices[["stock_code", "trade_date"]].drop_duplicates()
+                    actual = adjustment_factors[["stock_code", "trade_date"]].drop_duplicates()
+                    missing = expected.merge(actual, on=["stock_code", "trade_date"], how="left", indicator=True)
+                    missing = missing.loc[missing["_merge"].eq("left_only")]
+                    if not missing.empty:
+                        sample = missing[["stock_code", "trade_date"]].head(5).to_dict("records")
+                        raise RuntimeError(
+                            "feature.price_adjustment_factor_asof coverage is incomplete; "
+                            f"missing={len(missing)} sample={sample}"
+                        )
+                    features = calculate_technical_features(prices, adjustment_factors)
                     features = features[
                         (features["trade_date"] >= sub_start)
                         & (features["trade_date"] <= sub_end)
@@ -103,7 +113,7 @@ def run(start: str | date, end: str | date, *, run_id: str | None = None) -> dic
                     written += repository.upsert_technical_features(
                         to_feature_rows(features), sub_start, sub_end, context
                     )
-                    del prices, dividends, features
+                    del prices, adjustment_factors, features
                 kernel.checkpoint.mark_progress(run_id, JOB_NAME, sub_scope_key, sub_index)
                 kernel.checkpoint.mark_done(run_id, JOB_NAME, sub_scope_key)
             kernel.checkpoint.mark_progress(run_id, JOB_NAME, scope_key, index + 1)

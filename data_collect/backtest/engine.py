@@ -389,6 +389,10 @@ class BacktestEngine:
         self._cash_ledger: list[dict[str, Any]] = []
         self._position_daily: list[dict[str, Any]] = []
         self._performance_daily: list[dict[str, Any]] = []
+        # 每个评价日只保留一条有界的决策解释，避免为了诊断空仓而生成
+        # “每股票/每天”的 HOLD 事件。具体策略可通过 last_decision_reason
+        # 提供候选门禁统计；没有该扩展的策略使用引擎通用解释。
+        self._decision_reasons: dict[date, dict[str, Any]] = {}
         self._warnings: list[str] = []
         self._r_multiples: list[float] = []
         self._realized_trades: list[dict[str, Any]] = []
@@ -463,9 +467,23 @@ class BacktestEngine:
                         signals = strategy.generate_signals(
                             current_day, dataset.observations_for(current_day), positions_view
                         )
+                        self._decision_reasons[current_day] = self._decision_reason(
+                            strategy, current_day, signals,
+                        )
                         self._create_signals_and_orders(current_day, next_day, signals, dataset)
+                    else:
+                        self._decision_reasons[current_day] = self._decision_reason(
+                            strategy, current_day, [],
+                            reason_code="NOT_SCHEDULED_SIGNAL_DAY",
+                            signal_day=False,
+                        )
                 else:
                     self._warnings.append(f"{current_day}: 评价结束日没有下一交易日，信号不创建订单")
+                    self._decision_reasons[current_day] = self._decision_reason(
+                        strategy, current_day, [],
+                        reason_code="EVALUATION_END_NO_NEXT_TRADING_DAY",
+                        signal_day=False,
+                    )
                 self._record_daily(current_day, dataset)
 
         for order in self._pending_orders:
@@ -537,6 +555,48 @@ class BacktestEngine:
                               for order in self._pending_orders
                           )}
         return view
+
+    @staticmethod
+    def _decision_reason(
+        strategy: BaseStrategy,
+        day: date,
+        signals: list[SignalIntent],
+        *,
+        reason_code: str | None = None,
+        signal_day: bool = True,
+    ) -> dict[str, Any]:
+        """Build one bounded, JSON-serializable explanation for an evaluation day.
+
+        A strategy may expose ``last_decision_reason`` when it has richer gate
+        diagnostics.  The engine still supplies a stable fallback for every
+        strategy, so dashboards and reports never infer a decision from missing
+        performance rows.
+        """
+        if signal_day:
+            explain = getattr(strategy, "last_decision_reason", None)
+            if callable(explain):
+                payload = explain()
+                if isinstance(payload, Mapping) and payload:
+                    return dict(payload)
+        return {
+            "schema_version": "backtest-decision-v1",
+            "strategy_id": getattr(strategy, "strategy_id", strategy.__class__.__name__),
+            "trade_date": day.isoformat(),
+            "signal_day": bool(signal_day),
+            "decision_type": "ACTIONS" if signals else "NO_ACTION",
+            "reason_code": reason_code,
+            "signal_count": len(signals),
+            "buy_signal_count": sum(1 for signal in signals if signal.direction == "BUY"),
+            "sell_signal_count": sum(1 for signal in signals if signal.direction == "SELL"),
+            "actions": [
+                {
+                    "ts_code": signal.ts_code,
+                    "direction": signal.direction,
+                    "reason": dict(signal.reason),
+                }
+                for signal in signals
+            ],
+        }
 
     def _position_count_after_pending_sells(self) -> int:
         """计算已排队卖单成交后预计剩余的持仓数。
@@ -1615,6 +1675,12 @@ class BacktestEngine:
             "cumulative_return": equity / self.config.initial_cash - 1,
             "drawdown": (peak - equity) / peak if peak else 0.0,
             "turnover": turnover, "valuation_status": status,
+            "decision_reason": dict(self._decision_reasons.get(day) or {
+                "schema_version": "backtest-decision-v1",
+                "trade_date": day.isoformat(),
+                "decision_type": "NO_ACTION",
+                "reason_code": "DECISION_NOT_RECORDED",
+            }),
         })
 
     def _forced_liquidation_value(self, day: date, dataset: BacktestDataset) -> tuple[float, int, int]:

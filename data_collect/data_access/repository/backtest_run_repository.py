@@ -63,25 +63,61 @@ class BacktestRunRepository(BaseRepository):
     def dataset_rules(self, dataset_id: str, context: RunContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         datasets = self.kernel.read._repository_query(
             context, "backtest.dataset_manifest",
-            """SELECT status, input_manifest_hash, market_rule_version,
+            """SELECT status, dataset_kind, input_manifest_hash, market_rule_version,
                       fee_rule_version, benchmark_code, warmup_start,
                       evaluation_start, evaluation_end
                  FROM backtest.dataset_manifest WHERE dataset_id=%s""",
             (dataset_id,), self._scope(dataset_id), 2,
         )
-        rules = self.kernel.read._repository_query(
-            context, "backtest.dataset_rule_snapshot",
-            """SELECT rule_version, market_rule_version, fee_rule_version, effective_from, effective_to,
+        if not datasets:
+            raise RuntimeError("正式回测只能使用存在的 Dataset")
+        dataset = datasets[0]
+        if dataset.get("dataset_kind", "MATERIALIZED") == "COMPOSITE":
+            rules = self.kernel.read._repository_query(
+                context, "backtest.dataset_rule_snapshot",
+                """WITH components AS (
+                       SELECT component_dataset_id AS dataset_id,effective_from,effective_to
+                         FROM backtest.dataset_component
+                        WHERE composite_dataset_id=%s
+                   )
+                   SELECT DISTINCT r.rule_version, r.market_rule_version, r.fee_rule_version,
+                      r.effective_from, r.effective_to, r.market, r.min_buy_lot,
+                      r.allow_sell_odd_lot, r.t_plus_one, r.price_tick,
+                      r.cash_settlement_days, r.commission_rate, r.min_commission,
+                      r.stamp_duty_sell_rate, r.transfer_fee_rate, r.slippage_bps,
+                      r.parameters, r.rule_hash
+                     FROM components c
+                     JOIN backtest.dataset_rule_snapshot r ON r.dataset_id=c.dataset_id
+                      AND r.effective_from <= c.effective_to
+                      AND COALESCE(r.effective_to,DATE '9999-12-31') >= c.effective_from
+                    ORDER BY r.effective_from, r.market, r.rule_version""",
+                (dataset_id,), self._scope(dataset_id), 100_000,
+            )
+            identities = {}
+            for row in rules:
+                key = (
+                    row["rule_version"], row["market_rule_version"],
+                    row["fee_rule_version"], row["effective_from"], row["market"],
+                )
+                if key in identities and identities[key] != row:
+                    raise RuntimeError(f"组合 Dataset 的生效规则副本不一致: {key}")
+                identities[key] = row
+            rules = sorted(
+                identities.values(),
+                key=lambda row: (row["effective_from"], row["market"], row["rule_version"]),
+            )
+        else:
+            rules = self.kernel.read._repository_query(
+                context, "backtest.dataset_rule_snapshot",
+                """SELECT rule_version, market_rule_version, fee_rule_version, effective_from, effective_to,
                       market, min_buy_lot, allow_sell_odd_lot, t_plus_one, price_tick,
                       cash_settlement_days, commission_rate, min_commission, stamp_duty_sell_rate,
                       transfer_fee_rate, slippage_bps, parameters, rule_hash
                  FROM backtest.dataset_rule_snapshot WHERE dataset_id=%s
                  ORDER BY effective_from, market, rule_version""",
-            (dataset_id,), self._scope(dataset_id), 100_000,
-        )
-        if not datasets:
-            raise RuntimeError("正式回测只能使用存在的 Dataset")
-        return datasets[0], rules
+                (dataset_id,), self._scope(dataset_id), 100_000,
+            )
+        return dataset, rules
 
     def create_run(self, row: dict[str, Any], context: RunContext) -> int:
         return self.kernel.write.bulk_insert(
@@ -260,7 +296,7 @@ class BacktestRunRepository(BaseRepository):
                              cash_receivable, stock_receivable_value,
                              receivable_total, total_equity, daily_return,
                              cumulative_return, drawdown, turnover,
-                             valuation_status
+                             valuation_status, decision_reason
                         FROM backtest.performance_daily
                        WHERE run_id=%s
                        ORDER BY trade_date""",
@@ -296,12 +332,22 @@ class BacktestRunRepository(BaseRepository):
         return self.kernel.read._repository_query(
             context,
             "backtest.dataset_benchmark_bar",
-            """SELECT trade_date, ts_code, close
-                        FROM backtest.dataset_benchmark_bar
-                       WHERE dataset_id=%s
-                         AND trade_date BETWEEN %s AND %s
-                       ORDER BY trade_date""",
-            (dataset_id, date_from, date_to), scope, 10_000,
+            """WITH components AS (
+                       SELECT component_dataset_id AS dataset_id,effective_from,effective_to
+                         FROM backtest.dataset_component
+                        WHERE composite_dataset_id=%s
+                       UNION ALL
+                       SELECT dataset_id,warmup_start,evaluation_end
+                         FROM backtest.dataset_manifest
+                        WHERE dataset_id=%s AND dataset_kind='MATERIALIZED'
+                   )
+                   SELECT b.trade_date, b.ts_code, b.close
+                     FROM components c
+                     JOIN backtest.dataset_benchmark_bar b ON b.dataset_id=c.dataset_id
+                      AND b.trade_date BETWEEN c.effective_from AND c.effective_to
+                    WHERE b.trade_date BETWEEN %s AND %s
+                    ORDER BY b.trade_date""",
+            (dataset_id, dataset_id, date_from, date_to), scope, 10_000,
         )
 
     def diagnostic_trade_chart(
@@ -323,18 +369,29 @@ class BacktestRunRepository(BaseRepository):
         return self.kernel.read._repository_query(
             context,
             "research.stock_snapshot_daily",
-            """SELECT s.research_date, s.ts_code, s.name, s.raw_close,
+            """WITH components AS (
+                       SELECT component_dataset_id AS dataset_id,effective_from,effective_to
+                         FROM backtest.dataset_component
+                        WHERE composite_dataset_id=%s
+                       UNION ALL
+                       SELECT dataset_id,warmup_start,evaluation_end
+                         FROM backtest.dataset_manifest
+                        WHERE dataset_id=%s AND dataset_kind='MATERIALIZED'
+                   )
+                   SELECT s.research_date, s.ts_code, s.name, s.raw_close,
                              s.adj_close_base, s.ma20, s.ma60, s.return_60d,
                              s.is_st_asof, s.quality_status
-                        FROM backtest.dataset_member m
+                        FROM components c
+                        JOIN backtest.dataset_member m
+                          ON m.dataset_id=c.dataset_id
+                         AND m.research_date BETWEEN c.effective_from AND c.effective_to
                         JOIN research.stock_snapshot_daily s
                           ON s.snapshot_id=m.research_snapshot_id
                          AND s.research_date=m.research_date
                          AND s.ts_code=%s
-                       WHERE m.dataset_id=%s
-                         AND s.research_date BETWEEN %s AND %s
+                       WHERE s.research_date BETWEEN %s AND %s
                        ORDER BY s.research_date""",
-            (ts_code, dataset_id, date_from, date_to), scope, 5_000,
+            (dataset_id, dataset_id, ts_code, date_from, date_to), scope, 5_000,
         )
 
     def diagnostic_metrics(self, run_id: str, context: RunContext) -> list[dict[str, Any]]:
@@ -417,7 +474,15 @@ class BacktestRunRepository(BaseRepository):
             output.extend(self.kernel.read._repository_query(
                 context,
                 "backtest.dataset_execution_bar",
-                """WITH entries(ts_code, buy_date) AS (
+                """WITH components AS (
+                             SELECT component_dataset_id AS dataset_id,effective_from,effective_to
+                               FROM backtest.dataset_component
+                              WHERE composite_dataset_id=%s
+                             UNION ALL
+                             SELECT dataset_id,warmup_start,evaluation_end
+                               FROM backtest.dataset_manifest
+                              WHERE dataset_id=%s AND dataset_kind='MATERIALIZED'
+                         ), entries(ts_code, buy_date) AS (
                              SELECT * FROM unnest(%s::text[], %s::date[])
                          ), ranked AS (
                              SELECT e.ts_code, e.buy_date, b.trade_date,
@@ -427,8 +492,11 @@ class BacktestRunRepository(BaseRepository):
                                         ORDER BY b.trade_date
                                     ) AS horizon
                                FROM entries e
+                               JOIN components c ON e.buy_date <= c.effective_to
+                                                 AND e.buy_date + INTERVAL '120 days' >= c.effective_from
                                JOIN backtest.dataset_execution_bar b
-                                 ON b.dataset_id=%s
+                                 ON b.dataset_id=c.dataset_id
+                                AND b.trade_date BETWEEN c.effective_from AND c.effective_to
                                 AND b.ts_code=e.ts_code
                                 AND b.trade_date>e.buy_date
                                 AND b.trade_date<=e.buy_date + INTERVAL '120 days'
@@ -439,7 +507,7 @@ class BacktestRunRepository(BaseRepository):
                            FROM ranked
                           WHERE horizon IN (5, 10, 20, 40)
                           ORDER BY buy_date, ts_code, horizon""",
-                (codes, dates, dataset_id), scope, 10_000,
+                (dataset_id, dataset_id, codes, dates), scope, 10_000,
             ))
         output.sort(key=lambda row: (
             row.get("buy_date"), row.get("ts_code"), row.get("horizon"),
@@ -495,7 +563,11 @@ class BacktestRunRepository(BaseRepository):
                         "cash_receivable": row.get("cash_receivable", 0), "stock_receivable_value": row.get("stock_receivable_value", 0),
                         "receivable_total": row.get("receivable_total", 0), "total_equity": row["total_equity"], "daily_return": row.get("daily_return"),
                         "cumulative_return": row.get("cumulative_return"), "drawdown": row.get("drawdown"), "turnover": row.get("turnover", 0),
-                        "valuation_status": row.get("valuation_status", "VALID")} for row in result.performance_daily]
+                        "valuation_status": row.get("valuation_status", "VALID"),
+                        "decision_reason": json.dumps(
+                            row.get("decision_reason") or {},
+                            ensure_ascii=False, default=str,
+                        )} for row in result.performance_daily]
         metrics = [{"run_id": run_id, "metric_name": name, "metric_value": float(value), "metric_text": None, "parameters": "{}"} for name, value in result.metrics.items()]
         for audit_name, payload in getattr(result, "audit_metadata", {}).items():
             if audit_name in {"monte_carlo", "end_of_data_liquidation"}:

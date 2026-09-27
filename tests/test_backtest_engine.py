@@ -490,6 +490,10 @@ def test_benchmark_and_out_of_sample_metrics_are_reported():
     assert result.metrics["benchmark_total_return"] == pytest.approx(0.10)
     assert result.metrics["excess_total_return"] == pytest.approx(-0.10)
     assert result.metrics["out_of_sample_excess_return"] == pytest.approx(-0.10)
+    decisions = [row["decision_reason"] for row in result.performance_daily]
+    assert all(row["decision_type"] == "NO_ACTION" for row in decisions)
+    assert all(row["signal_count"] == 0 for row in decisions)
+    assert all(row["actions"] == [] for row in decisions)
 
 
 def test_cutoff_validation_hides_future_rows_and_rejects_future_financial_visibility():

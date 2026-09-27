@@ -129,10 +129,13 @@ def rebuild_tradeability(start_date=None, end_date=None) -> int:
     return _scoped_rebuild(bounds, "tradeability")
 
 
-def rebuild_dividend() -> int:
+def rebuild_dividend(codes=None) -> int:
     kernel, sec_repo, _, _ = _repositories()
     try:
-        return sec_repo.rebuild_dividend(build_run_context(_JOB_NAME))
+        context = build_run_context(_JOB_NAME)
+        if codes is not None:
+            return sec_repo.rebuild_dividend_codes(context, codes)
+        return sec_repo.rebuild_dividend(context)
     finally:
         kernel.close()
 
@@ -158,6 +161,7 @@ def run(
     start_date: date | str | None = None,
     end_date: date | str | None = None,
     allow_full_rebuild: bool = False,
+    dividend_codes=None,
 ) -> dict[str, int]:
     tasks = {
         "lifecycle": rebuild_lifecycle,
@@ -187,7 +191,9 @@ def run(
     result = {}
     for name in selected:
         logger.info("phase2 standard task started=%s", name)
-        if name in {"status", "universe", "tradeability"}:
+        if name == "dividend" and dividend_codes is not None:
+            result[name] = tasks[name](dividend_codes)
+        elif name in {"status", "universe", "tradeability"}:
             result[name] = tasks[name](start_date, end_date)
         else:
             result[name] = tasks[name]()

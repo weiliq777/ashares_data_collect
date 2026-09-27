@@ -67,9 +67,53 @@ def apply_forward_ratio(price_df: pd.DataFrame, dividend_df: pd.DataFrame) -> pd
     return pd.concat(results, ignore_index=True)
 
 
-def calculate_technical_features(price_df: pd.DataFrame, dividend_df: pd.DataFrame) -> pd.DataFrame:
+def apply_adjustment_factor(price_df: pd.DataFrame, factor_df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the formal PIT mechanical-price coordinate to OHLC values.
+
+    ``adj_adjustment_factor`` is a cumulative factor as of each trade date.
+    To create a forward-adjusted window, each day's factor is normalized by
+    the last factor in that stock's input window.  Multiplying every OHLC
+    field by that same ratio preserves candle geometry and keeps technical
+    indicators on the same coordinate as ``feature.price_daily_v2``.
+    """
+    if price_df.empty:
+        return price_df.copy()
+    if factor_df.empty:
+        raise ValueError("formal price adjustment factors are required")
+    required = {"stock_code", "trade_date", "adjustment_factor"}
+    missing_columns = required.difference(factor_df.columns)
+    if missing_columns:
+        raise ValueError(f"adjustment factor data missing columns: {sorted(missing_columns)}")
+
+    factors = factor_df.loc[:, list(required)].copy()
+    factors["adjustment_factor"] = pd.to_numeric(factors["adjustment_factor"], errors="coerce")
+    if factors.duplicated(["stock_code", "trade_date"]).any():
+        raise ValueError("formal price adjustment factors contain duplicate stock/date rows")
+
+    results: list[pd.DataFrame] = []
+    for stock_code, group in price_df.groupby("stock_code"):
+        group = group.sort_values("trade_date").copy()
+        stock_factors = factors.loc[factors["stock_code"].eq(stock_code), ["trade_date", "adjustment_factor"]]
+        merged = group.merge(stock_factors, on="trade_date", how="left", validate="one_to_one")
+        values = merged["adjustment_factor"].to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (values <= 0).any():
+            raise ValueError(f"invalid formal price adjustment factor for {stock_code}")
+        terminal = values[-1]
+        ratio = values / terminal
+        for column in ("open", "high", "low", "close"):
+            merged[column] = (merged[column].astype(float) * ratio).round(2)
+        merged["close_raw"] = merged["close"] / ratio
+        results.append(merged.drop(columns=["adjustment_factor"]))
+    return pd.concat(results, ignore_index=True)
+
+
+def calculate_technical_features(price_df: pd.DataFrame, adjustment_df: pd.DataFrame) -> pd.DataFrame:
     """Calculate WR10/20, RSI9 and the existing Tongdaxin KDJ semantics."""
-    adjusted = apply_forward_ratio(price_df, dividend_df)
+    adjusted = (
+        apply_adjustment_factor(price_df, adjustment_df)
+        if not adjustment_df.empty and "adjustment_factor" in adjustment_df.columns
+        else apply_forward_ratio(price_df, adjustment_df)
+    )
     if adjusted.empty:
         return adjusted
     results: list[pd.DataFrame] = []

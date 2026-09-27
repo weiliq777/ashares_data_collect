@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
+import threading
+import time
 import uuid
 from datetime import date, timedelta
 
@@ -22,6 +25,18 @@ if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 
 PAGE_SIZE = 2000
+# One queue row normally maps to one stock. A consumer batch triggers a
+# historical Standard + Feature rebuild, so this is also a hard bound on the
+# amount of historical work one worker may start at once.
+QUEUE_CLAIM_LIMIT = 100
+QUEUE_LEASE_SECONDS = 4 * 60 * 60
+QUEUE_HEARTBEAT_SECONDS = 5 * 60
+# Individual SQL statements have a TransactionManager deadline. This second
+# circuit breaker bounds the aggregate work held by one queue claim.
+QUEUE_BATCH_DEADLINE_SECONDS = 30 * 60
+# A financial queue batch is deliberately smaller than the API page size.
+# This bounds the temporary pandas object frame used by Raw -> Standard.
+DERIVATION_PAGE_SIZE = 500
 DISCOVERY_FIELDS = "ts_code,ann_date,end_date,pre_date,actual_date"
 REPORT_APIS = {
     "income_vip": ("income", "ts_code,ann_date,f_ann_date,end_date,report_type,comp_type,end_type,update_flag,revenue,total_revenue,oper_cost,total_cogs,operate_profit,total_profit,income_tax,n_income,n_income_attr_p,basic_eps,diluted_eps"),
@@ -33,6 +48,52 @@ INDICATOR_API = "fina_indicator", "ts_code,ann_date,end_date,update_flag,roe,roe
 
 class CoverageBlocked(RuntimeError):
     """A successful response was not complete enough to publish."""
+
+
+class _QueueLeaseHeartbeat:
+    """Renew one queue claim from an independent Kernel connection."""
+
+    def __init__(self, queue_ids, context, claim_owner_id):
+        self._queue_ids = tuple(int(value) for value in queue_ids)
+        self._context = context
+        self._claim_owner_id = claim_owner_id
+        self._stop = threading.Event()
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"financial-queue-heartbeat-{claim_owner_id[-12:]}",
+            daemon=True,
+        )
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        if self._stop.is_set():
+            return
+        heartbeat_kernel = DataAccessKernel(policy_registry=build_default_registry())
+        heartbeat_repository = FinancialVipRepository(heartbeat_kernel)
+        try:
+            while not self._stop.wait(QUEUE_HEARTBEAT_SECONDS):
+                try:
+                    heartbeat_repository.renew_queue_lease(
+                        list(self._queue_ids), self._context,
+                        QUEUE_LEASE_SECONDS, self._claim_owner_id,
+                    )
+                except Exception as exc:  # surface to the owning worker
+                    self._error = exc
+                    self._stop.set()
+                    return
+        finally:
+            heartbeat_kernel.close()
+
+    def raise_if_failed(self):
+        if self._error is not None:
+            raise RuntimeError("financial queue lease heartbeat failed") from self._error
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=10)
 
 
 def _service(token: str):
@@ -188,7 +249,11 @@ def _period_pages(pro, api_name, dataset, fields, period, batch_id, dry_run, rep
     checkpoint_dataset = f"financial_vip_{dataset}"
     offset = 0
     while True:
-        key = f"{period}:offset:{offset}"
+        # A page checkpoint belongs to one fetch attempt, not forever to a
+        # report period.  The same batch_id can resume after a failure; a new
+        # scheduled run gets a new batch_id and re-requests recent periods so
+        # later Tushare revisions cannot be hidden by an old DONE marker.
+        key = f"{batch_id}:{period}:offset:{offset}"
         state = None if dry_run else _checkpoint_state(checkpoint_dataset, key, repository, context)
         if state and state[0] in {"DONE", "EMPTY_CONFIRMED"}:
             if int(state[1] or 0) < PAGE_SIZE:
@@ -213,41 +278,189 @@ def _period_pages(pro, api_name, dataset, fields, period, batch_id, dry_run, rep
             raise CoverageBlocked(f"{api_name} period={period} has no safe records")
         inserted = 0 if dry_run else _write_versions_and_queue(dataset, records, batch_id, repository, context)
         if not dry_run:
-            _checkpoint(checkpoint_dataset, key, "DONE", inserted, repository=repository, context=context)
+            # Pagination depends on the provider row count, not on the number
+            # of newly inserted hashes.  A full page of already-known rows can
+            # legitimately have inserted=0 and must still advance the offset.
+            _checkpoint(checkpoint_dataset, key, "DONE", raw_rows, repository=repository, context=context)
         if raw_rows < PAGE_SIZE:
             return
         offset += PAGE_SIZE
 
 
-def _pending_queue_codes(repository=None, context=None):
+def _pending_queue_codes(
+    repository=None, context=None, *, limit=QUEUE_CLAIM_LIMIT,
+    claim_owner_id=None, takeover=False, through_date=None,
+):
     kernel = None
     if repository is None or context is None:
         kernel, repository, context = _service(f"vip-queue-{uuid.uuid4().hex}")
     try:
-        return repository.pending_queue(context)
+        return repository.pending_queue(
+            context, limit=limit, claim_owner_id=claim_owner_id, takeover=takeover,
+            through_date=through_date,
+        )
     finally:
         if kernel is not None:
             kernel.close()
 
 
-def _legacy_pending_codes(repository=None, context=None):
+def _legacy_pending_codes(repository=None, context=None, *, limit=QUEUE_CLAIM_LIMIT):
     kernel = None
     if repository is None or context is None:
         kernel, repository, context = _service(f"vip-legacy-{uuid.uuid4().hex}")
     try:
-        return repository.pending_legacy_codes(context)
+        return repository.pending_legacy_codes(context, limit=limit)
     finally:
         if kernel is not None:
             kernel.close()
 
 
+def _consume_pending_changes(
+    repository, context, output_end, *, claim_owner_id=None, takeover=False,
+):
+    """Drain financial changes in leased, bounded batches.
+
+    A successful return means there is no pending, failed, running, blocked,
+    or quarantined queue work left at the end of this consumer run.  Derived
+    rebuilds happen outside the claim transaction; the lease is renewed at
+    a short periodic heartbeat and completion is owner-checked by the Gateway.
+    """
+    from data_collect.jobs.tushare_fina_indicator_version import _rebuild_standard_unlocked as indicator_run
+    from data_collect.jobs.tushare_foundation_features import rebuild_company_financial_v2
+    from data_collect.jobs.tushare_foundation_pipeline import OUTPUT_START, WARMUP_START
+
+    processed_batches = 0
+    processed_queue_rows = 0
+    processed_stocks = 0
+    last_result = None
+    claim_owner_id = context.run_id if claim_owner_id is None else claim_owner_id
+    while True:
+        queue_ids, queue_codes = _pending_queue_codes(
+            repository, context, limit=QUEUE_CLAIM_LIMIT,
+            claim_owner_id=claim_owner_id, takeover=takeover,
+            through_date=output_end,
+        )
+        legacy_limit = max(0, QUEUE_CLAIM_LIMIT - len(queue_ids))
+        legacy_codes = (
+            _legacy_pending_codes(repository, context, limit=legacy_limit)
+            if legacy_limit else []
+        )
+        if not queue_ids and not legacy_codes:
+            break
+        if queue_ids and not queue_codes:
+            raise RuntimeError("financial queue claim returned ids without stock codes")
+        changed_datasets = set(
+            repository.claimed_queue_datasets(queue_ids, context, claim_owner_id)
+            if queue_ids else ()
+        )
+        allowed_datasets = {"income", "balancesheet", "cashflow", "fina_indicator"}
+        unknown_datasets = changed_datasets - allowed_datasets
+        if unknown_datasets:
+            raise RuntimeError(
+                "financial queue contains unsupported datasets: "
+                f"{sorted(unknown_datasets)}"
+            )
+        codes = sorted(set(queue_codes) | set(legacy_codes))
+        if not codes:
+            raise RuntimeError("financial change consumer found work without stock codes")
+        if len(codes) > QUEUE_CLAIM_LIMIT:
+            raise RuntimeError(
+                "financial change consumer batch exceeds stock-code budget: "
+                f"codes={len(codes)} limit={QUEUE_CLAIM_LIMIT}"
+            )
+        batch_started = time.monotonic()
+
+        def check_batch_deadline(stage: str) -> None:
+            elapsed = time.monotonic() - batch_started
+            if elapsed > QUEUE_BATCH_DEADLINE_SECONDS:
+                raise TimeoutError(
+                    "financial change consumer batch exceeded deadline: "
+                    f"stage={stage} elapsed={elapsed:.1f}s "
+                    f"limit={QUEUE_BATCH_DEADLINE_SECONDS}s"
+                )
+
+        heartbeat = _QueueLeaseHeartbeat(queue_ids, context, claim_owner_id) if queue_ids else None
+        try:
+            if heartbeat:
+                heartbeat.start()
+            check_batch_deadline("before_standard")
+            # Legacy checkpoints do not carry a typed dataset, so retain the
+            # conservative all-dataset rebuild only for that compatibility
+            # path. Typed queue rows rebuild the affected Standard projection.
+            standard_datasets = (
+                {"income", "balancesheet", "cashflow"}
+                if legacy_codes else changed_datasets & {"income", "balancesheet", "cashflow"}
+            )
+            if standard_datasets:
+                for dataset in sorted(standard_datasets):
+                    standard_run(dataset, DERIVATION_PAGE_SIZE, codes, WARMUP_START, output_end)
+                    gc.collect()
+            if heartbeat:
+                heartbeat.raise_if_failed()
+            check_batch_deadline("after_standard")
+            if legacy_codes or "fina_indicator" in changed_datasets:
+                indicator_run(DERIVATION_PAGE_SIZE, codes, WARMUP_START, output_end)
+                gc.collect()
+            if heartbeat:
+                heartbeat.raise_if_failed()
+            check_batch_deadline("after_indicator")
+            last_result = rebuild_company_financial_v2(
+                None, WARMUP_START, OUTPUT_START, output_end,
+                requested_codes=codes, target_table="feature.company_financial_v2",
+                batch_stocks=5,
+            )
+            if heartbeat:
+                heartbeat.raise_if_failed()
+            check_batch_deadline("after_feature")
+            if queue_ids:
+                repository.finish_queue(
+                    queue_ids, "DONE", None, context, claim_owner_id,
+                    processed_through=output_end,
+                )
+            repository.finish_legacy(legacy_codes, "done", None, context)
+        except Exception as exc:
+            if queue_ids:
+                repository.finish_queue(
+                    queue_ids, "FAILED", str(exc)[:500], context, claim_owner_id,
+                )
+            repository.finish_legacy(legacy_codes, "failed", str(exc)[:500], context)
+            raise
+        finally:
+            if heartbeat:
+                heartbeat.stop()
+        processed_batches += 1
+        processed_queue_rows += len(queue_ids)
+        processed_stocks += len(codes)
+
+    queue_status = repository.queue_status_counts(context, output_end)
+    unresolved = {
+        status: count for status, count in queue_status.items()
+        if status in {"PENDING", "FAILED", "RUNNING", "COVERAGE_BLOCKED", "QUARANTINED"}
+        and count
+    }
+    if unresolved:
+        raise RuntimeError(f"financial change queue is not drained: {unresolved}")
+    return {
+        "processed_batches": processed_batches,
+        "processed_queue_rows": processed_queue_rows,
+        "processed_stocks": processed_stocks,
+        "queue_status": queue_status,
+        "last_result": last_result,
+    }
+
+
 @warehouse_write_job
-def run(end_date=None, run_date=None, lookback_days=30, report_periods_back=4, rebuild_derived=True, dry_run=False):
+def run(end_date=None, run_date=None, lookback_days=30, report_periods_back=4,
+        rebuild_derived=True, dry_run=False, batch_id=None, attempt=1):
     if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
         raise ValueError("end_date and run_date must match")
     end = (end_date or run_date or date.today().strftime("%Y%m%d")).replace("-", "")
     end_dt = pd.to_datetime(end, format="%Y%m%d").date()
-    batch_id = f"financial-vip-{uuid.uuid4().hex}"
+    batch_id = batch_id or f"financial-vip-{uuid.uuid4().hex}"
+    if not str(batch_id).strip():
+        raise ValueError("batch_id must not be empty")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ValueError("attempt must be a positive integer")
     kernel, repository, context = _service(batch_id)
     try:
         pro = get_pro()
@@ -262,22 +475,11 @@ def run(end_date=None, run_date=None, lookback_days=30, report_periods_back=4, r
         if blocked:
             raise CoverageBlocked("; ".join(blocked[:10]))
         if not dry_run and rebuild_derived:
-            queue_ids, queue_codes = _pending_queue_codes(repository, context)
-            legacy_codes = _legacy_pending_codes(repository, context)
-            codes = sorted(set(queue_codes) | set(legacy_codes))
-            if codes:
-                try:
-                    from data_collect.jobs.tushare_foundation_pipeline import OUTPUT_START, WARMUP_START
-                    standard_run("all", 2000, codes, WARMUP_START, end_dt)
-                    from data_collect.jobs.tushare_fina_indicator_version import _rebuild_standard_unlocked as rebuild_indicator
-                    rebuild_indicator(2000, codes, WARMUP_START, end_dt)
-                    rebuild_company_financial_v2(None, WARMUP_START, OUTPUT_START, end_dt, requested_codes=codes, target_table="feature.company_financial_v2", batch_stocks=5)
-                    repository.finish_queue(queue_ids, "DONE", None, context)
-                    repository.finish_legacy(legacy_codes, "done", None, context)
-                except Exception as exc:
-                    repository.finish_queue(queue_ids, "FAILED", str(exc)[:500], context)
-                    repository.finish_legacy(legacy_codes, "failed", str(exc)[:500], context)
-                    raise
+            claim_owner_id = f"{batch_id}:attempt:{attempt}:{uuid.uuid4().hex}"
+            _consume_pending_changes(
+                repository, context, end_dt,
+                claim_owner_id=claim_owner_id, takeover=attempt > 1,
+            )
         return f"financial VIP incremental completed batch_id={batch_id} periods={len(periods)}"
     finally:
         kernel.close()
@@ -299,5 +501,6 @@ if __name__ == "__main__":
     parser.add_argument("--report-periods-back", type=int, default=4)
     parser.add_argument("--no-rebuild-derived", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--batch-id")
     args = parser.parse_args()
-    print(run(end_date=args.end_date, lookback_days=args.lookback_days, report_periods_back=args.report_periods_back, rebuild_derived=not args.no_rebuild_derived, dry_run=args.dry_run))
+    print(run(end_date=args.end_date, lookback_days=args.lookback_days, report_periods_back=args.report_periods_back, rebuild_derived=not args.no_rebuild_derived, dry_run=args.dry_run, batch_id=args.batch_id))

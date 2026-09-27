@@ -3,6 +3,13 @@ from data_collect.data_access.repository.base import BaseRepository
 from data_collect.data_access.repository.raw_repository import RawRepository
 from data_collect.data_access.repository.security_repository import SecurityRepository
 from data_collect.data_access.repository.market_repository import MarketRepository
+from data_collect.data_access.repository.market_activity_repository import MarketActivityRepository
+from data_collect.data_access.repository.market_activity_storage_repository import (
+    MarketActivityStorageRepository,
+)
+from data_collect.data_access.repository.industry_membership_repository import (
+    IndustryMembershipRepository,
+)
 from data_collect.data_access.repository.financial_repository import FinancialRepository
 from data_collect.data_access.repository.pit_repository import PitRepository
 from data_collect.data_access.repository.feature_repository import FeatureRepository
@@ -24,6 +31,7 @@ from data_collect.data_access.repository.backtest_run_repository import Backtest
 from data_collect.data_access.repository.backtest_rules_repository import BacktestRulesRepository
 from data_collect.data_access.repository.foundation_contract_repository import FoundationContractRepository
 from data_collect.data_access.repository.schema_migration_repository import SchemaMigrationRepository
+from data_collect.data_access.repository.retention_archive_repository import RetentionArchiveRepository
 from data_collect.data_access.repository.foundation_metadata_repository import FoundationMetadataRepository
 from data_collect.data_access.repository.contract_product_repository import ContractProductRepository
 from data_collect.data_access.repository.observation_repository import (
@@ -40,6 +48,9 @@ __all__ = [
     "RawRepository",
     "SecurityRepository",
     "MarketRepository",
+    "MarketActivityRepository",
+    "MarketActivityStorageRepository",
+    "IndustryMembershipRepository",
     "FinancialRepository",
     "PitRepository",
     "FeatureRepository",
@@ -58,6 +69,7 @@ __all__ = [
     "PitValidationRepository",
     "FoundationContractRepository",
     "SchemaMigrationRepository",
+    "RetentionArchiveRepository",
     "FoundationMetadataRepository",
     "ContractProductRepository",
     "StockAnomalyObservationRepository",
@@ -66,4 +78,15 @@ __all__ = [
     "ObservationEventRepository",
     "MarketAnomalyOutcomeRepository",
     "ScenarioEvaluationRepository",
+    "MarketActivityObservationRepository",
 ]
+
+
+def __getattr__(name: str):
+    """Load the Activity Observation adapter lazily to avoid import cycles."""
+    if name == "MarketActivityObservationRepository":
+        from data_collect.data_access.repository.market_activity_observation_repository import (
+            MarketActivityObservationRepository,
+        )
+        return MarketActivityObservationRepository
+    raise AttributeError(name)

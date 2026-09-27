@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
 
@@ -91,6 +93,20 @@ ON CONFLICT (trade_date, ts_code) DO UPDATE SET
 
 
 class SecurityRepository(BaseRepository):
+    @staticmethod
+    def _daily_scopes(scope: WorkScope):
+        """按单日拆分状态重建，避免宽日期窗口形成大事务。"""
+        current = scope.date_from
+        while current <= scope.date_to:
+            yield WorkScope(
+                date_from=current,
+                date_to=current,
+                codes=scope.codes,
+                dimensions=scope.dimensions,
+                partition=scope.partition,
+            )
+            current += timedelta(days=1)
+
     def stock_codes(self, context: RunContext) -> list[str]:
         rows = self.kernel.read.query(
             context=context,
@@ -243,24 +259,30 @@ class SecurityRepository(BaseRepository):
         if scope.date_from is None or scope.date_to is None:
             raise ValueError("rebuild_status_daily 需要 scope.date_from/date_to")
 
-        plan = SqlPlan(
-            operation=Operation.REBUILD,
-            target="std.security_status_daily",
-            scope=scope,
-            expected_mode="SET_BASED",
-            estimated_rows=0,
-            allow_insert_select=True,
-            allow_delete=True,  # SQL 含 scoped DELETE
-        )
-        # params 顺序：DELETE(2) + dates(2) + limits(2)
-        params = (
-            scope.date_from, scope.date_to,
-            scope.date_from, scope.date_to,
-            scope.date_from, scope.date_to,
-        )
-        return self.kernel.rebuild.run_scoped_merge(
-            sql=_STATUS_DAILY_REBUILD_SQL, plan=plan, context=context, params=params
-        )
+        total = 0
+        for day_scope in self._daily_scopes(scope):
+            plan = SqlPlan(
+                operation=Operation.REBUILD,
+                target="std.security_status_daily",
+                scope=day_scope,
+                expected_mode="SET_BASED",
+                estimated_rows=10_000,
+                allow_insert_select=True,
+                allow_delete=True,  # SQL 含 scoped DELETE
+            )
+            # params 顺序：DELETE(2) + dates(2) + limits(2)
+            params = (
+                day_scope.date_from, day_scope.date_to,
+                day_scope.date_from, day_scope.date_to,
+                day_scope.date_from, day_scope.date_to,
+            )
+            total += self.kernel.rebuild.run_scoped_merge(
+                sql=_STATUS_DAILY_REBUILD_SQL,
+                plan=plan,
+                context=context,
+                params=params,
+            )
+        return total
 
     def rebuild_dividend(self, context: RunContext) -> int:
         """重建分红事件（纯 upsert，无 TRUNCATE——原实现 TRUNCATE 后 ON CONFLICT 冗余且危险）。"""
@@ -275,6 +297,35 @@ class SecurityRepository(BaseRepository):
         return self.kernel.rebuild.run_insert_select(
             sql=_DIVIDEND_REBUILD_SQL, plan=plan, context=context
         )
+
+    def rebuild_dividend_codes(self, context: RunContext, codes) -> int:
+        """只重建明确受影响证券的分红；每批 5 只，避免每日路径扫描 Raw 全表。"""
+        securities = sorted({str(code).strip() for code in codes or () if str(code).strip()})
+        if not securities:
+            return 0
+        total = 0
+        for batch_index, offset in enumerate(range(0, len(securities), 5), start=1):
+            batch = securities[offset : offset + 5]
+            scope = WorkScope(
+                codes=tuple(batch),
+                partition="std:dividend_event:changed-codes",
+                dimensions={"code_batch": batch_index},
+            )
+            plan = SqlPlan(
+                operation=Operation.REBUILD,
+                target="std.dividend_event",
+                scope=scope,
+                expected_mode="SET_BASED",
+                estimated_rows=500,
+                allow_insert_select=True,
+            )
+            total += self.kernel.rebuild.run_insert_select(
+                sql=_dividend_rebuild_sql(scoped=True),
+                plan=plan,
+                context=context,
+                params=(batch,),
+            )
+        return total
 
     def rebuild_lifecycle(self, context: RunContext) -> int:
         """重建证券生命周期（名称历史，全量快照重建）。
@@ -312,7 +363,9 @@ class SecurityRepository(BaseRepository):
 
 
 # 迁移自 tushare_phase2_standard.rebuild_dividend（去掉 TRUNCATE，纯 ON CONFLICT upsert）
-_DIVIDEND_REBUILD_SQL = """
+def _dividend_rebuild_sql(*, scoped: bool) -> str:
+    code_filter = "WHERE ts_code = ANY(%s)" if scoped else ""
+    return f"""
 INSERT INTO std.dividend_event
     (ts_code, report_date, announce_date, implementation_status, stock_div,
      stock_bonus_rate, stock_conversion_rate, cash_div, cash_div_tax,
@@ -337,6 +390,7 @@ FROM (
          ts_code || ':' || COALESCE(end_date::text,'') || ':' ||
          COALESCE(div_proc,'') AS business_key
   FROM tushare_dividend_raw
+  {code_filter}
   ORDER BY ts_code, end_date, div_proc,
            to_date(NULLIF(payload->>'imp_ann_date',''),'YYYYMMDD') DESC NULLS LAST,
            ann_date DESC NULLS LAST, fetched_at DESC, record_id DESC
@@ -351,6 +405,9 @@ ON CONFLICT (source, source_record_key, record_version) DO UPDATE SET
   business_key=EXCLUDED.business_key, payload_hash=EXCLUDED.payload_hash,
   quality_status=EXCLUDED.quality_status, fetched_at=CURRENT_TIMESTAMP
 """
+
+
+_DIVIDEND_REBUILD_SQL = _dividend_rebuild_sql(scoped=False)
 
 
 # 迁移自 tushare_phase2_standard.rebuild_lifecycle（TRUNCATE → staging+swap，INSERT 目标改为 {staging}）

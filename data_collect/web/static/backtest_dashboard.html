@@ -288,7 +288,7 @@
       makeSvgChart($("drawdown-chart"), [{name:"回撤",color:"#ff6b81",values:curve.map(x=>x.drawdown)}], {labels,format:v=>pct(v),zeroLine:true});
       makeSvgChart($("cash-chart"), [{name:"现金占比",color:"#45d39c",values:curve.map(x=>x.cash_ratio)}], {labels,format:v=>pct(v)});
       const calendar = data.evaluation?.calendar || {};
-      bars($("monthly-bars"), (calendar.month || data.monthly_returns || []).map(x=>({label:x.period,value:x.strategy_return ?? x.return,negative:(x.strategy_return ?? x.return)<0})), {format:v=>pct(v)});
+      bars($("monthly-bars"), (calendar.month || data.monthly_returns || []).map(x=>({label:`${x.period}${x.activity_status === "CASH_ONLY" ? " · 现金期" : ""}`,value:x.strategy_return ?? x.return,negative:(x.strategy_return ?? x.return)<0})), {format:v=>pct(v)});
       const rej = Object.entries(data.order_rejections?.by_category || {}).filter(x=>x[0]!=="FILLED").sort((a,b)=>b[1]-a[1]).map(x=>({label:categoryNames[x[0]]||x[0],value:x[1]}));
       bars($("rejection-bars"), rej, {format:v=>`${v} 笔`});
       const ex = Object.entries(data.exit_attribution || {}).sort((a,b)=>b[1].trade_count-a[1].trade_count).map(x=>({label:exitNames[x[0]]||x[0],value:x[1].trade_count,negative:(x[1].net_pnl||0)<0}));

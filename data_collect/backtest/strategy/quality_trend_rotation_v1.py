@@ -69,6 +69,7 @@ class QualityTrendRotationV1:
         self._current_amount: dict[str, float | None] = {}
         self._return_60: dict[str, float | None] = {}
         self._last_state_day: date | None = None
+        self._last_decision_reason: dict[str, Any] = {}
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -172,18 +173,30 @@ class QualityTrendRotationV1:
             )
 
     def _financial_quality_ok(self, observation: Observation, trade_date: date) -> bool:
+        return not self._financial_quality_failure_codes(observation, trade_date)
+
+    def _financial_quality_failure_codes(
+        self, observation: Observation, trade_date: date,
+    ) -> list[str]:
+        """Return deterministic first-order reasons for a failed PIT quality gate.
+
+        The checks intentionally mirror ``_financial_quality_ok`` in the same
+        order.  This method is diagnostic only; it must not create a second
+        selection rule with different semantics.
+        """
+        failures: list[str] = []
         effective = self._as_date(observation.get("effective_announce_date"))
         available = self._as_date(observation.get("financial_data_available_timestamp"))
         if effective is None or effective > trade_date:
-            return False
+            failures.append("FINANCIAL_EFFECTIVE_DATE_UNAVAILABLE")
         if available is None or available > trade_date:
-            return False
+            failures.append("FINANCIAL_AVAILABLE_DATE_UNAVAILABLE")
         if observation.get("financial_feature_contract_version") != "feature-contract-v2.0":
-            return False
+            failures.append("FINANCIAL_CONTRACT_MISMATCH")
         if not str(observation.get("financial_source_fingerprint") or "").strip():
-            return False
+            failures.append("FINANCIAL_SOURCE_FINGERPRINT_MISSING")
         if observation.get("ttm_complete") is not True:
-            return False
+            failures.append("FINANCIAL_TTM_INCOMPLETE")
         roe = self._finite(observation.get("roe_ttm"))
         ocf = self._finite(observation.get("operating_cashflow_ttm"))
         debt = self._finite(observation.get("debt_to_assets"))
@@ -197,14 +210,24 @@ class QualityTrendRotationV1:
         if not cashflow_status and ocf is not None:
             cashflow_status = "VALID"
         if roe_status != "VALID" or cashflow_status != "VALID":
-            return False
-        return (
-            roe is not None and roe >= self.roe_ttm_min
-            and ocf is not None and ocf > self.ocf_ttm_min
-            and debt is not None and 0 <= debt <= self.debt_to_assets_max
-        )
+            failures.append("FINANCIAL_COMPONENT_STATUS_INVALID")
+        if roe is None:
+            failures.append("ROE_MISSING")
+        elif roe < self.roe_ttm_min:
+            failures.append("ROE_BELOW_THRESHOLD")
+        if ocf is None:
+            failures.append("OPERATING_CASHFLOW_MISSING")
+        elif ocf <= self.ocf_ttm_min:
+            failures.append("OPERATING_CASHFLOW_NOT_POSITIVE")
+        if debt is None:
+            failures.append("DEBT_TO_ASSETS_MISSING")
+        elif not 0 <= debt <= self.debt_to_assets_max:
+            failures.append("DEBT_TO_ASSETS_OUT_OF_RANGE")
+        return failures
 
-    def _entry_candidate(self, trade_date: date, observation: Observation) -> dict[str, Any] | None:
+    def _entry_candidate_with_reason(
+        self, trade_date: date, observation: Observation,
+    ) -> tuple[dict[str, Any] | None, str | None]:
         raw_close = self._finite(observation.get("raw_close"))
         adj_close = self._finite(observation.get("adj_close_base"))
         ma20 = self._finite(observation.get("ma20"))
@@ -213,32 +236,37 @@ class QualityTrendRotationV1:
         avg_amount = self._avg_amount_20.get(observation.ts_code)
         listed_count = self._finite(observation.get("available_observation_count"))
         if any(value is None or value <= 0 for value in (raw_close, adj_close, ma20, ma60)):
-            return None
+            return None, "MISSING_PRICE_OR_TREND_INPUT"
         if observation.get("is_listed_asof") is not True:
-            return None
+            return None, "NOT_LISTED_ASOF"
         if observation.get("eligible_by_market") is not True:
-            return None
+            return None, "MARKET_ELIGIBILITY_FAILED"
         if observation.get("is_tradeable") is not True or observation.get("can_buy") is not True:
-            return None
+            return None, "NOT_TRADEABLE_OR_CANNOT_BUY"
         st_status = observation.get("is_st_asof")
         if st_status not in {True, False}:
-            return None
+            return None, "ST_STATUS_UNKNOWN"
         if st_status is True and not self.allow_st:
-            return None
-        if not self._financial_quality_ok(observation, trade_date):
-            return None
+            return None, "ST_REJECTED"
+        financial_failures = self._financial_quality_failure_codes(observation, trade_date)
+        if financial_failures:
+            return None, financial_failures[0]
         # available_observation_count 由冻结价格特征按证券自身有效行情累计，
         # 可精确覆盖 Dataset 预热起点之前的上市历史；不能从回测起点重新计数。
         if listed_count is None or listed_count < self.min_listing_trading_days:
-            return None
-        if (
-            ret60 is None or ret60 <= 0
-            or self._current_amount.get(observation.ts_code) is None
-            or avg_amount is None or avg_amount < self.min_avg_amount_20
-        ):
-            return None
+            return None, "LISTING_HISTORY_TOO_SHORT"
+        if ret60 is None:
+            return None, "RET60_UNAVAILABLE"
+        if ret60 <= 0:
+            return None, "RET60_NOT_POSITIVE"
+        if self._current_amount.get(observation.ts_code) is None:
+            return None, "CURRENT_AMOUNT_UNAVAILABLE"
+        if avg_amount is None:
+            return None, "AVERAGE_AMOUNT_20_UNAVAILABLE"
+        if avg_amount < self.min_avg_amount_20:
+            return None, "AVERAGE_AMOUNT_20_BELOW_THRESHOLD"
         if not (adj_close > ma20 > ma60):
-            return None
+            return None, "ENTRY_TREND_FILTER_FAILED"
         return {
             "observation": observation,
             "raw_close": raw_close,
@@ -248,7 +276,14 @@ class QualityTrendRotationV1:
             "ret60": ret60,
             "avg_amount_20": avg_amount,
             "listed_trading_day_count": int(listed_count),
-        }
+        }, None
+
+    def _entry_candidate(self, trade_date: date, observation: Observation) -> dict[str, Any] | None:
+        return self._entry_candidate_with_reason(trade_date, observation)[0]
+
+    def last_decision_reason(self) -> dict[str, Any]:
+        """Return the latest bounded, JSON-serializable decision explanation."""
+        return dict(self._last_decision_reason)
 
     @staticmethod
     def _sell_intent(code: str, observation: Observation | None, rule: str, **details) -> SignalIntent:
@@ -307,12 +342,18 @@ class QualityTrendRotationV1:
                 ))
 
         candidates: list[dict[str, Any]] = []
+        failure_counts: dict[str, int] = defaultdict(int)
+        failure_examples: dict[str, list[str]] = defaultdict(list)
         for observation in sorted(observations, key=lambda item: item.ts_code):
             if observation.ts_code in pending_sell_codes:
                 continue
-            candidate = self._entry_candidate(trade_date, observation)
+            candidate, failure_code = self._entry_candidate_with_reason(trade_date, observation)
             if candidate is not None:
                 candidates.append(candidate)
+            elif failure_code is not None:
+                failure_counts[failure_code] += 1
+                if len(failure_examples[failure_code]) < 3:
+                    failure_examples[failure_code].append(observation.ts_code)
         candidates.sort(key=lambda item: (
             -float(item["ret60"]), -float(item["avg_amount_20"]),
             item["observation"].ts_code,
@@ -365,4 +406,46 @@ class QualityTrendRotationV1:
                     "signal_frequency": "WEEKLY_LAST_TRADING_DAY",
                 },
             ))
+        action_rows = [
+            {
+                "ts_code": signal.ts_code,
+                "direction": signal.direction,
+                "reason": dict(signal.reason),
+            }
+            for signal in signals
+        ]
+        dominant_failure = None
+        if failure_counts:
+            dominant_failure = min(
+                failure_counts,
+                key=lambda code: (-failure_counts[code], code),
+            )
+        self._last_decision_reason = {
+            "schema_version": "quality-trend-decision-v1",
+            "strategy_id": self.strategy_id,
+            "trade_date": trade_date.isoformat(),
+            "signal_day": True,
+            "decision_type": "ACTIONS" if signals else "NO_ACTION",
+            "observed_count": len(observations),
+            "held_count": len(held_codes),
+            "held_codes": sorted(held_codes),
+            "pending_sell_count": len(pending_sell_codes),
+            "eligible_candidate_count": len(candidates),
+            "top_n": self.top_n,
+            "rank_exit_threshold": self.rank_exit_threshold,
+            "buy_signal_count": sum(1 for signal in signals if signal.direction == "BUY"),
+            "sell_signal_count": sum(1 for signal in signals if signal.direction == "SELL"),
+            "failure_counts": dict(sorted(failure_counts.items())),
+            "failure_examples": dict(sorted(failure_examples.items())),
+            "dominant_failure_code": dominant_failure,
+            "no_action_reason_code": (
+                "NO_ELIGIBLE_CANDIDATE"
+                if not signals and not candidates
+                else "NO_NEW_ACTION_AFTER_HOLDING_RULES"
+                if not signals
+                else None
+            ),
+            "ranking": ["ret60 DESC", "avg_amount_20 DESC", "ts_code ASC"],
+            "actions": action_rows,
+        }
         return signals

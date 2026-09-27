@@ -660,3 +660,38 @@ def test_valuation_rebuild_filters_completed_codes_before_loading_inputs(monkeyp
     assert repository.load_calls == [("B", "C"), ("F",)]
     assert repository.published_codes == ["B", "C", "F"]
     assert result["partitions"] == 6
+
+
+def test_valuation_input_repository_enforces_code_date_and_row_budgets():
+    from types import SimpleNamespace
+
+    from data_collect.data_access.repository.financial_repository import (
+        FinancialRepository,
+    )
+
+    class FakeRead:
+        def __init__(self):
+            self.call = None
+
+        def _repository_query(self, **kwargs):
+            self.call = kwargs
+            return []
+
+    read = FakeRead()
+    repository = object.__new__(FinancialRepository)
+    repository.kernel = SimpleNamespace(read=read)
+    start, end = date(2021, 8, 1), date(2026, 9, 25)
+
+    with pytest.raises(ValueError, match="limited to 15 securities"):
+        repository.load_valuation_inputs(
+            [f"{index:06d}.SH" for index in range(16)], start, end, None,
+        )
+
+    repository.load_valuation_inputs(["000001.SZ"], start, end, None)
+    assert "stock_code=ANY(%s)" in read.call["sql"]
+    assert "trade_date BETWEEN %s AND %s" in read.call["sql"]
+    assert read.call["params"] == (["000001.SZ"], start, end)
+    assert read.call["scope"].date_from == start
+    assert read.call["scope"].date_to == end
+    assert read.call["scope"].codes == ("000001.SZ",)
+    assert read.call["max_rows"] == 25_000

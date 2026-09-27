@@ -16,6 +16,8 @@ from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.security_repository import SecurityRepository
 from data_collect.data_access.repository.pit_repository import PitRepository
+from data_collect.data_access.repository.market_repository import MarketRepository
+from data_collect.data_access.repository.release_repository import ReleaseRepository
 from tests._fake_db import FakeConnection
 
 
@@ -34,28 +36,137 @@ def make_kernel_and_repo():
     return SecurityRepository(kernel), kernel, conn
 
 
+@pytest.mark.parametrize(
+    ("schema_version", "expected_domain"),
+    [
+        ("market-activity-v1", "MARKET_ACTIVITY"),
+        ("feature-contract-v2.0", "RESEARCH"),
+        ("", "RESEARCH"),
+    ],
+)
+def test_release_schema_maps_to_an_isolated_baseline_domain(schema_version, expected_domain):
+    assert ReleaseRepository._baseline_domain(schema_version) == expected_domain
+
+
+def test_research_release_gate_blocks_implemented_dividends_without_ex_date(monkeypatch):
+    from data_collect.data_access.repository.quality_inspection_repository import (
+        QualityInspectionRepository,
+    )
+
+    monkeypatch.setattr(
+        QualityInspectionRepository,
+        "phase2_invariants",
+        lambda self, context, cutoff, skip_names: {},
+    )
+    monkeypatch.setattr(
+        QualityInspectionRepository,
+        "phase2_checkpoint_completeness",
+        lambda self, context, cutoff: {},
+    )
+    values = {
+        "release:lifecycle": 0,
+        "release:dividend-duplicates": 0,
+        "release:dividend-ex-date": 1,
+    }
+    repository = ReleaseRepository(object())
+    monkeypatch.setattr(
+        repository,
+        "_scalar",
+        lambda table, sql, context, partition, params=(): values[partition],
+    )
+
+    report = repository.quality_gate(date(2026, 9, 25), False, ctx())
+
+    assert report["implementation_without_ex_date"] == 1
+    assert report["failures"]["implementation_without_ex_date"] == 1
+
+
+def test_research_observation_baseline_lookup_is_domain_scoped():
+    from data_collect.data_access.repository.observation_repository import (
+        StockAnomalyObservationRepository,
+    )
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    with pytest.raises(ValueError, match="validated data baseline not found"):
+        StockAnomalyObservationRepository(kernel).validated_baseline("baseline-x", ctx())
+    query = next(item["sql"] for item in conn.executed if "ops.tushare_data_release" in item["sql"])
+    assert "baseline_domain='RESEARCH'" in query
+
+
+def test_incremental_watermarks_fall_back_to_non_revoked_research_releases():
+    from data_collect.data_access.repository.phase2_raw_repository import Phase2RawRepository
+
+    for repository, method_name in (
+        (MarketRepository, "baseline_cutoff"),
+        (Phase2RawRepository, "baseline_cutoff"),
+    ):
+        conn = FakeConnection()
+        kernel = DataAccessKernel(
+            policy_registry=build_default_registry(), connection_factory=lambda: conn
+        )
+        with pytest.raises(RuntimeError, match="RESEARCH"):
+            getattr(repository(kernel), method_name)(ctx())
+        query = next(
+            item["sql"] for item in conn.executed
+            if "ops.tushare_data_release" in item["sql"]
+        )
+        assert "status IN ('validated', 'superseded')" in query
+        assert "baseline_domain='RESEARCH'" in query
+        assert "CASE WHEN status='validated' THEN 0 ELSE 1 END" in query
+
+
 def test_security_repository_requires_scope_dates():
     repo, _, _ = make_kernel_and_repo()
     with pytest.raises(ValueError):
         repo.rebuild_status_daily(WorkScope(), ctx())  # 无日期范围
 
 
+@pytest.mark.parametrize(
+    ("logical_target", "canonical_target"),
+    [
+        ("daily_kline", "std.daily_kline"),
+        ("valuation_daily", "std.valuation_daily"),
+        ("adj_factor_daily", "std.adj_factor_daily"),
+    ],
+)
+def test_market_standard_count_uses_registered_standard_relation(
+    logical_target, canonical_target,
+):
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    captured = {}
+
+    def fake_query(**kwargs):
+        captured.update(kwargs)
+        return [{"count": 0}]
+
+    kernel.read._repository_query = fake_query
+    MarketRepository(kernel).standard_count(logical_target, date(2026, 9, 10), ctx())
+    assert captured["source"] == canonical_target
+    assert f"FROM {canonical_target}" in captured["sql"]
+
+
 def test_security_repository_executes_set_based_sql():
     repo, kernel, conn = make_kernel_and_repo()
-    scope = WorkScope(date_from=date(2026, 1, 1), date_to=date(2026, 1, 31))
+    scope = WorkScope(date_from=date(2026, 1, 1), date_to=date(2026, 1, 2))
     repo.rebuild_status_daily(scope, ctx())
 
     sqls = [e["sql"] for e in conn.executed]
     # SET-based 重建：scoped DELETE + INSERT...ON CONFLICT
     assert any("DELETE FROM std.security_status_daily" in s for s in sqls)
     assert any("ON CONFLICT" in s for s in sqls)
-    # 提交了一次（单事务）
-    assert conn.committed == 1
+    # Two dates, one governed transaction per date.
+    assert conn.committed == 2
 
 
 def test_security_repository_passes_params():
     repo, kernel, conn = make_kernel_and_repo()
-    scope = WorkScope(date_from=date(2026, 1, 1), date_to=date(2026, 1, 31))
+    scope = WorkScope(date_from=date(2026, 1, 1), date_to=date(2026, 1, 2))
     repo.rebuild_status_daily(scope, ctx())
 
     # params 应为 6 个（DELETE 2 + dates 2 + limits 2）
@@ -63,10 +174,28 @@ def test_security_repository_passes_params():
     assert executed_with_params
     params = executed_with_params[0]["params"]
     assert params == (
-        date(2026, 1, 1), date(2026, 1, 31),
-        date(2026, 1, 1), date(2026, 1, 31),
-        date(2026, 1, 1), date(2026, 1, 31),
+        date(2026, 1, 1), date(2026, 1, 1),
+        date(2026, 1, 1), date(2026, 1, 1),
+        date(2026, 1, 1), date(2026, 1, 1),
     )
+
+
+def test_security_repository_splits_wide_status_scope_by_day():
+    repo, kernel, conn = make_kernel_and_repo()
+    scope = WorkScope(date_from=date(2026, 1, 1), date_to=date(2026, 1, 2))
+
+    repo.rebuild_status_daily(scope, ctx())
+
+    statements = [
+        item for item in conn.executed
+        if "DELETE FROM std.security_status_daily" in item["sql"]
+    ]
+    assert len(statements) == 2
+    assert [item["params"][:2] for item in statements] == [
+        (date(2026, 1, 1), date(2026, 1, 1)),
+        (date(2026, 1, 2), date(2026, 1, 2)),
+    ]
+    assert conn.committed == 2
 
 
 def test_security_repository_guard_rejects_unscoped_delete():
@@ -103,6 +232,36 @@ def test_pit_rebuild_splits_join_heavy_targets_by_date():
         (date(2026, 1, 1), date(2026, 1, 1)),
         (date(2026, 1, 2), date(2026, 1, 2)),
     ]
+    # Two bounded reads plus one governed write per day.
+    assert conn.committed == 6
+
+
+def test_pit_rebuild_can_split_a_day_by_code_batch():
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repo = PitRepository(kernel)
+    codes = tuple(f"{index:06d}.SZ" for index in range(501))
+
+    repo.rebuild_universe(
+        WorkScope(
+            date_from=date(2026, 1, 1),
+            date_to=date(2026, 1, 1),
+            codes=codes,
+        ),
+        ctx(),
+    )
+
+    merge_sql = [
+        item for item in conn.executed
+        if "DELETE FROM pit.universe_daily" in item["sql"]
+    ]
+    assert len(merge_sql) == 2
+    assert all("ts_code = ANY(%s)" in item["sql"] for item in merge_sql)
+    assert all(len(item["params"]) == 6 for item in merge_sql)
+    assert merge_sql[0]["params"][2] == list(codes[:500])
+    assert merge_sql[1]["params"][2] == list(codes[500:])
     assert conn.committed == 2
 
 
@@ -112,18 +271,11 @@ def test_security_repository_lifecycle_uses_staging_swap_not_truncate():
     repo.rebuild_lifecycle(ctx())
     sqls = [e["sql"] for e in conn.executed]
     # 建 staging（带 schema）+ fill + swap
-    assert any("CREATE TABLE std._staging_" in s for s in sqls)
+    assert any("ops.create_table_replace_staging" in s for s in sqls)
     # PostgreSQL 的 RENAME TO 右侧必须是未限定的表名；swap 期间旧表仍在，
     # 因而不会出现 DROP target 后再 RENAME 的短暂 relation 缺失窗口。
-    assert any(
-        "ALTER TABLE std.security_lifecycle RENAME TO _old_security_lifecycle_" in s
-        for s in sqls
-    )
-    assert any(
-        "ALTER TABLE std._staging_" in s and "RENAME TO security_lifecycle" in s
-        for s in sqls
-    )
-    assert any("DROP TABLE std._old_security_lifecycle_" in s for s in sqls)
+    assert any("ops.swap_table_replace_staging" in s for s in sqls)
+    assert any("ops.drop_table_replace_staging" in s for s in sqls)
     # 无 TRUNCATE（文档 §5.2 禁止）
     assert not any("TRUNCATE" in s for s in sqls)
 
@@ -192,7 +344,14 @@ def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
         date_from=start, date_to=end,
     )
 
-    bar_query, observation_query = conn.executed[-2:]
+    bar_query = next(
+        row for row in conn.executed
+        if "FROM backtest.dataset_execution_bar" in row["sql"]
+    )
+    observation_query = next(
+        row for row in conn.executed
+        if "JOIN research.stock_snapshot_daily s" in row["sql"]
+    )
     assert "trade_date >= %s" in bar_query["sql"]
     assert "trade_date <= %s" in bar_query["sql"]
     assert bar_query["params"] == (
@@ -246,7 +405,7 @@ def test_instrument_repository_keeps_legacy_raw_first_seen_only():
     assert "DO UPDATE" not in raw_sql
 
 
-def test_financial_vip_page_queue_lookup_is_bounded_to_page_hashes():
+def test_financial_vip_page_queue_lookup_is_bounded_to_page_hashes(monkeypatch):
     from data_collect.data_access.repository.financial_vip_repository import FinancialVipRepository
 
     conn = FakeConnection()
@@ -259,16 +418,116 @@ def test_financial_vip_page_queue_lookup_is_bounded_to_page_hashes():
         "report_type": "1", "comp_type": "1", "end_type": "1",
         "f_ann_date": "20260301", "update_flag": "0", "revenue": 1,
     }]
+
+    def lookup(*, context, source, sql, params, scope, max_rows):
+        conn.executed.append({"kind": "execute", "sql": sql, "params": params})
+        return [{
+            "record_id": 1,
+            "business_key": params[0][0],
+                "ts_code": "000001.SZ",
+                "end_date": date(2025, 12, 31),
+                "batch_id": "batch-1",
+                "payload_hash": params[1][0],
+                "available_date": date(2026, 3, 1),
+        }]
+
+    monkeypatch.setattr(kernel.read, "_repository_query", lookup)
     repository.write_versions_and_queue("income", records, "batch-1", ctx())
     lookup = next(
         entry for entry in conn.executed
         if entry["kind"] == "execute" and "SELECT record_id" in entry["sql"]
     )
-    assert "WHERE batch_id=%s" in lookup["sql"]
-    assert "payload_hash = ANY(%s)" in lookup["sql"]
-    assert "AND dataset=%s" in lookup["sql"]
-    assert lookup["params"][0] == "batch-1"
+    assert "FROM unnest(%s::text[], %s::text[])" in lookup["sql"]
+    assert "v.business_key=r.business_key" in lookup["sql"]
+    assert "v.payload_hash=r.payload_hash" in lookup["sql"]
+    assert "AND r.dataset=%s" in lookup["sql"]
+    assert lookup["params"][0][0] == "000001.SZ:20251231:1:1:1"
+    assert len(lookup["params"][0]) == 1
     assert len(lookup["params"][1]) == 1
+
+
+def test_financial_vip_queue_lookup_fails_closed_for_missing_pair():
+    from data_collect.data_access.repository.financial_vip_repository import FinancialVipRepository
+
+    with pytest.raises(RuntimeError, match="queue lookup incomplete"):
+        FinancialVipRepository._assert_queue_lookup_complete(
+            [{"business_key": "000001.SZ:20251231:1:1:1", "payload_hash": "a" * 64}],
+            [],
+        )
+
+
+def test_financial_vip_write_rolls_back_on_incomplete_queue_lookup():
+    from data_collect.data_access.repository.financial_vip_repository import FinancialVipRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = FinancialVipRepository(kernel)
+    with pytest.raises(RuntimeError, match="queue lookup incomplete"):
+        repository.write_versions_and_queue(
+            "income",
+            [{
+                "ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260301",
+                "report_type": "1", "comp_type": "1", "end_type": "1",
+                "f_ann_date": "20260301", "update_flag": "0", "revenue": 1,
+            }],
+            "batch-1",
+            ctx(),
+        )
+    assert conn.committed == 0
+    assert conn.rolled_back == 1
+
+
+def test_financial_queue_claim_uses_lease_owner_and_reclaims_expired_rows():
+    class QueueConnection(FakeConnection):
+        def cursor(self, name=None, withhold=False):
+            cursor = super().cursor(name, withhold)
+            original_execute = cursor.execute
+
+            def execute(sql, params=None):
+                original_execute(sql, params)
+                if "RETURNING q.queue_id, q.ts_code" in sql:
+                    cursor._fetch_rows = [(11, "000001.SZ")]
+
+            cursor.execute = execute
+            return cursor
+
+    conn = QueueConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    ids, codes = kernel.write.claim_financial_queue(
+        ctx(), WorkScope(partition="vip-queue-claim"),
+        limit=10, lease_seconds=600, max_attempts=3,
+        through_date=date(2026, 9, 5),
+    )
+    assert ids == [11]
+    assert codes == ["000001.SZ"]
+    reclaim = next(
+        entry for entry in conn.executed
+        if "WITH reclaimable AS" in entry["sql"]
+    )
+    claim = next(
+        entry for entry in conn.executed
+        if "RETURNING q.queue_id, q.ts_code" in entry["sql"]
+    )
+    assert "claim_run_id=NULL" in reclaim["sql"]
+    assert "claim_owner_id=NULL" in reclaim["sql"]
+    assert "lease_expires_at=NULL" in reclaim["sql"]
+    assert "claim_run_id=%s" in claim["sql"]
+    assert "claim_owner_id=%s" in claim["sql"]
+    assert "lease_expires_at=CURRENT_TIMESTAMP" in claim["sql"]
+    assert claim["params"] == (3, date(2026, 9, 5), 10, "run-1", "run-1", 600)
+
+
+def test_financial_queue_finish_does_not_reuse_cross_attempt_checkpoint():
+    from data_collect.data_access.write_gateway import WriteGateway
+
+    source = __import__("inspect").getsource(WriteGateway.update_financial_queue)
+    assert "_checkpoint_cursor" not in source
+    assert "_checkpoint_done" not in source
+    assert "claim_owner_id=%s" in source
 
 
 def test_phase2_raw_serialization_normalizes_non_finite_api_numbers():
@@ -531,6 +790,178 @@ def test_release_manifest_groups_versioned_market_datasets_in_one_scan():
     assert " OR " not in shared_sql
 
 
+def test_market_activity_release_gate_is_scoped_to_market_inputs():
+    from types import SimpleNamespace
+    from data_collect.data_access.repository.release_repository import ReleaseRepository
+
+    calls = []
+
+    class ReadProbe:
+        def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
+            calls.append(source)
+            if source == "ops.market_data_quality_gate":
+                return [{
+                    "dataset": "daily",
+                    "trade_date": date(2026, 9, 10),
+                    "actual_rows": 5549,
+                    "expected_rows": 5549,
+                    "status": "PASS",
+                    "batch_id": "batch-1",
+                    "reason": "coverage within threshold",
+                    "created_at": None,
+                }]
+            if source == "std.daily_kline":
+                return [{"row_count": 5549, "stock_count": 5549, "invalid_count": 0}]
+            raise AssertionError(f"unexpected source: {source}")
+
+    repository = ReleaseRepository(SimpleNamespace(read=ReadProbe()))
+    result = repository.market_activity_quality_gate(date(2026, 9, 10), None)
+
+    assert result["failures"] == {}
+    assert result["standard_daily_kline"]["stock_count"] == 5549
+    assert calls == ["ops.market_data_quality_gate", "std.daily_kline"]
+
+
+def test_market_activity_source_manifest_hashes_exact_calculation_inputs():
+    from datetime import timedelta
+    from data_collect.market_activity.contracts import MarketActivityRequest
+    from data_collect.market_activity.metrics import build_daily_report
+
+    cutoff = date(2026, 9, 10)
+    bars = []
+    for offset in range(20, 0, -1):
+        bars.append({
+            "stock_code": "600000.SH", "trade_date": cutoff - timedelta(days=offset),
+            "close": 10.0, "volume": 100.0, "amount": 1000.0,
+        })
+    bars.append({
+        "stock_code": "600000.SH", "trade_date": cutoff,
+        "close": 11.0, "volume": 200.0, "amount": 2500.0,
+    })
+    report = build_daily_report([bars], MarketActivityRequest(trade_date=cutoff))
+
+    manifest, manifest_hash = ReleaseRepository(None).market_activity_source_manifest(
+        cutoff, report
+    )
+
+    assert manifest["schema_version"] == "market-activity-input-v2"
+    assert manifest["input_window"] == {
+        "source": "std.daily_kline",
+        "date_from": report.lookback_start.isoformat(),
+        "date_to": cutoff.isoformat(),
+        "row_count": report.input_row_count,
+    }
+    assert manifest["report"]["input_manifest_hash"] == report.input_manifest_hash
+    assert manifest["report"]["activity_hash"] == report.activity_hash
+    assert len(manifest_hash) == 64
+
+
+def test_market_activity_full_release_audit_uses_one_hard_limited_input_stream():
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from data_collect.market_activity.contracts import MarketActivityRequest
+    from data_collect.market_activity.metrics import build_daily_report
+
+    cutoff = date(2026, 9, 10)
+    bars = []
+    for offset in range(20, 0, -1):
+        bars.append({
+            "stock_code": "600000.SH", "trade_date": cutoff - timedelta(days=offset),
+            "close": 10.0, "volume": 100.0, "amount": 1000.0,
+        })
+    bars.append({
+        "stock_code": "600000.SH", "trade_date": cutoff,
+        "close": 11.0, "volume": 200.0, "amount": 2500.0,
+    })
+    expected_report = build_daily_report([bars], MarketActivityRequest(trade_date=cutoff))
+    reads = []
+    streams = []
+
+    class ReadProbe:
+        def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
+            reads.append((source, sql, params, max_rows))
+            if source == "ops.tushare_data_release":
+                return [{
+                    "baseline_domain": "MARKET_ACTIVITY",
+                    "baseline_cutoff_date": cutoff,
+                    "schema_version": "market-activity-v1",
+                    "data_cutoff_timestamp": None,
+                    "temporal_evidence_level": "WAREHOUSE_OBSERVED",
+                    "visibility_policy_version": "business-pit-v2",
+                }]
+            if source == "ops.market_data_quality_gate":
+                return [{
+                    "dataset": "daily", "trade_date": cutoff,
+                    "actual_rows": 1, "expected_rows": 1, "status": "PASS",
+                    "batch_id": "batch-1", "reason": "ok", "created_at": None,
+                }]
+            if source == "std.daily_kline":
+                return [{"row_count": 1, "stock_count": 1, "invalid_count": 0}]
+            raise AssertionError(f"unexpected fact/control query: {source}")
+
+        def _repository_stream(self, **kwargs):
+            streams.append(kwargs)
+            return iter([bars])
+
+    kernel = SimpleNamespace(
+        read=ReadProbe(),
+        write=SimpleNamespace(begin_release_validation_boundary=lambda *args: 77),
+    )
+    result = ReleaseRepository(kernel).validate("market-release", "", ctx())
+
+    assert result["release_change_watermark"] == 77
+    assert result["gate"]["market_activity_report"]["activity_hash"] == expected_report.activity_hash
+    assert result["source_manifest"]["report"]["input_manifest_hash"] == expected_report.input_manifest_hash
+    assert len(streams) == 1
+    assert streams[0]["source"] == "std.daily_kline"
+    assert "LIMIT %s" in streams[0]["sql"]
+    assert streams[0]["params"] == (cutoff - timedelta(days=45), cutoff, 250_001)
+    assert all("raw" not in source and "tushare_market_raw_version" not in sql
+               for source, sql, _, _ in reads)
+
+
+def test_market_activity_release_audit_stops_before_lookback_stream_when_daily_gate_fails():
+    import pytest
+    from types import SimpleNamespace
+
+    cutoff = date(2026, 9, 10)
+    streams = []
+
+    class ReadProbe:
+        def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
+            if source == "ops.tushare_data_release":
+                return [{
+                    "baseline_domain": "MARKET_ACTIVITY",
+                    "baseline_cutoff_date": cutoff,
+                    "schema_version": "market-activity-v1",
+                    "data_cutoff_timestamp": None,
+                    "temporal_evidence_level": "WAREHOUSE_OBSERVED",
+                    "visibility_policy_version": "business-pit-v2",
+                }]
+            if source == "ops.market_data_quality_gate":
+                return [{
+                    "dataset": "daily", "trade_date": cutoff,
+                    "actual_rows": 0, "expected_rows": 0, "status": "BLOCKED",
+                    "batch_id": "batch-1", "reason": "empty source", "created_at": None,
+                }]
+            if source == "std.daily_kline":
+                return [{"row_count": 0, "stock_count": 0, "invalid_count": 0}]
+            raise AssertionError(f"unexpected source: {source}")
+
+        def _repository_stream(self, **kwargs):
+            streams.append(kwargs)
+            return iter(())
+
+    kernel = SimpleNamespace(
+        read=ReadProbe(),
+        write=SimpleNamespace(begin_release_validation_boundary=lambda *args: 77),
+    )
+    with pytest.raises(RuntimeError, match="release quality gate failed"):
+        ReleaseRepository(kernel).validate("market-release", "unused", ctx())
+
+    assert streams == []
+
+
 def test_feature_repository_rebuild_price_v2_scoped_merge():
     """rebuild_price_v2 迁移：分批 scoped merge（DELETE + INSERT...ON CONFLICT），无 TRUNCATE。"""
     from data_collect.data_access.repository.feature_repository import FeatureRepository
@@ -545,6 +976,15 @@ def test_feature_repository_rebuild_price_v2_scoped_merge():
     assert any("INTERVAL '400 days'" in s for s in sqls)
     assert any("DISTINCT ON (d.stock_code)" in s for s in sqls)
     assert not any("TRUNCATE" in s for s in sqls)
+
+
+def test_price_v2_checkpoint_identity_accepts_execution_id():
+    from pathlib import Path
+
+    source = Path("data_collect/jobs/tushare_phase2_features.py").read_text(encoding="utf-8")
+    assert "execution_id=None" in source
+    assert "logical_execution_id = str(execution_id or base_context.run_id)" in source
+    assert "logical_execution_id," in source
 
 
 def test_feature_repository_load_codes_deduplicates_before_read_ceiling(monkeypatch):

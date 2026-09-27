@@ -30,7 +30,9 @@ class FakeCursor:
         self.conn.executed.append({"sql": sql, "params": params, "kind": "execute"})
         staged_rowcount = self.rowcount
         self.rowcount = 0
-        if "pg_try_advisory_lock" in sql or "pg_advisory_unlock" in sql:
+        if sql.lstrip().upper().startswith("EXPLAIN ("):
+            self._fetch_rows = [([{"Plan": {"Node Type": "Index Scan"}}],)]
+        elif "pg_try_advisory_lock" in sql or "pg_advisory_unlock" in sql:
             self._fetch_rows = [(True,)]
         elif sql.lstrip().upper().startswith("SELECT TO_REGCLASS"):
             relation = params[0]

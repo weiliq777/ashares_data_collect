@@ -430,6 +430,43 @@ def test_foundation_financial_contract_rejects_legacy_lineage_and_missing_identi
     assert "financial_source_fingerprint" in sql
     assert "financial_source_record_key IS DISTINCT FROM source_record_key" in sql
     assert "financial_data_available_timestamp IS NULL" in sql
+    assert "b.research_date BETWEEN %s AND %s" in sql
+
+
+def test_foundation_financial_contract_is_batched_and_uses_direct_source_lookup():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    calls = []
+
+    def fake_query(context, target, sql, params, scope, max_rows):
+        calls.append((target, sql, params, scope, max_rows))
+        return [
+            {
+                "snapshot_id": snapshot_id,
+                "snapshot_rows": 1,
+                "missing_lineage_rows": 0,
+                "non_v2_source_rows": 0,
+                "invalid_v2_rows": 0,
+            }
+            for snapshot_id in params[0]
+        ]
+
+    repository.kernel = SimpleNamespace(
+        read=SimpleNamespace(_repository_query=fake_query)
+    )
+    manifests = [
+        {
+            "snapshot_id": f"snapshot-{index}",
+            "cutoff": date(2026, 8, 1 + index),
+            "schema_version": "research-v2.0",
+        }
+        for index in range(6)
+    ]
+
+    assert repository.foundation_financial_contract_issues(manifests, object()) == {}
+    assert len(calls) == 2
+    assert [len(call[2][0]) for call in calls] == [5, 1]
+    assert all("source_map" not in call[1] for call in calls)
+    assert all(call[5 - 1] == max(2, len(call[2][0]) + 1) for call in calls)
 
 
 def test_lineage_contract_has_all_required_groups():

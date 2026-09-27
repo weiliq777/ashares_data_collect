@@ -26,6 +26,16 @@ from data_collect.backtest.models import (
     Observation,
 )
 from data_collect.backtest.risk import FeeRule, MarketRule
+from data_collect.backtest.dataset_composition import (
+    MAX_COMPONENTS,
+    DatasetComponent,
+    assert_resumable_component_prefix,
+    assert_compatible_manifests,
+    composition_hash,
+    frozen_manifest_hash,
+    stable_hash,
+    validate_component_coverage,
+)
 from data_collect.jobs.research_snapshot import (
     FOUNDATION_SCHEMA_VERSION,
     SCHEMA_VERSION as RESEARCH_SCHEMA_VERSION,
@@ -480,7 +490,12 @@ def missing_snapshot_dates(
     return tuple(sorted(required - present))
 
 
-def _assert_build_code_current(manifest: dict[str, Any], metadata: dict[str, Any]) -> None:
+def _assert_build_code_current(
+    manifest: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    allow_validation_only: bool = False,
+) -> None:
     """确保冻结时的代码身份与物化时一致，避免错误覆盖 Dataset 血缘。"""
     fields = (
         ("code_version", "code_version"),
@@ -492,7 +507,12 @@ def _assert_build_code_current(manifest: dict[str, Any], metadata: dict[str, Any
     for manifest_field, metadata_field in fields:
         if manifest.get(manifest_field) != metadata.get(metadata_field):
             mismatches.append(manifest_field)
-    if mismatches:
+    if mismatches and not (
+        allow_validation_only
+        and mismatches == ["diff_hash"]
+        and manifest.get("git_dirty") is True
+        and metadata.get("dirty") is True
+    ):
         raise RuntimeError(
             "Dataset build 后代码身份发生变化，必须重新 build 后才能 freeze: "
             + ", ".join(mismatches)
@@ -620,6 +640,481 @@ def create_dataset(
         kernel.close()
 
 
+def _json_document(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+def _component_from_manifest(
+    manifest: dict[str, Any], effective_from: date, effective_to: date,
+) -> DatasetComponent:
+    baseline = manifest.get("baseline")
+    input_hash = str(manifest.get("input_manifest_hash") or "").strip()
+    baseline_hash = str(manifest.get("baseline_quality_report_hash") or "").strip()
+    if not baseline or not input_hash or not baseline_hash:
+        raise RuntimeError(
+            f"FROZEN Dataset 缺少组合必需的基线或输入哈希: {manifest.get('dataset_id')}"
+        )
+    return DatasetComponent(
+        dataset_id=str(manifest["dataset_id"]),
+        effective_from=effective_from,
+        effective_to=effective_to,
+        input_manifest_hash=input_hash,
+        manifest_hash=frozen_manifest_hash(manifest),
+        baseline_tag=str(baseline),
+        baseline_quality_report_hash=baseline_hash,
+    )
+
+
+def _assert_resumable_composite_manifest(
+    existing: dict[str, Any], intended: dict[str, Any],
+) -> None:
+    if existing.get("status") != "DRAFT":
+        raise RuntimeError("指定 dataset_id 已存在且不是可恢复的 DRAFT 组合数据集")
+    for field, expected in intended.items():
+        if field in {"dataset_id", "status"}:
+            continue
+        actual = existing.get(field)
+        if field in {"selected_columns", "availability_rules"}:
+            actual = _json_document(actual)
+            expected = _json_document(expected)
+        if actual != expected:
+            raise RuntimeError(
+                "指定 dataset_id 对应的 DRAFT 组合身份与本次输入不一致: "
+                f"{field}"
+            )
+
+
+def _read_component_leaves(
+    repository: DatasetRepository,
+    context: RunContext,
+    components: Sequence[dict[str, Any]],
+) -> tuple[list[DatasetComponent], list[dict[str, Any]]]:
+    if not components or len(components) > MAX_COMPONENTS:
+        raise RuntimeError("组合 Dataset 组件为空或超过 128 个")
+    materialized: list[DatasetComponent] = []
+    manifests: list[dict[str, Any]] = []
+    for expected_ordinal, row in enumerate(components):
+        if int(row["ordinal"]) != expected_ordinal:
+            raise RuntimeError("组合 Dataset ordinal 必须从 0 连续递增")
+        child = repository.manifest(str(row["component_dataset_id"]), context)
+        component = _component_from_manifest(
+            child, row["effective_from"], row["effective_to"],
+        )
+        if child.get("status") != "FROZEN" or child.get("dataset_kind", "MATERIALIZED") != "MATERIALIZED":
+            raise RuntimeError(
+                f"组合 Dataset 只能引用 FROZEN MATERIALIZED 子集: {child['dataset_id']}"
+            )
+        proof = _json_document(child.get("quality_report"))
+        if (
+            not isinstance(proof, dict)
+            or proof.get("status") != "VALID"
+            or proof.get("issues") != []
+            or not str(child.get("quality_report_hash") or "").strip()
+        ):
+            raise RuntimeError(
+                f"FROZEN 子 Dataset 缺少有效质量报告证明: {child['dataset_id']}"
+            )
+        proof_counts = proof.get("validation_counts")
+        required_counts = (
+            "missing_execution_rows", "missing_execution_lineage",
+            "missing_limit_rows", "missing_calendar_lineage",
+            "future_dividend_rows", "invalid_dividend_dates",
+            "missing_dividend_lineage", "inconsistent_stock_rates",
+        )
+        if proof_counts is not None:
+            if not isinstance(proof_counts, dict) or any(
+                proof_counts.get(name) != 0 for name in required_counts
+            ):
+                raise RuntimeError(
+                    f"FROZEN 子 Dataset 的继承质量计数不完整或非零: {child['dataset_id']}"
+                )
+        elif any(proof.get(name) != 0 for name in (
+            "missing_execution_rows", "missing_limit_rows",
+        )):
+            raise RuntimeError(
+                f"旧版 FROZEN 子 Dataset 缺少可接受的质量计数证明: {child['dataset_id']}"
+            )
+        stored_input_hash = str(row["component_input_manifest_hash"] or "").strip()
+        stored_manifest_hash = str(row["component_manifest_hash"] or "").strip()
+        if (
+            stored_input_hash != component.input_manifest_hash
+            or stored_manifest_hash != component.manifest_hash
+            or str(row["component_baseline_tag"]) != component.baseline_tag
+            or str(row["component_baseline_quality_report_hash"] or "").strip()
+            != component.baseline_quality_report_hash
+        ):
+            raise RuntimeError(
+                f"组合 Dataset 子集身份或哈希已变化: {component.dataset_id}"
+            )
+        if not (
+            child["warmup_start"] <= component.effective_from
+            <= component.effective_to <= child["evaluation_end"]
+        ):
+            raise RuntimeError(
+                f"组合 Dataset 日期范围超出子集冻结范围: {component.dataset_id}"
+            )
+        materialized.append(component)
+        manifests.append(child)
+    assert_compatible_manifests(manifests)
+    return materialized, manifests
+
+
+def create_composite_dataset(
+    component_dataset_ids: Sequence[str],
+    dataset_name: str,
+    dataset_version: str,
+    *,
+    dataset_id: str | None = None,
+) -> str:
+    """Create a metadata-only, multi-baseline Dataset over frozen components.
+
+    The first ID may be a prior composite, which is flattened by reusing its
+    component references. Every following ID must be a newly frozen physical
+    extension Dataset. The new Dataset owns no copied market or snapshot rows.
+    """
+    if len(component_dataset_ids) < 2:
+        raise ValueError("至少需要一个历史 Dataset 和一个增量 Dataset")
+    if len(component_dataset_ids) > MAX_COMPONENTS:
+        raise ValueError(f"输入 Dataset 数量不能超过 {MAX_COMPONENTS}")
+    if not dataset_name or len(dataset_name) > 160:
+        raise ValueError("dataset_name must be between 1 and 160 characters")
+    if not dataset_version or len(dataset_version) > 40:
+        raise ValueError("dataset_version must be between 1 and 40 characters")
+    if len(set(component_dataset_ids)) != len(component_dataset_ids):
+        raise ValueError("component_dataset_ids 不能重复")
+
+    dataset_id = dataset_id or str(uuid.uuid4())
+    kernel, repository, context = _read_service("compose")
+    try:
+        top_level = [repository.manifest(str(item), context) for item in component_dataset_ids]
+        if any(row["status"] != "FROZEN" for row in top_level):
+            raise ValueError("只允许组合已 FROZEN 的 Backtest Dataset")
+
+        components: list[DatasetComponent] = []
+        leaves: list[dict[str, Any]] = []
+        first = top_level[0]
+        if first.get("dataset_kind", "MATERIALIZED") == "COMPOSITE":
+            prior_rows = repository.composition_components(str(first["dataset_id"]), context)
+            components, leaves = _read_component_leaves(repository, context, prior_rows)
+            if not components or components[-1].effective_to != first["evaluation_end"]:
+                raise RuntimeError("历史组合 Dataset 的组件范围与其 Manifest 截止日不一致")
+        else:
+            component = _component_from_manifest(
+                first, first["warmup_start"], first["evaluation_end"],
+            )
+            components.append(component)
+            leaves.append(first)
+
+        used_ids = {component.dataset_id for component in components}
+        for extension in top_level[1:]:
+            if extension.get("dataset_kind", "MATERIALIZED") != "MATERIALIZED":
+                raise ValueError("只有第一个输入可以是 COMPOSITE；后续输入必须是物化增量 Dataset")
+            extension_id = str(extension["dataset_id"])
+            if extension_id in used_ids:
+                raise ValueError(f"重复的物化组件 Dataset: {extension_id}")
+            prior_end = components[-1].effective_to
+            extension_end = extension["evaluation_end"]
+            if extension_end <= prior_end:
+                raise ValueError(
+                    f"增量 Dataset 未向后扩展日期范围: {extension_id}"
+                )
+            following_dates = repository.open_dates(prior_end, extension_end, context)
+            starts = [day for day in following_dates if day > prior_end]
+            if not starts:
+                raise ValueError(f"增量 Dataset 没有新增开市日: {extension_id}")
+            effective_from = starts[0]
+            if effective_from < extension["evaluation_start"]:
+                raise ValueError(
+                    f"增量 Dataset 在 {effective_from} 之前没有正式 Evaluation 快照: {extension_id}"
+                )
+            if extension_end not in following_dates:
+                raise ValueError(f"增量 Dataset 截止日不是有效 SSE 开市日: {extension_end}")
+            components.append(
+                _component_from_manifest(extension, effective_from, extension_end)
+            )
+            leaves.append(extension)
+            used_ids.add(extension_id)
+
+        if len(components) < 2:
+            raise ValueError("组合数据集至少需要两个物化冻结组件")
+        if len(components) > MAX_COMPONENTS:
+            raise ValueError(
+                f"组合组件超过安全上限 {MAX_COMPONENTS}；请按月或季度构建增量 Dataset"
+            )
+        assert_compatible_manifests(leaves)
+        root_start = components[0].effective_from
+        root_end = components[-1].effective_to
+        expected_dates = repository.open_dates(root_start, root_end, context)
+        validate_component_coverage(components, expected_dates)
+
+        latest_leaf = leaves[-1]
+        baseline = repository.baseline(str(latest_leaf["baseline"]), context)
+        if not baseline or baseline["status"] != "validated":
+            raise ValueError("最新组件的数据基线不存在或尚未 validated")
+        if baseline["baseline_cutoff_date"] < root_end:
+            raise ValueError("最新组件数据基线截止日早于组合 Dataset 结束日期")
+        if (
+            str(baseline["quality_report_hash"] or "").strip()
+            != str(latest_leaf["baseline_quality_report_hash"] or "").strip()
+            or str(baseline["source_manifest_hash"] or "").strip()
+            != str(latest_leaf["baseline_source_manifest_hash"] or "").strip()
+        ):
+            raise ValueError("最新组件与已验证数据基线的质量/来源哈希不一致")
+
+        metadata = _git_metadata()
+        root = {
+            "dataset_id": dataset_id,
+            "dataset_name": dataset_name,
+            "dataset_version": dataset_version,
+            "dataset_kind": "COMPOSITE",
+            "data_baseline_tag": latest_leaf["baseline"],
+            "baseline_quality_report_hash": latest_leaf["baseline_quality_report_hash"],
+            "baseline_source_manifest_hash": latest_leaf["baseline_source_manifest_hash"],
+            "schema_version": first["schema_version"],
+            "adapter_version": first["adapter_version"],
+            "feature_version": first["feature_version"],
+            "price_adjustment_mode": first["price_adjustment_mode"],
+            "warmup_start": components[0].effective_from,
+            "evaluation_start": first["evaluation_start"],
+            "evaluation_end": root_end,
+            "out_of_sample_start": first["out_of_sample_start"],
+            "calendar_rule_version": first["calendar_rule_version"],
+            "market_rule_version": first["market_rule_version"],
+            "fee_rule_version": first["fee_rule_version"],
+            "benchmark_code": first["benchmark_code"],
+            "selection_predicate": (
+                "ordered FROZEN MATERIALIZED Dataset components; each open date "
+                "belongs to exactly one component; facts are read-through, never copied"
+            ),
+            "selected_columns": _json_param(_json_document(first["selected_columns"])),
+            "hash_algorithm": first["hash_algorithm"],
+            "availability_rules": _json_param(_json_document(first["availability_rules"])),
+            "status": "DRAFT",
+            "code_version": metadata["code_version"],
+            "git_commit": metadata["commit"],
+            "git_dirty": metadata["dirty"],
+            "diff_hash": metadata["diff_hash"],
+            "notes": "Metadata-only composition; all source components remain independently FROZEN.",
+        }
+        try:
+            existing = repository.manifest(dataset_id, context)
+        except ValueError:
+            existing = None
+        if existing is None:
+            repository.create_manifest(root, context)
+        else:
+            _assert_resumable_composite_manifest(existing, root)
+
+        component_rows = []
+        for ordinal, component in enumerate(components):
+            component_rows.append({
+                "ordinal": ordinal,
+                "component_dataset_id": component.dataset_id,
+                "effective_from": component.effective_from,
+                "effective_to": component.effective_to,
+                "component_input_manifest_hash": component.input_manifest_hash,
+                "component_manifest_hash": component.manifest_hash,
+                "component_baseline_tag": component.baseline_tag,
+                "component_baseline_quality_report_hash": component.baseline_quality_report_hash,
+            })
+        assert_resumable_component_prefix(
+            repository.composition_components(
+                dataset_id, context, allow_empty=True,
+            ),
+            component_rows,
+        )
+        repository.create_composition_components(dataset_id, component_rows, context)
+        return dataset_id
+    finally:
+        kernel.close()
+
+
+def _validate_composite_dataset_impl(
+    dataset_id: str,
+    manifest: dict[str, Any],
+    repository: DatasetRepository,
+    context: RunContext,
+) -> dict[str, Any]:
+    if manifest.get("dataset_kind") != "COMPOSITE":
+        raise ValueError(f"Dataset 不是 COMPOSITE: {dataset_id}")
+    if manifest["status"] not in {"DRAFT", "BUILDING", "FAILED"}:
+        raise RuntimeError(f"组合 Dataset 当前不可校验: {manifest['status']}")
+    components, leaves = _read_component_leaves(
+        repository, context, repository.composition_components(dataset_id, context),
+    )
+    if len(components) < 2:
+        raise RuntimeError("组合 Dataset 至少需要两个有效组件")
+    assert_compatible_manifests(leaves)
+    expected_dates = repository.open_dates(
+        manifest["warmup_start"], manifest["evaluation_end"], context,
+    )
+    validate_component_coverage(components, expected_dates)
+    actual_component_dates = repository.dataset_open_dates(
+        dataset_id, manifest["warmup_start"], manifest["evaluation_end"], context,
+    )
+    if tuple(actual_component_dates) != tuple(expected_dates):
+        raise RuntimeError("组合 Dataset 子组件保存的交易日历存在缺失或多余日期")
+    if (
+        components[0].effective_from != manifest["warmup_start"]
+        or components[-1].effective_to != manifest["evaluation_end"]
+        or manifest["evaluation_start"] < manifest["warmup_start"]
+        or manifest["evaluation_end"] < manifest["evaluation_start"]
+    ):
+        raise RuntimeError("组合 Dataset 根 Manifest 日期范围与组件范围不一致")
+    for component, child in zip(components, leaves):
+        if component.effective_from > child["evaluation_start"] and component is components[0]:
+            raise RuntimeError("首个组件没有覆盖 Dataset warmup 起点")
+        if component.effective_from < child["evaluation_start"] and component is not components[0]:
+            raise RuntimeError("增量组件不能把 warmup 日期冒充为新 Evaluation 日期")
+    last = leaves[-1]
+    if (
+        manifest["baseline"] != last["baseline"]
+        or str(manifest["baseline_quality_report_hash"] or "").strip()
+        != str(last["baseline_quality_report_hash"] or "").strip()
+        or str(manifest["baseline_source_manifest_hash"] or "").strip()
+        != str(last["baseline_source_manifest_hash"] or "").strip()
+    ):
+        raise RuntimeError("组合 Dataset 根基线身份与最后一个组件不一致")
+    baseline = repository.baseline(manifest["baseline"], context)
+    if not baseline or baseline["status"] != "validated":
+        raise RuntimeError("组合 Dataset 绑定的数据基线不再处于 validated")
+    if baseline["baseline_cutoff_date"] < manifest["evaluation_end"]:
+        raise RuntimeError("组合 Dataset 的数据基线截止日覆盖不足")
+    if (
+        str(baseline["quality_report_hash"] or "").strip()
+        != str(manifest["baseline_quality_report_hash"] or "").strip()
+        or str(baseline["source_manifest_hash"] or "").strip()
+        != str(manifest["baseline_source_manifest_hash"] or "").strip()
+    ):
+        raise RuntimeError("组合 Dataset 与当前已验证基线哈希不一致")
+
+    contract_rows = repository.research_snapshot_contracts(dataset_id, context)
+    schemas = {str(row["research_schema_version"]) for row in contract_rows}
+    foundation_only = bool(contract_rows) and all(is_foundation_schema(item) for item in schemas)
+    component_foundation_pass = all(
+        _foundation_contract_audit_is_present(child) for child in leaves
+    )
+    if foundation_only and not component_foundation_pass:
+        raise RuntimeError("至少一个 Foundation 组件缺少已通过的财务身份门禁证明")
+    foundation_contract = {
+        "status": "PASS" if foundation_only else "NOT_APPLICABLE",
+        "audit_version": "foundation-financial-contract-v1",
+        "snapshot_count": len(contract_rows),
+        "issue_snapshot_count": 0,
+        "inherited_from_frozen_components": True,
+    }
+
+    input_hash = composition_hash(components)
+    component_hash_rows = [
+        {
+            "dataset_id": component.dataset_id,
+            "effective_from": component.effective_from,
+            "effective_to": component.effective_to,
+            "input_manifest_hash": component.input_manifest_hash,
+            "component_manifest_hash": component.manifest_hash,
+        }
+        for component in components
+    ]
+    counts = {
+        "missing_execution_rows": 0,
+        "missing_execution_lineage": 0,
+        "missing_limit_rows": 0,
+        "missing_calendar_lineage": 0,
+        "future_dividend_rows": 0,
+        "invalid_dividend_dates": 0,
+        "missing_dividend_lineage": 0,
+        "inconsistent_stock_rates": 0,
+    }
+    quality = {
+        "status": "VALID",
+        "issues": [],
+        "validation_mode": "FROZEN_COMPONENT_METADATA_AND_DATE_COVERAGE",
+        "materialized_fact_copy": False,
+        "member_count": len(expected_dates),
+        "component_count": len(components),
+        "components": component_hash_rows,
+        "foundation_financial_contract": foundation_contract,
+        "validation_counts": counts,
+    }
+    root_hashes = {
+        name: stable_hash({
+            "kind": name,
+            "components": [
+                {
+                    "dataset_id": component.dataset_id,
+                    "effective_from": component.effective_from.isoformat(),
+                    "effective_to": component.effective_to.isoformat(),
+                    "component_hash": child.get(f"{name}_hash"),
+                }
+                for component, child in zip(components, leaves)
+            ],
+        })
+        for name in (
+            "calendar", "rules", "execution", "corporate_action", "benchmark",
+        )
+    }
+    report_hash = _quality_report_hash(quality)
+    if manifest["status"] in {"DRAFT", "FAILED"}:
+        changed = repository.transition_manifest(
+            context, dataset_id, (manifest["status"],), "BUILDING",
+        )
+        if changed != 1:
+            raise RuntimeError("组合 Dataset 状态并发变化，不能进入 BUILDING")
+    fields = {
+        "input_manifest_hash": input_hash,
+        "calendar_hash": root_hashes["calendar"],
+        "rules_hash": root_hashes["rules"],
+        "execution_hash": root_hashes["execution"],
+        "corporate_action_hash": root_hashes["corporate_action"],
+        "benchmark_hash": root_hashes["benchmark"],
+        "quality_report": _json_param(quality),
+        "quality_report_hash": report_hash,
+    }
+    changed = repository.transition_manifest(
+        context, dataset_id, ("BUILDING",), "VALIDATED", fields,
+    )
+    if changed != 1:
+        raise RuntimeError("组合 Dataset 校验完成但状态转换失败")
+    return quality
+
+
+def _verify_frozen_composition(
+    manifest: dict[str, Any],
+    repository: DatasetRepository,
+    context: RunContext,
+) -> None:
+    """Verify only small immutable metadata/calendar ranges before a run."""
+    components, leaves = _read_component_leaves(
+        repository,
+        context,
+        repository.composition_components(str(manifest["dataset_id"]), context),
+    )
+    assert_compatible_manifests(leaves)
+    expected_hash = composition_hash(components)
+    if str(manifest.get("input_manifest_hash") or "").strip() != expected_hash:
+        raise RuntimeError("FROZEN COMPOSITE Dataset composition hash mismatch")
+    if (
+        components[0].effective_from != manifest["warmup_start"]
+        or components[-1].effective_to != manifest["evaluation_end"]
+        or manifest["baseline"] != leaves[-1]["baseline"]
+    ):
+        raise RuntimeError("FROZEN COMPOSITE Dataset root boundaries/provenance mismatch")
+    expected_dates = repository.open_dates(
+        manifest["warmup_start"], manifest["evaluation_end"], context,
+    )
+    validate_component_coverage(components, expected_dates)
+    frozen_component_calendar = repository.open_calendar(
+        str(manifest["dataset_id"]), context,
+    )
+    if tuple(expected_dates) != tuple(frozen_component_calendar):
+        raise RuntimeError("FROZEN COMPOSITE Dataset 的子集交易日历存在缺失或多余日期")
+
+
 def _json_param(value: Any):
     """将结构化值规范化为稳定 JSON 文本，由写入 Gateway 负责类型适配。"""
     return json.dumps(
@@ -689,6 +1184,16 @@ def _materialized_hashes(dataset_id: str) -> dict[str, Any]:
     """
     execution_hasher = _IncrementalRowHasher()
     execution_by_day: dict[date, dict[str, Any]] = {}
+    validation_counts = {
+        "missing_execution_rows": 0,
+        "missing_execution_lineage": 0,
+        "missing_limit_rows": 0,
+        "missing_calendar_lineage": 0,
+        "future_dividend_rows": 0,
+        "invalid_dividend_dates": 0,
+        "missing_dividend_lineage": 0,
+        "inconsistent_stock_rates": 0,
+    }
     last_key: tuple | None = None
     kernel, repository, context = _read_service("materialized-hashes")
     try:
@@ -721,12 +1226,50 @@ def _materialized_hashes(dataset_id: str) -> dict[str, Any]:
                 quality = row[-1]
                 quality_counts = stats["quality_counts"]
                 quality_counts[quality] = quality_counts.get(quality, 0) + 1
+                if quality == "MISSING_SOURCE":
+                    validation_counts["missing_execution_rows"] += 1
+                if (
+                    (row[12] is True or row[13] is True)
+                    and (
+                        row[17] is None
+                        or row[18] is None
+                        or row[19] is None
+                    )
+                ) or (row[11] is True and row[20] is None):
+                    validation_counts["missing_execution_lineage"] += 1
+                if (
+                    quality == "VALID"
+                    and row[11] is not True
+                    and (row[12] is True or row[13] is True)
+                    and (row[9] is None or row[10] is None)
+                ):
+                    validation_counts["missing_limit_rows"] += 1
             last_key = tuple(rows[-1][:2])
         calendar_rows = repository.materialized_calendar_rows(dataset_id, context)
+        validation_counts["missing_calendar_lineage"] = sum(
+            row[6] is None for row in calendar_rows
+        )
         dividend_rows = repository.materialized_dividend_rows(dataset_id, context)
         dividend_by_day: dict[date, list[tuple]] = {}
         for row in dividend_rows:
             dividend_by_day.setdefault(row[10], []).append(row)
+            ex_date = row[10]
+            available_date = row[13] or row[2] or row[1] or ex_date
+            if ex_date is not None and available_date is not None and available_date > ex_date:
+                validation_counts["future_dividend_rows"] += 1
+            if (
+                ex_date is not None
+                and ((row[11] is not None and row[11] < ex_date) or (row[12] is not None and row[12] < ex_date))
+            ):
+                validation_counts["invalid_dividend_dates"] += 1
+            if row[15] is None or row[16] is None:
+                validation_counts["missing_dividend_lineage"] += 1
+            if (
+                row[4] is not None
+                and (row[5] is not None or row[6] is not None)
+                and abs(row[4] - ((row[5] or 0) + (row[6] or 0))) > 1e-8
+            ):
+                validation_counts["inconsistent_stock_rates"] += 1
 
         # rules_hash 必须与 build 阶段使用完全相同的审计字段集合；
         # load_frozen_dataset 另外使用不含审批元数据的 rule_rows。
@@ -748,6 +1291,7 @@ def _materialized_hashes(dataset_id: str) -> dict[str, Any]:
         "corporate_action_hash": hash_rows(dividend_rows),
         "rules_hash": hash_rows(rule_audit_rows),
         "benchmark_hash": hash_rows(benchmark_rows),
+        "validation_counts": validation_counts,
     }
 
 
@@ -755,6 +1299,10 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
     kernel, repository, context = _read_service("validate")
     try:
         manifest = repository.manifest(dataset_id, context)
+        if manifest.get("dataset_kind", "MATERIALIZED") == "COMPOSITE":
+            return _validate_composite_dataset_impl(
+                dataset_id, manifest, repository, context,
+            )
         if manifest["status"] != "BUILDING":
             raise RuntimeError(f"只有 BUILDING Dataset 可校验: {manifest['status']}")
         _check_baseline(
@@ -823,7 +1371,11 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
             issues.append("Dataset 基准行情未逐日覆盖成员日期")
         if sorted(materialized["execution_by_day"]) != member_dates:
             issues.append("Dataset 成员日期与物化执行行情日期不一致")
-        counts = repository.validation_counts(dataset_id, context)
+        # _materialized_hashes already streamed every execution row to
+        # compute the immutable materialized hash.  Reusing these counters
+        # avoids a second set of full scans over the ~10GB execution table,
+        # which previously made validation hit the governed statement timeout.
+        counts = materialized["validation_counts"]
         for key, message in (
             ("missing_execution_rows", "执行行情缺失"),
             ("missing_execution_lineage", "执行行情 Raw 血缘不完整"),
@@ -844,6 +1396,11 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
             "baseline_quality_report_hash": manifest.get("baseline_quality_report_hash"),
             "baseline_source_manifest_hash": manifest.get("baseline_source_manifest_hash"),
             "foundation_financial_contract": foundation_contract_quality,
+            # Persist the exact counters produced while streaming the
+            # materialized Dataset.  The database freeze trigger verifies
+            # this immutable proof instead of rescanning the multi-GB child
+            # tables during the status transition.
+            "validation_counts": counts,
         }
         report_hash = _quality_report_hash(quality)
         if issues:
@@ -882,7 +1439,12 @@ def validate_dataset(dataset_id: str) -> dict[str, Any]:
         raise
 
 
-def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
+def freeze_dataset(
+    dataset_id: str,
+    code_archive_path: str | None = None,
+    *,
+    allow_validation_only: bool = False,
+):
     metadata = _git_metadata()
     if metadata["dirty"] and not code_archive_path:
         raise RuntimeError("正式冻结要求 Git 工作区干净；如需保留脏工作区，请提供 code_archive_path")
@@ -907,7 +1469,11 @@ def freeze_dataset(dataset_id: str, code_archive_path: str | None = None):
                     "必须重新 validate 后才能冻结"
                 )
         _check_baseline(manifest["baseline"], manifest["evaluation_end"], expected_quality_report_hash=manifest.get("baseline_quality_report_hash"), expected_source_manifest_hash=manifest.get("baseline_source_manifest_hash"))
-        _assert_build_code_current(manifest, metadata)
+        _assert_build_code_current(
+            manifest,
+            metadata,
+            allow_validation_only=allow_validation_only,
+        )
         changed = repository.transition_manifest(
             context, dataset_id, ("VALIDATED",), "FROZEN",
             {"code_archive_path": code_archive_path, "code_archive_sha256": archive_hash, "code_archive_size_bytes": archive_size, "code_version": metadata["code_version"], "git_commit": metadata["commit"], "git_dirty": metadata["dirty"], "diff_hash": metadata["diff_hash"]},
@@ -982,6 +1548,8 @@ def _resolve_frozen_window(
     manifest = repository.manifest(dataset_id, context)
     if manifest["status"] != "FROZEN":
         raise RuntimeError(f"鍙湁 FROZEN Dataset 鍙互鐢ㄤ簬姝ｅ紡鍥炴祴: {manifest['status']}")
+    if manifest.get("dataset_kind", "MATERIALIZED") == "COMPOSITE":
+        _verify_frozen_composition(manifest, repository, context)
     contract_rows = repository.research_snapshot_contracts(dataset_id, context)
     contract_schemas = {
         str(row["research_schema_version"]) for row in contract_rows
@@ -1361,6 +1929,14 @@ def main(argv=None):
     create.add_argument("--market-rule-version", default="cn-a-share-v2")
     create.add_argument("--fee-rule-version", default="research-fee-assumption-v3")
     create.add_argument("--benchmark-code", default="000300.SH")
+    compose = sub.add_parser("compose")
+    compose.add_argument(
+        "--component-dataset-id", action="append", required=True,
+        help="按时间顺序传入历史 Dataset/组合 Dataset，再传入新增冻结 Dataset；可重复",
+    )
+    compose.add_argument("--name", required=True)
+    compose.add_argument("--version", required=True)
+    compose.add_argument("--dataset-id", help="可选固定 ID，便于失败后恢复创建")
     build = sub.add_parser("build")
     build.add_argument("--dataset-id", required=True)
     validate = sub.add_parser("validate")
@@ -1380,6 +1956,11 @@ def main(argv=None):
                               market_rule_version=args.market_rule_version,
                               fee_rule_version=args.fee_rule_version,
                               benchmark_code=args.benchmark_code))
+    elif args.command == "compose":
+        print(create_composite_dataset(
+            args.component_dataset_id, args.name, args.version,
+            dataset_id=args.dataset_id,
+        ))
     elif args.command == "build":
         print(json.dumps(build_dataset(args.dataset_id), ensure_ascii=False, default=str))
     elif args.command == "validate":

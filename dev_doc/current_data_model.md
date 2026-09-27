@@ -777,3 +777,16 @@ Raw 与交易日历可支持的截止日为 `2026-08-06`。
 ## 2026-08-08 当前数据库复核
 
 当前源码契约为 `research-v1.3`、`backtest-dataset-v2`、`research-to-backtest-v2` 和 `daily-next-open-v2`。数据库尚未生成当前 v1.3 FROZEN 系列；现有 690 条 v1.1 FROZEN、1 条 v1.1 DRAFT，五年区间仍缺 522 个 SSE 开市日。旧 v1.1/v1.2 快照及 v1 Dataset/Run 记录保持不可变，仅作为历史烟测证据，不能描述为完整五年生产回测。
+
+## 2026-09-25 Tushare 行业每日观测
+
+行业来源使用 `stock_basic.industry`（股票基础资料接口的行业名称字段）。该接口提供抓取时的当前名称，不提供稳定行业代码和官方生效日期，因此每日记录只表示“仓库于该日观察到的行业名称”，不能倒推成正式业务生效区间。
+
+- 写入对象：`pit.industry_membership_daily`（行业每日归属观测表）；
+- 标识：`industry_system='TUSHARE_STOCK_BASIC'`、`industry_level=1`；`industry_code` 允许 `NULL`，不从名称伪造代码；
+- 证据状态：名称存在时为 `DAILY_CAPTURED`（每日采集），名称缺失时为 `UNKNOWN`（未知）。这两种状态都不会被当前 Observation（观察域）查询当作 `VALID` PIT 证据；
+- 时间：仅在上海时区交易日 17:00 后采集；`trade_date`/`source_asof_date` 是观察日期，`data_available_timestamp` 是接口响应抓取时间；历史指定日期运行不得用当前响应补写；
+- 幂等：同一交易日按股票代码、分类来源和层级唯一；同内容重跑不重复写；若进程中断造成部分写入，重试只补缺失股票；已有行内容变化则保留首次记录并失败提示，不原地覆盖；
+- 规模：每交易日约 5,500 行，只读写和校验单日范围，不扫描历史表、不回填历史。`sql/107_tushare_industry_daily_capture.sql` 已于 2026-09-25 应用到 `ashares` 生产库；首次行业观测安排在当日收盘后运行并验收。
+
+该每日观测只扩展行业数据留痕，不修改 Raw、Standard、Feature、Research Snapshot 或 Backtest Dataset 的历史结果。只有后续取得足够连续覆盖并通过独立证据门禁后，才能另行定义行业 PIT 有效状态。

@@ -11,6 +11,9 @@ from data_collect.jobs.tushare_derived_rebuild import rebuild_after_market
 from data_collect.jobs.tushare_job_lock import warehouse_write_job
 
 
+MAX_PRODUCTION_LOOKBACK_DAYS = 31
+
+
 def _parse_date(value: date | str | None) -> date:
     if value is None:
         return date.today()
@@ -20,9 +23,16 @@ def _parse_date(value: date | str | None) -> date:
 
 
 @warehouse_write_job
-def run(run_date=None, lookback_days: int = 5, dry_run: bool = False, **_kwargs) -> dict:
-    if lookback_days <= 0:
-        raise ValueError("lookback_days must be > 0")
+def run(
+    run_date=None, lookback_days: int = 5, dry_run: bool = False,
+    execution_id=None, **_kwargs,
+) -> dict:
+    if not 1 <= int(lookback_days) <= MAX_PRODUCTION_LOOKBACK_DAYS:
+        raise ValueError(
+            "production market-derived lookback_days must be in 1..31 "
+            "to keep output rebuilds bounded"
+        )
+    lookback_days = int(lookback_days)
     end_date = _parse_date(run_date)
     if dry_run:
         return {
@@ -46,7 +56,7 @@ def run(run_date=None, lookback_days: int = 5, dry_run: bool = False, **_kwargs)
         return {"status": "no_trading_days", "start_date": None, "end_date": None}
     first = datetime.strptime(trade_days[0], "%Y%m%d").date()
     last = datetime.strptime(trade_days[-1], "%Y%m%d").date()
-    result = rebuild_after_market(first, last)
+    result = rebuild_after_market(first, last, execution_id=execution_id)
     return {"status": "rebuilt", "start_date": first.isoformat(), "end_date": last.isoformat(), **result}
 
 

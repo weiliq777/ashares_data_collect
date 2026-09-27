@@ -34,20 +34,39 @@ from data_collect.features.financial_v2 import (
 )
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
-from data_collect.data_access.repository.financial_repository import FinancialRepository
+from data_collect.data_access.repository.financial_repository import (
+    FinancialRepository,
+)
 
 
 logger = logging.getLogger(__name__)
 CONTRACT_VERSION = "feature-contract-v2.0"
 TARGET_TABLE = "feature.company_financial_v2"
 VALUATION_TARGET_TABLE = "feature.valuation_daily_v1"
-# A full valuation rebuild publishes at most 20,000 rows per transaction.
-# Fifteen securities fit that budget for the observed daily grain while
-# amortizing staging/validation overhead; the publish loop still splits a
-# batch by actual row count before opening a transaction.
-VALUATION_CODE_BATCH_SIZE = max(
-    1, int(os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "15"))
-)
+# Valuation percentiles need a five-year, per-security input history. Keep
+# each SQL read narrow even if an operator overrides the batch size. At ~1,260
+# daily rows per security, 15 codes stay below the 25k row read cap. Writes
+# have their own independent transaction budget below.
+MAX_VALUATION_CODE_BATCH_SIZE = 15
+
+
+def _valuation_code_batch_size() -> int:
+    raw = os.getenv("ASHARES_VALUATION_CODE_BATCH_SIZE", "15")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "ASHARES_VALUATION_CODE_BATCH_SIZE must be an integer in 1..15"
+        ) from exc
+    if not 1 <= value <= MAX_VALUATION_CODE_BATCH_SIZE:
+        raise ValueError(
+            "ASHARES_VALUATION_CODE_BATCH_SIZE must be in 1..15; "
+            "larger batches can create oversized five-year valuation reads"
+        )
+    return value
+
+
+VALUATION_CODE_BATCH_SIZE = _valuation_code_batch_size()
 DEFAULT_FEATURE_BATCH_STOCKS = 5
 MAX_FEATURE_ROWS_PER_TRANSACTION = 20_000
 MAX_VALUATION_ROWS_PER_TRANSACTION = 20_000
@@ -580,7 +599,7 @@ def _write_partition(target_table: str, codes: list[str], rows: list[dict[str, A
     kernel, repository, context = _financial_access(run_id)
     try:
         return repository.publish_feature_partition(
-            target, rows, codes, output_start, output_end, context,
+            target_table, rows, codes, output_start, output_end, context,
         )
     finally:
         kernel.close()
@@ -599,54 +618,56 @@ def rebuild_company_financial_v2(
         raise ValueError("batch_stocks 必须为正整数")
     _target(target_table)
     kernel, repository, context = _financial_access(run_id)
-    codes = repository.stock_codes(warmup_start, output_end, context, requested_codes)
-    completed_keys = (
-        repository.completed_checkpoint_keys(run_id, "company_financial_v2", context)
-        if run_id else set()
-    )
-    attempted = written = completed = 0
-    for offset in range(0, len(codes), batch_stocks):
-        batch = codes[offset : offset + batch_stocks]
-        partition_key = f"{batch[0]}..{batch[-1]}"
-        if run_id and partition_key in completed_keys:
-            completed += 1
-            continue
-        if run_id:
-            repository.save_checkpoint(
-                run_id, "company_financial_v2", partition_key, "RUNNING", context
-            )
-        try:
-            events = _load_events(batch, warmup_start, output_end)
-            rows = calculate_features(events, output_start, output_end)
-            result_hash = hashlib.sha256(
-                json.dumps(
-                    rows, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"), default=str, allow_nan=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            count = repository.publish_feature_partition(
-                target_table, rows, batch, output_start, output_end, context
-            )
+    try:
+        codes = repository.stock_codes(warmup_start, output_end, context, requested_codes)
+        completed_keys = (
+            repository.completed_checkpoint_keys(run_id, "company_financial_v2", context)
+            if run_id else set()
+        )
+        attempted = written = completed = 0
+        for offset in range(0, len(codes), batch_stocks):
+            batch = codes[offset : offset + batch_stocks]
+            partition_key = f"{batch[0]}..{batch[-1]}"
+            if run_id and partition_key in completed_keys:
+                completed += 1
+                continue
             if run_id:
                 repository.save_checkpoint(
-                    run_id, "company_financial_v2", partition_key, "COMPLETED", context,
-                    len(rows), count, result_hash,
+                    run_id, "company_financial_v2", partition_key, "RUNNING", context
                 )
-            attempted += len(rows)
-            written += count
-            completed += 1
-            logger.info(
-                "company_financial_v2 partition=%s rows=%s", partition_key, count
-            )
-        except Exception as exc:
-            if run_id:
-                repository.save_checkpoint(
-                    run_id, "company_financial_v2", partition_key, "FAILED", context,
-                    error=str(exc)[:1000],
+            try:
+                events = _load_events(batch, warmup_start, output_end)
+                rows = calculate_features(events, output_start, output_end)
+                result_hash = hashlib.sha256(
+                    json.dumps(
+                        rows, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"), default=str, allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                count = repository.publish_feature_partition(
+                    target_table, rows, batch, output_start, output_end, context
                 )
-            raise
-    kernel.close()
-    return {"stocks": len(codes), "partitions": completed, "attempted": attempted, "written": written}
+                if run_id:
+                    repository.save_checkpoint(
+                        run_id, "company_financial_v2", partition_key, "COMPLETED", context,
+                        len(rows), count, result_hash,
+                    )
+                attempted += len(rows)
+                written += count
+                completed += 1
+                logger.info(
+                    "company_financial_v2 partition=%s rows=%s", partition_key, count
+                )
+            except Exception as exc:
+                if run_id:
+                    repository.save_checkpoint(
+                        run_id, "company_financial_v2", partition_key, "FAILED", context,
+                        error=str(exc)[:1000],
+                    )
+                raise
+        return {"stocks": len(codes), "partitions": completed, "attempted": attempted, "written": written}
+    finally:
+        kernel.close()
 
 
 def create_smoke_target(run_id: str) -> str:

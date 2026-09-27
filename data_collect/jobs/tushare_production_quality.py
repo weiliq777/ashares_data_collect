@@ -10,6 +10,9 @@ from data_collect.data_access.repository.phase2_raw_repository import Phase2RawR
 from data_collect.data_access.repository.production_quality_repository import ProductionQualityRepository
 
 
+MAX_QUALITY_LOOKBACK_DAYS = 31
+
+
 def _parse_date(value: date | str | None) -> date:
     if value is None:
         return date.today()
@@ -18,9 +21,16 @@ def _parse_date(value: date | str | None) -> date:
     return datetime.strptime(str(value).replace("-", ""), "%Y%m%d").date()
 
 
-def run(run_date=None, lookback_days: int = 5, dry_run: bool = False, **_kwargs) -> dict:
-    if lookback_days <= 0:
-        raise ValueError("lookback_days must be > 0")
+def run(
+    run_date=None,
+    lookback_days: int = 5,
+    dry_run: bool = False,
+    allow_empty_window: bool = False,
+    **_kwargs,
+) -> dict:
+    if not 1 <= int(lookback_days) <= MAX_QUALITY_LOOKBACK_DAYS:
+        raise ValueError("production quality lookback_days must be in 1..31")
+    lookback_days = int(lookback_days)
     end_date = _parse_date(run_date)
     if dry_run:
         return {
@@ -41,10 +51,20 @@ def run(run_date=None, lookback_days: int = 5, dry_run: bool = False, **_kwargs)
             start_date, end_date, context, lookback_days,
         )
         if not trade_days:
-            return {"status": "no_trading_days", "failures": []}
+            if allow_empty_window:
+                return {"status": "no_trading_days", "failures": []}
+            raise RuntimeError(
+                "production quality gate found no trading days; "
+                "calendar coverage is missing or stale"
+            )
         first = datetime.strptime(trade_days[0], "%Y%m%d").date()
         last = datetime.strptime(trade_days[-1], "%Y%m%d").date()
-        report = ProductionQualityRepository(kernel).inspect_window(first, last, context)
+        expected_dates = tuple(
+            datetime.strptime(value, "%Y%m%d").date() for value in trade_days
+        )
+        report = ProductionQualityRepository(kernel).inspect_window(
+            first, last, context, expected_dates=expected_dates,
+        )
     finally:
         kernel.close()
 

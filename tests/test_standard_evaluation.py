@@ -50,6 +50,19 @@ def test_calendar_evaluation_has_strategy_benchmark_and_excess_returns():
     assert rows[0]["benchmark_return"] == pytest.approx(0.10)
     assert rows[0]["excess_return"] == pytest.approx(-0.11)
     assert rows[0]["max_drawdown"] == pytest.approx(0.10)
+    assert rows[0]["activity_status"] == "UNKNOWN"
+    assert rows[0]["invested_days"] is None
+
+
+def test_calendar_evaluation_marks_complete_cash_only_period():
+    performance = [
+        {"trade_date": date(2024, 2, 1), "total_equity": 100, "daily_return": None, "position_value": 0},
+        {"trade_date": date(2024, 2, 2), "total_equity": 100, "daily_return": 0, "position_value": 0},
+    ]
+    rows = evaluate_calendar_periods(performance, [], "month")
+    assert rows[0]["activity_status"] == "CASH_ONLY"
+    assert rows[0]["invested_days"] == 0
+    assert rows[0]["cash_only_days"] == 2
 
 
 def test_rolling_evaluation_uses_bounded_trading_day_windows():

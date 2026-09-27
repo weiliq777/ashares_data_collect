@@ -51,6 +51,71 @@ news:
   rss_sources: []                        # RSSHub/RSS 源清单（二期）
 
 pipelines:
+  # 20:00 — Tushare 每日生产增量（Raw → Standard/PIT/Feature → 质量门禁）
+  # 运行前请在本机 config.yaml/.env 配置 Tushare 凭据；不要把密钥提交到仓库。
+  tushare_production_daily:
+    schedule:
+      hour: 20
+      minute: 0
+      timezone: "Asia/Shanghai"
+    tasks:
+      - name: production_instrument_raw
+        job: data_collect.jobs.a_share_instrument_tushare
+        platform: windows
+        timeout: 1200
+        retries: 1
+      - name: production_market_raw
+        job: data_collect.jobs.tushare_market_incremental_by_date
+        platform: windows
+        depends_on: [production_instrument_raw]
+        timeout: 7200
+        retries: 1
+        kwargs:
+          lookback_days: 20
+          rebuild_derived: false
+      - name: production_phase2_raw
+        job: data_collect.jobs.tushare_phase2_incremental
+        platform: windows
+        depends_on: [production_market_raw]
+        timeout: 7200
+        retries: 1
+        kwargs:
+          lookback_days: 20
+          event_lookback_days: 30
+          rebuild_standard: false
+      - name: production_market_derived
+        job: data_collect.jobs.tushare_production_market_derived
+        platform: windows
+        depends_on: [production_phase2_raw]
+        timeout: 14400
+        retries: 1
+        kwargs:
+          lookback_days: 20
+      - name: production_financial_raw
+        job: data_collect.jobs.tushare_financial_vip_incremental
+        platform: windows
+        depends_on: [production_phase2_raw]
+        timeout: 14400
+        retries: 1
+        kwargs:
+          lookback_days: 30
+          report_periods_back: 4
+          rebuild_derived: false
+      - name: production_financial_derived
+        job: data_collect.jobs.tushare_production_financial_derived
+        platform: windows
+        depends_on: [production_financial_raw]
+        timeout: 14400
+        retries: 1
+      - name: production_quality
+        job: data_collect.jobs.tushare_production_quality
+        platform: windows
+        depends_on: [production_market_derived, production_financial_derived]
+        timeout: 300
+        retries: 0
+        kwargs:
+          lookback_days: 20
+
   # 每日 15:30 主流水线
   daily:
     schedule:

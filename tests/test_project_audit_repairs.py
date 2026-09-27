@@ -80,11 +80,12 @@ def test_dataset_validation_has_failure_state_recovery_boundary():
     assert "_mark_dataset_validation_failed(dataset_id, exc)" in source
 
 
-def test_release_switch_is_atomic_and_respects_single_validated_index():
+def test_release_switch_is_atomic_and_scoped_to_its_validated_domain():
     source = Path("data_collect/data_access/write_gateway.py").read_text(encoding="utf-8")
     supersede_at = source.index("SET status='superseded'")
     validate_at = source.index("SET status='validated'")
     assert supersede_at < validate_at
+    assert "WHERE status='validated' AND baseline_domain=%s AND release_tag<>%s" in source
     job_source = Path("data_collect/jobs/tushare_release.py").read_text(encoding="utf-8")
     assert "repository.commit_validation" in job_source
 

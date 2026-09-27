@@ -82,7 +82,7 @@ class Wave3Repository(BaseRepository):
             100_000,
         )
 
-    def divid_factors(
+    def price_adjustment_factors(
         self,
         stock_codes: Sequence[str],
         context: RunContext,
@@ -91,22 +91,22 @@ class Wave3Repository(BaseRepository):
     ) -> list[dict[str, Any]]:
         if not stock_codes:
             return []
-        date_clause = ""
-        params: tuple[Any, ...] = (list(stock_codes),)
-        if start_date is not None and end_date is not None:
-            date_clause = " AND date >= %s AND date <= %s"
-            params = (list(stock_codes), start_date, end_date)
+        if start_date is None or end_date is None:
+            raise ValueError("price adjustment factor reads require a bounded date range")
         return self.kernel.read._repository_query(
             context,
-            "divid_factors",
-            f"SELECT stock_code,date,dr FROM divid_factors "
-            f"WHERE stock_code=ANY(%s){date_clause} ORDER BY stock_code,date",
-            params,
-            self._scope("wave3-divid", date_from=start_date, date_to=end_date),
-            # ReadGateway enforces the repository policy ceiling of 100,000
-            # rows.  A technical backfill already bounds this query by stock
-            # batch and warm-up window, so keeping the request at the ceiling
-            # preserves the bounded-read contract without weakening it.
+            "feature.price_adjustment_factor_asof",
+            """SELECT ts_code AS stock_code, trade_date,
+                      adj_adjustment_factor AS adjustment_factor
+                 FROM feature.price_adjustment_factor_asof
+                WHERE ts_code=ANY(%s)
+                  AND trade_date >= %s AND trade_date <= %s
+                  AND adj_adjustment_factor IS NOT NULL
+                ORDER BY ts_code,trade_date""",
+            (list(stock_codes), start_date, end_date),
+            self._scope("wave3-price-adjustment", date_from=start_date, date_to=end_date),
+            # The technical job bounds the query by stock batch and warm-up
+            # window.  Keep the repository read ceiling explicit.
             100_000,
         )
 

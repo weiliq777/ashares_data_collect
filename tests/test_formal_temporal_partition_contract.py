@@ -13,6 +13,15 @@ def test_release_contract_has_revocation_and_temporal_evidence():
     assert "DELETE FROM" not in sql
 
 
+def test_release_domains_keep_research_and_market_activity_baselines_independent():
+    sql = Path("sql/109_release_baseline_domains.sql").read_text(encoding="utf-8")
+    assert "baseline_domain IN ('RESEARCH', 'MARKET_ACTIVITY')" in sql
+    assert "ON ops.tushare_data_release (baseline_domain)" in sql
+    assert "WHERE status = 'validated'" in sql
+    assert "NEW.baseline_domain IS NOT DISTINCT FROM OLD.baseline_domain" in sql
+    assert "DELETE FROM" not in sql
+
+
 def test_snapshot_partition_target_is_additive_and_partitioned():
     sql = Path("sql/064_research_snapshot_partition_target.sql").read_text(encoding="utf-8")
     assert "PARTITION BY RANGE (research_date)" in sql

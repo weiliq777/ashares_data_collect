@@ -6,7 +6,11 @@ import pandas as pd
 
 from data_collect.data_access.dataset_policy import WriteMode
 from data_collect.data_access.policy_catalog import build_default_registry
-from data_collect.features.technical_daily import calculate_technical_features, to_feature_rows
+from data_collect.features.technical_daily import (
+    apply_adjustment_factor,
+    calculate_technical_features,
+    to_feature_rows,
+)
 from data_collect.jobs.backfill_technical_daily import bounded_windows, month_windows, stock_batches
 
 
@@ -34,6 +38,22 @@ def test_technical_features_preserve_indicator_contract_and_history_gate():
     assert result.iloc[20:]["quality_status"].eq("VALID").all()
     assert result["feature_contract_version"].eq("technical_daily_v1").all()
     assert len(to_feature_rows(result)) == len(result)
+
+
+def test_technical_features_use_daily_formal_adjustment_factor_for_ohlc():
+    prices = _prices(3)
+    factors = pd.DataFrame(
+        {
+            "stock_code": ["000001.SZ"] * 3,
+            "trade_date": prices["trade_date"],
+            "adjustment_factor": [2.0, 1.5, 1.0],
+        }
+    )
+    adjusted = apply_adjustment_factor(prices, factors)
+
+    assert adjusted["close"].tolist() == [20.4, 16.8, 12.2]
+    assert adjusted["open"].tolist() == [20.0, 16.5, 12.0]
+    assert np.allclose(adjusted["close_raw"], prices["close"])
 
 
 def test_wave3_reads_feature_output_instead_of_calculating_indicators():
@@ -75,11 +95,14 @@ def test_technical_backfill_is_monthly_and_resumable_by_design():
     assert "STOCK_BATCH_SIZE = 250" in Path("data_collect/jobs/technical_daily.py").read_text(encoding="utf-8")
 
 
-def test_wave3_dividend_read_stays_within_repository_policy_ceiling():
+def test_wave3_reads_formal_price_adjustment_factors_within_policy_ceiling():
     source = Path("data_collect/data_access/repository/wave3_repository.py").read_text(encoding="utf-8")
-    dividend_block = source.split("def divid_factors", 1)[1].split("def stock_summary", 1)[0]
-    assert "100_000," in dividend_block
-    assert "500_000," not in dividend_block
+    factor_block = source.split("def price_adjustment_factors", 1)[1].split("def stock_summary", 1)[0]
+    assert '"feature.price_adjustment_factor_asof"' in factor_block
+    assert "adj_adjustment_factor" in factor_block
+    assert "100_000," in factor_block
+    assert "500_000," not in factor_block
+    assert "divid_factors" not in factor_block
 
 
 def test_dividend_factor_schema_repair_is_additive():

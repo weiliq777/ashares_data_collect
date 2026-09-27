@@ -39,6 +39,12 @@ from data_collect.data_access.repository.dataset_repository import DatasetReposi
 _CONTRACT_SOURCE_ASSERTIONS = "m.research_date BETWEEN %s AND %s"
 # Contract text: DELETE FROM backtest.dataset_execution_bar
 # Contract text: trade_date BETWEEN %s AND %s
+# Keep each server-side FETCH below the governed statement timeout.  The
+# durable write/checkpoint batch remains five trading days; source reads use
+# one trading day because the source tables are large and their statistics can
+# make a multi-day plan choose an unstable nested-loop path.
+_SOURCE_FETCH_ROWS = 20_000
+_SOURCE_QUERY_DAYS = 1
 
 
 def _source_service(dataset_id: str, batch_start: date):
@@ -143,6 +149,8 @@ def _trading_batches(dataset_id: str, batch_days: int, repository: DatasetReposi
 
 def _prepare_manifest(dataset_id: str, repository: DatasetRepository, context: RunContext) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     manifest = repository.manifest(dataset_id, context)
+    if manifest.get("dataset_kind", "MATERIALIZED") != "MATERIALIZED":
+        raise RuntimeError("COMPOSITE Dataset 只读引用已有物料，不能执行物化 build")
     if manifest["status"] not in {"DRAFT", "FAILED", "BUILDING"}:
         raise RuntimeError(f"只有 DRAFT/FAILED/BUILDING Dataset 可分批构建: {manifest['status']}")
     baseline = _check_baseline(manifest["baseline"], manifest["evaluation_end"], expected_quality_report_hash=manifest.get("baseline_quality_report_hash"), expected_source_manifest_hash=manifest.get("baseline_source_manifest_hash"))
@@ -159,26 +167,35 @@ def _prepare_manifest(dataset_id: str, repository: DatasetRepository, context: R
     return manifest, boundaries, _git_metadata()
 
 
-def _build_execution_batch(dataset_id: str, batch_start: date, batch_end: date, boundaries: dict[str, Any], code_version: str, repository: DatasetRepository, context: RunContext) -> dict[str, Any]:
-    _set_batch_checkpoint(dataset_id, batch_start, batch_end, "RUNNING", code_version=code_version, details={"mode": "date_batch"}, repository=repository, context=context)
+def _build_execution_batch(dataset_id: str, batch_start: date, batch_end: date, source_days: list[date], boundaries: dict[str, Any], code_version: str, diff_hash: str, repository: DatasetRepository, context: RunContext) -> dict[str, Any]:
+    _set_batch_checkpoint(dataset_id, batch_start, batch_end, "RUNNING", code_version=code_version, details={"mode": "date_batch", "diff_hash": diff_hash}, repository=repository, context=context)
     try:
         repository.delete_execution_range(dataset_id, batch_start, batch_end, context)
         batch_hasher, per_day, pending, total = _IncrementalRowHasher(), {}, [], 0
         columns = ("dataset_id", "trade_date", "ts_code", "market", "raw_open", "raw_high", "raw_low", "raw_close", "volume", "amount", "up_limit", "down_limit", "is_suspended", "can_buy", "can_sell", "limit_status", "source_record_key", "source_record_version", "source_payload_hash", "limit_source_record_id", "limit_source_payload_hash", "suspend_source_record_id", "suspend_source_payload_hash", "quality_status")
-        for source_rows in repository.execution_source_batches(dataset_id, boundaries, batch_start, batch_end, context, 5000):
-            for source_row in source_rows:
-                values, quality = _transform_row(source_row, dataset_id)
-                pending.append(dict(zip(columns, values)))
-                batch_hasher.update(values[1:])
-                total += 1
-                stats = per_day.setdefault(values[1], {"hasher": _IncrementalRowHasher(), "count": 0, "valid": 0, "missing": 0, "invalid": 0, "warning": 0})
-                stats["hasher"].update(values[1:])
-                stats["count"] += 1
-                key = _quality_counter_key(quality)
-                stats[key] += 1
-                if len(pending) >= 5000:
-                    repository.write_execution_rows(pending, context, dataset_id)
-                    pending.clear()
+        # Keep the durable checkpoint at five trading days, but execute each
+        # source read one day at a time.  A multi-day source query can choose
+        # an unstable plan on a cold WSL2 cache and exceed the governed
+        # statement budget; daily sub-batches avoid that without changing the
+        # materialized result.
+        for offset in range(0, len(source_days), _SOURCE_QUERY_DAYS):
+            source_window = source_days[offset:offset + _SOURCE_QUERY_DAYS]
+            for source_rows in repository.execution_source_batches(
+                dataset_id, boundaries, source_window[0], source_window[-1], context, _SOURCE_FETCH_ROWS
+            ):
+                for source_row in source_rows:
+                    values, quality = _transform_row(source_row, dataset_id)
+                    pending.append(dict(zip(columns, values)))
+                    batch_hasher.update(values[1:])
+                    total += 1
+                    stats = per_day.setdefault(values[1], {"hasher": _IncrementalRowHasher(), "count": 0, "valid": 0, "missing": 0, "invalid": 0, "warning": 0})
+                    stats["hasher"].update(values[1:])
+                    stats["count"] += 1
+                    key = _quality_counter_key(quality)
+                    stats[key] += 1
+                    if len(pending) >= 5000:
+                        repository.write_execution_rows(pending, context, dataset_id)
+                        pending.clear()
         if pending:
             repository.write_execution_rows(pending, context, dataset_id)
         for day, stats in per_day.items():
@@ -188,7 +205,7 @@ def _build_execution_batch(dataset_id: str, batch_start: date, batch_end: date, 
             quality = "INVALID" if stats["invalid"] else "MISSING_SOURCE" if stats["missing"] else "WARNING" if stats["warning"] else "VALID"
             repository.update_batch_member(dataset_id, day, {"observation_row_count": member["observation_row_count"], "execution_row_count": stats["count"], "execution_hash": stats["hasher"].hexdigest(), "quality_status": quality}, context)
         result = {"batch_start": batch_start, "batch_end": batch_end, "rows": total, "hash": batch_hasher.hexdigest()}
-        _set_batch_checkpoint(dataset_id, batch_start, batch_end, "COMPLETED", row_count=total, batch_hash=result["hash"], code_version=code_version, details={"dates": len(per_day), "rows": total}, repository=repository, context=context)
+        _set_batch_checkpoint(dataset_id, batch_start, batch_end, "COMPLETED", row_count=total, batch_hash=result["hash"], code_version=code_version, details={"dates": len(per_day), "rows": total, "diff_hash": diff_hash}, repository=repository, context=context)
         return result
     except Exception as exc:
         _set_batch_checkpoint(dataset_id, batch_start, batch_end, "FAILED", code_version=code_version, error_message=str(exc)[:4000], repository=repository, context=context)
@@ -250,6 +267,7 @@ def _build_dataset_batched(dataset_id: str, *, batch_days: int = 5, force_rebuil
                 and checkpoint["status"] == "COMPLETED"
                 and checkpoint["batch_end"] == batch_end
                 and checkpoint["code_version"] == metadata["code_version"]
+                and (checkpoint.get("details") or {}).get("diff_hash") == metadata["diff_hash"]
                 and checkpoint["batch_hash"]
             )
             if checkpoint_is_eligible:
@@ -261,7 +279,7 @@ def _build_dataset_batched(dataset_id: str, *, batch_days: int = 5, force_rebuil
                     results.append({"batch_start": batch_start, "batch_end": batch_end, "rows": expected_rows, "skipped": True})
                     _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
                     continue
-            results.append(_build_execution_batch(dataset_id, batch_start, batch_end, boundaries, metadata["code_version"], repository, context))
+            results.append(_build_execution_batch(dataset_id, batch_start, batch_end, _days, boundaries, metadata["code_version"], metadata["diff_hash"], repository, context))
             _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
         repository.rebuild_auxiliary(dataset_id, manifest, boundaries, context)
         result = _finalize_build(dataset_id, manifest, metadata, repository, context)

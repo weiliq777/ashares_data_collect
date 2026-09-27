@@ -52,6 +52,8 @@ DATE_DATASETS = {
     "stk_limit": "tushare_stk_limit_raw",
 }
 ROW_LIMITS = {"stock_st": 1000, "stk_limit": 5800}
+MAX_INCREMENTAL_TRADE_DAYS = 31
+MAX_INCREMENTAL_EVENT_DAYS = 90
 INDEX_CODES = ("000300.SH", "000905.SH", "000852.SH", "000016.SH")
 
 
@@ -73,7 +75,7 @@ def _baseline_cutoff(explicit: str | None = None):
     finally:
         kernel.close()
     if value is None:
-        raise RuntimeError("未找到 validated 数据基线，请先建立历史发布点")
+        raise RuntimeError("未找到未撤销的 RESEARCH 数据发布水位，请先建立历史发布点")
     return value
 
 
@@ -215,6 +217,7 @@ def _run_dividend(
     pause: float,
     dry_run: bool,
     affected_ex_dates: list[date] | None = None,
+    affected_codes: set[str] | None = None,
 ) -> int:
     """按公告/实施公告日期查询，不再逐只股票扫描。"""
     total = 0
@@ -229,6 +232,12 @@ def _run_dividend(
                 elif rows == 0:
                     _checkpoint("dividend_incremental", key, "empty", 0, "接口返回空数据")
                 else:
+                    if affected_codes is not None and "ts_code" in frame.columns:
+                        affected_codes.update(
+                            str(value).strip()
+                            for value in frame["ts_code"].dropna().tolist()
+                            if str(value).strip()
+                        )
                     if affected_ex_dates is not None and "ex_date" in frame.columns:
                         affected_ex_dates.extend(
                             value.date()
@@ -253,6 +262,52 @@ def _run_dividend(
                 raise
             time.sleep(float(pause))
     return total
+
+
+def _rebuild_dividend_incremental(
+    *, codes: list[str], ex_dates: list[date], output_end: date, execution_id: str,
+) -> dict:
+    """Propagate fetched dividend rows through bounded code/date scopes only."""
+    securities = sorted({str(code).strip() for code in codes if str(code).strip()})
+    if not securities:
+        return {"status": "no_changed_codes", "standard_rows": 0, "price_rows": 0, "return_rows": 0}
+
+    from data_collect.jobs.tushare_phase2_standard import run as standard_run
+    standard_result = standard_run(
+        "dividend", dividend_codes=securities,
+    )
+    valid_ex_dates = sorted({day for day in ex_dates if day <= output_end})
+    if not valid_ex_dates:
+        return {
+            "status": "standard_only_no_effective_ex_date",
+            "codes": len(securities),
+            "standard_rows": standard_result.get("dividend", 0),
+            "price_rows": 0,
+            "return_rows": 0,
+        }
+
+    from data_collect.jobs.tushare_phase2_features import run as feature_run
+    start = min(valid_ex_dates)
+    end = output_end
+    price_result = feature_run(
+        "price_v2", start, end,
+        execution_id=f"phase2-dividend-{execution_id}",
+        codes=securities,
+    )
+    return_result = feature_run(
+        "shareholder_return", start, end, codes=securities,
+    )
+    result = {
+        "status": "rebuilt",
+        "codes": len(securities),
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "standard_rows": standard_result.get("dividend", 0),
+        "price_rows": price_result.get("price_v2", 0),
+        "return_rows": return_result.get("shareholder_return", 0),
+    }
+    logger.info("bounded dividend derived rebuild result=%s", result)
+    return result
 
 
 def _run_namechange(pro, start: str, end: str, batch_id: str, pause: float, dry_run: bool) -> int:
@@ -308,6 +363,8 @@ def _rebuild_standard(
     datasets: set[str],
     start_date: date | str | None = None,
     end_date: date | str | None = None,
+    *,
+    dividend_codes=None,
 ):
     from data_collect.jobs.tushare_phase2_standard import run as rebuild
 
@@ -322,7 +379,10 @@ def _rebuild_standard(
         tasks.add("index_daily")
     for task in sorted(tasks):
         logger.info("rebuilding phase2 standard task=%s", task)
-        rebuild(task, start_date, end_date)
+        if task == "dividend" and dividend_codes is not None:
+            rebuild(task, start_date, end_date, dividend_codes=dividend_codes)
+        else:
+            rebuild(task, start_date, end_date)
     from data_collect.jobs.tushare_phase2_features import run as rebuild_features
 
     feature_tasks = set()
@@ -338,6 +398,17 @@ def _rebuild_standard(
         for task in sorted(feature_tasks):
             logger.info("rebuilding phase2 feature task=%s", task)
             rebuild_features(task, start_date, end_date)
+    if datasets & set(DATE_DATASETS):
+        # Keep the scheduled 18:00 path equivalent to the unified production
+        # path: technical_daily_v1 is a required market-derived producer, not
+        # an optional external side job.
+        from data_collect.jobs.technical_daily import build as build_technical_daily
+
+        build_technical_daily(
+            start_date,
+            end_date,
+            run_id=f"technical-daily-phase2-{start_date}-{end_date}",
+        )
 
 
 @warehouse_write_job
@@ -349,14 +420,26 @@ def run(
     dataset: str = "all",
     baseline_cutoff: str | None = None,
     dry_run: bool = False,
-    rebuild_standard: bool = False,
+    rebuild_standard: bool | None = None,
+    rebuild_derived: bool | None = None,
     run_date: str | None = None,
 ) -> str:
+    # ``rebuild_standard`` is the canonical Python API name.  Keep the
+    # historical scheduler spelling as a strict, non-ambiguous alias because
+    # the deployment config is intentionally local/ignored and may lag the
+    # checked-in job code.  Conflicting values fail closed.
+    if rebuild_derived is not None:
+        if rebuild_standard is not None and rebuild_standard != rebuild_derived:
+            raise ValueError("rebuild_standard and rebuild_derived conflict")
+        rebuild_standard = bool(rebuild_derived)
+    rebuild_standard = bool(rebuild_standard)
     allowed = {"all", "date", "dividend", "namechange", "index_daily"}
     if dataset not in allowed:
         raise ValueError(f"不支持的数据集: {dataset}")
-    if lookback_days <= 0 or event_lookback_days <= 0:
-        raise ValueError("lookback_days 和 event_lookback_days 必须大于 0")
+    if not 1 <= int(lookback_days) <= MAX_INCREMENTAL_TRADE_DAYS:
+        raise ValueError("lookback_days 必须在 1..31；历史回填请使用专用分批任务")
+    if not 1 <= int(event_lookback_days) <= MAX_INCREMENTAL_EVENT_DAYS:
+        raise ValueError("event_lookback_days 必须在 1..90；历史回填请使用专用分批任务")
 
     if end_date and run_date and str(end_date).replace("-", "") != str(run_date).replace("-", ""):
         raise ValueError("end_date 与 run_date 不一致")
@@ -389,6 +472,7 @@ def run(
     if selected & set(DATE_DATASETS) and trade_days:
         total += _run_date_datasets(pro, trade_days, batch_id, batch_pause, dry_run)
     dividend_ex_dates: list[date] = []
+    dividend_codes: set[str] = set()
     if "dividend" in selected and event_days:
         total += _run_dividend(
             pro,
@@ -397,23 +481,32 @@ def run(
             batch_pause,
             dry_run,
             affected_ex_dates=dividend_ex_dates,
+            affected_codes=dividend_codes,
         )
     if "namechange" in selected and event_days:
         total += _run_namechange(pro, event_days[0], event_days[-1], batch_id, batch_pause, dry_run)
     if "index_daily" in selected and trade_days:
         total += _run_index(pro, trade_days[0], trade_days[-1], batch_id, batch_pause, dry_run)
     if rebuild_standard and not dry_run:
-        affected_days = [
+        market_affected_days = [
             datetime.strptime(value, "%Y%m%d").date()
             for value in [*trade_days, *event_days]
         ]
-        # A corrected historical dividend changes total-return coordinates and
-        # rolling shareholder-return features from its ex-date onward.
-        affected_days.extend(value for value in dividend_ex_dates if value <= end_dt)
-        derived_start = min(affected_days) if affected_days else None
-        derived_end = end_dt if affected_days else None
-        if affected_days:
-            _rebuild_standard(selected, derived_start, derived_end)
+        derived_start = min(market_affected_days) if market_affected_days else None
+        derived_end = end_dt if market_affected_days else None
+        if market_affected_days:
+            # Dividend Raw is converted through a code-scoped repository path;
+            # never invoke the legacy all-Raw dividend reconstruction here.
+            other_selected = selected - {"dividend"}
+            if other_selected:
+                _rebuild_standard(other_selected, derived_start, derived_end)
+    if not dry_run and "dividend" in selected and dividend_codes:
+        _rebuild_dividend_incremental(
+            codes=sorted(dividend_codes),
+            ex_dates=dividend_ex_dates,
+            output_end=end_dt,
+            execution_id=batch_id,
+        )
     return f"阶段二增量完成 batch_id={batch_id} cutoff={cutoff} total_inserted={total}"
 
 

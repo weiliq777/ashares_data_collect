@@ -6,6 +6,7 @@ import json
 import uuid
 from contextlib import contextmanager
 from datetime import date, timedelta
+from typing import Any
 
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
@@ -91,23 +92,60 @@ def _mark_run(run_id: str, status: str, error: str | None = None):
         kernel.close()
 
 
-def resume_run(run_id: str, mode: str, output_end: date) -> None:
+def _decode_run_parameters(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("foundation run parameters are not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("foundation run parameters must be a JSON object")
+    return dict(value)
+
+
+def resume_run(
+    run_id: str,
+    mode: str,
+    output_end: date,
+    *,
+    requested_reuse_standard: bool | None = None,
+) -> bool:
     from data_collect.jobs.research_snapshot import _git_metadata
 
     kernel, repository, context = _pipeline_access(run_id)
     try:
         metadata = _git_metadata()
-        previous = repository.foundation_run_metadata(run_id, context).get("git_commit")
+        run_metadata = repository.foundation_run_metadata(run_id, context)
+        parameters = _decode_run_parameters(run_metadata.get("parameters"))
+        original_reuse_standard = parameters.get("reuse_standard")
+        if not isinstance(original_reuse_standard, bool):
+            raise RuntimeError(
+                "foundation run is missing immutable reuse_standard parameter"
+            )
+        if (
+            requested_reuse_standard is not None
+            and requested_reuse_standard != original_reuse_standard
+        ):
+            raise RuntimeError(
+                "resume reuse_standard does not match the original foundation run"
+            )
+        stored_identities = parameters.get("_stage_code_identities")
+        if not isinstance(stored_identities, dict) or not stored_identities:
+            raise RuntimeError(
+                "foundation run is missing immutable stage code identities"
+            )
         current_identities = stage_code_identities()
-        previous_identities = stage_code_identities(str(previous).strip()) if previous else {}
+        all_stages = sorted(set(stored_identities) | set(current_identities))
         stage_pairs = {
-            stage: (previous_identities.get(stage), current)
-            for stage, current in current_identities.items()
+            stage: (stored_identities.get(stage), current)
+            for stage in all_stages
+            for current in (current_identities.get(stage),)
         }
         repository.resume_run(
             run_id, mode, output_end, metadata, context,
             stage_identities=stage_pairs,
         )
+        return original_reuse_standard
     finally:
         kernel.close()
 
@@ -214,7 +252,7 @@ def run_production_derived(
     output_end: date | None = None,
     batch_stocks: int = DEFAULT_FEATURE_BATCH_STOCKS,
     run_id: str | None = None,
-    reuse_standard: bool = False,
+    reuse_standard: bool | None = None,
 ) -> dict:
     assert_migration_applied()
     output_end = output_end or latest_completed_trade_date()
@@ -225,8 +263,14 @@ def run_production_derived(
         kernel.close()
     with _run_lock("PRODUCTION"):
         if run_id:
-            resume_run(run_id, "PRODUCTION", output_end)
+            reuse_standard = resume_run(
+                run_id,
+                "PRODUCTION",
+                output_end,
+                requested_reuse_standard=reuse_standard,
+            )
         else:
+            reuse_standard = bool(reuse_standard)
             run_id = create_run(
                 "PRODUCTION", WARMUP_START, OUTPUT_START, output_end,
                 {
@@ -276,7 +320,7 @@ def main():
     parser.add_argument("--batch-stocks", type=int, default=DEFAULT_FEATURE_BATCH_STOCKS)
     parser.add_argument("--run-id")
     parser.add_argument(
-        "--reuse-standard", action="store_true",
+        "--reuse-standard", action="store_true", default=None,
         help="reuse the existing validated Standard layer and rebuild only Feature/quality stages",
     )
     args = parser.parse_args()

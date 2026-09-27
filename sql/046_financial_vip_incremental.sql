@@ -17,10 +17,15 @@ CREATE TABLE IF NOT EXISTS financial_change_queue (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP,
+    available_date DATE,
+    processed_through DATE,
+    quarantine_resolved_by VARCHAR(160),
+    quarantine_resolved_at TIMESTAMP,
+    quarantine_resolution_reason TEXT,
     UNIQUE (dataset, business_key, payload_hash),
     CHECK (status IN (
         'PENDING', 'RUNNING', 'DONE', 'FAILED',
-        'COVERAGE_BLOCKED', 'QUARANTINED'
+        'COVERAGE_BLOCKED', 'QUARANTINED', 'RESOLVED'
     ))
 );
 

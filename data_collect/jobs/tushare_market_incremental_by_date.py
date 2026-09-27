@@ -57,10 +57,11 @@ ROW_LIMITS = {
     "daily_basic": 6000,
     "adj_factor": 6000,
 }
+MAX_INCREMENTAL_TRADE_DAYS = 31
 
 
-def _validated_baseline_cutoff(explicit: str | None = None):
-    """读取已验收历史基线，增量任务不跨越冻结点。"""
+def _research_baseline_cutoff(explicit: str | None = None):
+    """读取 Research 发布水位；没有当前 validated 时可回退到 superseded。"""
     if explicit:
         return market_shared._date(explicit)
     kernel = DataAccessKernel(policy_registry=build_default_registry())
@@ -69,14 +70,9 @@ def _validated_baseline_cutoff(explicit: str | None = None):
         code_version="unknown", config_hash="unknown", pipeline_version="v1",
     )
     try:
-        return MarketRepository(kernel).validated_baseline_cutoff(context)
+        return MarketRepository(kernel).baseline_cutoff(context)
     finally:
         kernel.close()
-    if not row:
-        raise RuntimeError(
-            "未找到 validated 数据基线；请先建立历史发布点，或显式传入 baseline_cutoff"
-        )
-    return row[0]
 
 
 def _normalize_for_count(dataset: str, frame: pd.DataFrame) -> pd.DataFrame:
@@ -258,8 +254,8 @@ def run(
     ``limit_stocks`` 和 ``dry_run`` 仅用于小范围验证，正式任务不应使用
     ``limit_stocks``，否则该批次不是完整的全市场快照。
     """
-    if int(lookback_days) <= 0:
-        raise ValueError("lookback_days 必须大于 0")
+    if not 1 <= int(lookback_days) <= MAX_INCREMENTAL_TRADE_DAYS:
+        raise ValueError("lookback_days 必须在 1..31；历史回填请使用专用分批任务")
     if dataset not in {"all", *DATASETS}:
         raise ValueError(f"不支持的数据集: {dataset}")
     if limit_stocks is not None and int(limit_stocks) <= 0:
@@ -280,7 +276,7 @@ def run(
     if not dry_run:
         market_shared._version_and_snapshot("trade_cal", calendar, batch_id)
 
-    cutoff = _validated_baseline_cutoff(baseline_cutoff)
+    cutoff = _research_baseline_cutoff(baseline_cutoff)
     calendar = calendar[pd.to_datetime(calendar["cal_date"]) > pd.Timestamp(cutoff)]
     if calendar.empty:
         return f"最近 {lookback_days} 个交易日均不晚于历史基线 {cutoff}，无需增量"

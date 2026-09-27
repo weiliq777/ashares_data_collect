@@ -289,12 +289,19 @@ def test_bounded_standard_rebuild_deletes_only_requested_dates():
     repo = SecurityRepository(kernel)
     bounds = (date(2026, 8, 5), date(2026, 8, 6))
     repo.rebuild_status_daily(WorkScope(date_from=bounds[0], date_to=bounds[1]), _da_context())
-    captured = conn.executed[0]
+    captured = next(
+        item for item in conn.executed
+        if "DELETE FROM std.security_status_daily" in item["sql"]
+    )
 
     assert "TRUNCATE TABLE std.security_status_daily" not in captured["sql"]
     assert "DELETE FROM std.security_status_daily" in captured["sql"]
     assert "cal_date BETWEEN %s AND %s" in captured["sql"]
-    assert captured["params"] == (*bounds, *bounds, *bounds)
+    assert captured["params"] == (
+        date(2026, 8, 5), date(2026, 8, 5),
+        date(2026, 8, 5), date(2026, 8, 5),
+        date(2026, 8, 5), date(2026, 8, 5),
+    )
     assert "FROM tushare_stk_limit_raw" in captured["sql"]
     assert "WHERE trade_date BETWEEN %s AND %s" in captured["sql"]
 
@@ -305,7 +312,10 @@ def test_tradeability_blocks_limit_direction():
     PitRepository(kernel).rebuild_tradeability(
         WorkScope(date_from=date(2026, 8, 5), date_to=date(2026, 8, 6)), _da_context()
     )
-    captured = conn.executed[0]
+    captured = next(
+        item for item in conn.executed
+        if "DELETE FROM pit.security_tradeability_daily" in item["sql"]
+    )
 
     assert "is_tradeable AND limit_status <> 'UP_LIMIT'" in captured["sql"]
     assert "is_tradeable AND limit_status <> 'DOWN_LIMIT'" in captured["sql"]
@@ -324,6 +334,50 @@ def test_dividend_business_key_survives_corrected_event_dates():
     business_key = sql.split("AS business_key", 1)[0].rsplit("ts_code ||", 1)[1]
     assert "record_date" not in business_key
     assert "ex_date" not in business_key
+
+
+def test_incremental_dividend_standard_rebuild_is_scoped_to_five_code_batches():
+    conn = FakeConnection()
+    kernel = DataAccessKernel(policy_registry=build_default_registry(), connection_factory=lambda: conn)
+    codes = [f"00000{i}.SZ" for i in range(7)]
+    SecurityRepository(kernel).rebuild_dividend_codes(_da_context(), codes)
+
+    writes = [item for item in conn.executed if "INSERT INTO std.dividend_event" in item["sql"]]
+    assert len(writes) == 2
+    assert all("WHERE ts_code = ANY(%s)" in item["sql"] for item in writes)
+    assert [item["params"][0] for item in writes] == [codes[:5], codes[5:]]
+
+
+def test_incremental_dividend_rebuild_propagates_only_changed_codes_and_effective_window(monkeypatch):
+    standard_calls = []
+    feature_calls = []
+    monkeypatch.setattr(
+        tushare_phase2_standard,
+        "run",
+        lambda task, *args, **kwargs: (
+            standard_calls.append((task, kwargs.get("dividend_codes"))) or {"dividend": 4}
+        ),
+    )
+    monkeypatch.setattr(
+        tushare_phase2_features,
+        "run",
+        lambda task, *args, **kwargs: feature_calls.append((task, args, kwargs)) or {task: 8},
+    )
+
+    result = tushare_phase2_incremental._rebuild_dividend_incremental(
+        codes=["600000.SH", "600000.SH", "000001.SZ"],
+        ex_dates=[date(2025, 3, 1), date(2026, 10, 1)],
+        output_end=date(2026, 9, 27),
+        execution_id="same-parent-attempt",
+    )
+
+    assert standard_calls[-1] == ("dividend", ["000001.SZ", "600000.SH"])
+    assert [call[0] for call in feature_calls] == ["price_v2", "shareholder_return"]
+    assert feature_calls[0][1] == (date(2025, 3, 1), date(2026, 9, 27))
+    assert feature_calls[0][2]["codes"] == ["000001.SZ", "600000.SH"]
+    assert feature_calls[0][2]["execution_id"] == "phase2-dividend-same-parent-attempt"
+    assert feature_calls[1][2]["codes"] == ["000001.SZ", "600000.SH"]
+    assert result["status"] == "rebuilt"
 
 
 def test_bounded_price_rebuild_preserves_other_dates():
@@ -345,6 +399,7 @@ def test_bounded_price_rebuild_preserves_other_dates():
 def test_market_derived_orchestrator_propagates_date_bounds(monkeypatch):
     standard_calls = []
     feature_calls = []
+    technical_calls = []
     bounds = (date(2026, 8, 5), date(2026, 8, 6))
 
     monkeypatch.setattr(
@@ -357,8 +412,14 @@ def test_market_derived_orchestrator_propagates_date_bounds(monkeypatch):
     monkeypatch.setattr(
         tushare_phase2_features,
         "run",
-        lambda task, start_date=None, end_date=None: (
-            feature_calls.append((task, start_date, end_date)) or {task: 1}
+        lambda task, start_date=None, end_date=None, **kwargs: (
+            feature_calls.append((task, start_date, end_date, kwargs)) or {task: 1}
+        ),
+    )
+    monkeypatch.setattr(
+        "data_collect.jobs.technical_daily.build",
+        lambda start_date, end_date, *, run_id: (
+            technical_calls.append((start_date, end_date, run_id)) or 1
         ),
     )
 
@@ -370,13 +431,15 @@ def test_market_derived_orchestrator_propagates_date_bounds(monkeypatch):
         ("tradeability", *bounds),
     ]
     assert feature_calls == [
-        ("price_v2", *bounds),
-        ("valuation", *bounds),
+        ("price_v2", *bounds, {"execution_id": None}),
+        ("valuation", *bounds, {}),
     ]
+    assert technical_calls == [(bounds[0], bounds[1], f"technical-daily-market-derived-{bounds[0]}-{bounds[1]}")]
 
 
 def test_phase2_incremental_keeps_legacy_price_v1_out_of_daily_path(monkeypatch):
     feature_calls = []
+    technical_calls = []
     monkeypatch.setattr(
         tushare_phase2_standard,
         "run",
@@ -389,12 +452,22 @@ def test_phase2_incremental_keeps_legacy_price_v1_out_of_daily_path(monkeypatch)
             feature_calls.append((task, start_date, end_date)) or {task: 1}
         ),
     )
+    monkeypatch.setattr(
+        "data_collect.jobs.technical_daily.build",
+        lambda start_date, end_date, *, run_id: (
+            technical_calls.append((start_date, end_date, run_id)) or 1
+        ),
+    )
 
     tushare_phase2_incremental._rebuild_standard(
         {"stock_st"}, date(2026, 8, 5), date(2026, 8, 6)
     )
 
     assert [task for task, _, _ in feature_calls] == ["price_v2", "valuation"]
+    assert technical_calls == [
+        (date(2026, 8, 5), date(2026, 8, 6),
+         "technical-daily-phase2-2026-08-05-2026-08-06")
+    ]
 
 
 def test_financial_derived_orchestrator_requires_changed_stock_scope(monkeypatch):
@@ -426,6 +499,7 @@ def test_bounded_price_v2_rebuild_never_truncates():
     assert "TRUNCATE TABLE" not in sql
     assert "DELETE FROM feature.price_daily_v2 WHERE ts_code=ANY(%s)" in sql
     assert "DELETE FROM feature.price_adjustment_factor_asof WHERE ts_code=ANY(%s)" in sql
+    assert "SELECT DISTINCT ON (source, source_record_key)" in sql
     assert conn.committed == 2
 
 
@@ -440,10 +514,28 @@ def test_bounded_shareholder_return_preserves_other_dates():
 
     assert "TRUNCATE TABLE feature.shareholder_return_v1" not in captured["sql"]
     assert "DELETE FROM feature.shareholder_return_v1" in captured["sql"]
+    assert "SELECT DISTINCT ON (source, source_record_key)" in captured["sql"]
     assert "WHERE d.stock_code=ANY(%s) AND d.trade_date BETWEEN %s AND %s" in captured["sql"]
     assert captured["params"] == (
-        ["000001.SZ"], *bounds, ["000001.SZ"], *bounds
+        ["000001.SZ"], *bounds, ["000001.SZ"], ["000001.SZ"], *bounds
     )
+
+
+def test_shareholder_return_splits_long_date_ranges_into_year_transactions():
+    conn = FakeConnection()
+    kernel = DataAccessKernel(policy_registry=build_default_registry(), connection_factory=lambda: conn)
+    FeatureRepository(kernel).rebuild_shareholder_return(
+        WorkScope(date_from=date(2023, 1, 1), date_to=date(2025, 1, 1)),
+        _da_context(),
+        ["000001.SZ"],
+    )
+
+    writes = [item for item in conn.executed if "DELETE FROM feature.shareholder_return_v1" in item["sql"]]
+    assert len(writes) == 3
+    for item in writes:
+        start, end = item["params"][1:3]
+        assert (end - start).days < 366
+        assert item["params"][3] == ["000001.SZ"]
 
 
 def test_heavy_warehouse_lock_commits_acquire_and_always_unlocks(monkeypatch):

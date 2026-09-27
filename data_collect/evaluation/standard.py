@@ -145,6 +145,16 @@ def evaluate_calendar_periods(
         dates = [item[0] for item in items]
         equities = [_number(item[1].get("total_equity")) for item in items]
         equity_values = [value for value in equities if value is not None]
+        position_values = [_number(item[1].get("position_value")) for item in items]
+        known_position_values = [value for value in position_values if value is not None]
+        invested_days = sum(value > 0 for value in known_position_values)
+        activity_status = (
+            "UNKNOWN"
+            if len(known_position_values) != len(items)
+            else "CASH_ONLY"
+            if invested_days == 0
+            else "INVESTED"
+        )
         strategy_return = _compound(strategy_returns.get(item) for item in dates)
         benchmark_return = _compound(benchmark_returns.get(item) for item in dates)
         output.append({
@@ -161,6 +171,11 @@ def evaluate_calendar_periods(
             ),
             "max_drawdown": _round(_drawdown_magnitude(equity_values)),
             "ending_equity": _round(equity_values[-1], 6) if equity_values else None,
+            "invested_days": invested_days if activity_status != "UNKNOWN" else None,
+            "cash_only_days": (
+                len(items) - invested_days if activity_status != "UNKNOWN" else None
+            ),
+            "activity_status": activity_status,
         })
     return output
 

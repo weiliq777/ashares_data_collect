@@ -26,13 +26,21 @@ def test_batched_builder_filters_source_query_by_date_range():
     assert "_materialized_hashes" in source
     assert "WITH base AS MATERIALIZED" in repository_source
     assert "market AS MATERIALIZED" in repository_source
-    assert "market_source AS MATERIALIZED" in repository_source
-    assert "limit_source AS MATERIALIZED" in repository_source
-    assert "suspend_source AS MATERIALIZED" in repository_source
+    assert "FROM public.tushare_market_raw_version" in repository_source
+    assert "FROM public.tushare_daily_raw" in repository_source
+    assert "FROM public.tushare_stk_limit_raw" in repository_source
+    assert "FROM public.tushare_suspend_d_raw" in repository_source
     assert "mv.ts_code=k.code AND mv.trade_date=k.day" in repository_source
     assert "limits AS MATERIALIZED" in repository_source
     assert "execution_row_count(" in source
     assert "actual_rows == expected_rows" in source
+    assert "_SOURCE_FETCH_ROWS = 20_000" in source
+    assert "context, _SOURCE_FETCH_ROWS" in source
+    assert 'checkpoint.get("details")' in source
+    assert 'metadata["diff_hash"]' in source
+    assert "range(0, len(source_days), _SOURCE_QUERY_DAYS)" in source
+    assert "_SOURCE_QUERY_DAYS = 1" in source
+    assert "source_window[0], source_window[-1]" in source
     repository_source = (ROOT / "data_collect" / "data_access" / "repository" / "dataset_repository.py").read_text(encoding="utf-8")
     assert "restart_checkpoint=True" in repository_source
     assert repository_source.count("restart_checkpoint=True") >= 5

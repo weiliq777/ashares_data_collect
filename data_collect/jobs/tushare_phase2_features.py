@@ -83,7 +83,7 @@ def rebuild_price(start_date=None, end_date=None) -> int:
         kernel.close()
 
 
-def rebuild_price_v2(start_date=None, end_date=None) -> int:
+def rebuild_price_v2(start_date=None, end_date=None, *, execution_id=None, codes=None) -> int:
     bounds = _bounded_dates(start_date, end_date) or _all_price_date_bounds()
     if bounds is None:
         return 0
@@ -94,7 +94,11 @@ def rebuild_price_v2(start_date=None, end_date=None) -> int:
         # The interval and code identity make retries reuse the same
         # per-batch checkpoint.  Include the code commit so a later code
         # version cannot silently skip work completed by an older version.
+        logical_execution_id = str(execution_id or base_context.run_id)
+        if not logical_execution_id.strip():
+            raise ValueError("price_v2 execution_id must be non-empty")
         run_identity = "|".join((
+            logical_execution_id,
             bounds[0].isoformat(), bounds[1].isoformat(),
             base_context.code_version, base_context.config_hash,
         ))
@@ -109,7 +113,10 @@ def rebuild_price_v2(start_date=None, end_date=None) -> int:
             pipeline_version=base_context.pipeline_version,
         )
         scope = WorkScope(date_from=bounds[0], date_to=bounds[1])
-        codes = repo.load_codes_in_window(scope, context)
+        selected_codes = repo.load_codes_in_window(scope, context) if codes is None else codes
+        codes = sorted({str(code) for code in selected_codes})
+        if not codes:
+            return 0
         return repo.rebuild_price_v2(
             scope, context, codes, batch_size=FEATURE_CODE_BATCH_SIZE,
         )
@@ -149,7 +156,7 @@ def rebuild_company_financial() -> int:
         kernel.close()
 
 
-def rebuild_shareholder_return(start_date=None, end_date=None) -> int:
+def rebuild_shareholder_return(start_date=None, end_date=None, *, codes=None) -> int:
     bounds = _bounded_dates(start_date, end_date) or _all_price_date_bounds()
     if bounds is None:
         return 0
@@ -157,7 +164,10 @@ def rebuild_shareholder_return(start_date=None, end_date=None) -> int:
     try:
         context = build_run_context(_JOB_NAME)
         scope = WorkScope(date_from=bounds[0], date_to=bounds[1])
-        codes = repo.load_codes_in_window(scope, context)
+        selected_codes = repo.load_codes_in_window(scope, context) if codes is None else codes
+        codes = sorted({str(code) for code in selected_codes})
+        if not codes:
+            return 0
         return repo.rebuild_shareholder_return(scope, context, codes)
     finally:
         kernel.close()
@@ -176,6 +186,8 @@ def run(
     start_date: date | str | None = None,
     end_date: date | str | None = None,
     allow_full_rebuild: bool = False,
+    execution_id: str | None = None,
+    codes=None,
 ) -> dict[str, int]:
     tasks = {
         "price": rebuild_price,
@@ -207,7 +219,13 @@ def run(
     result = {}
     for name in selected:
         logger.info("phase2 feature task started=%s", name)
-        if name in {"price", "price_v2", "valuation", "shareholder_return"}:
+        if name == "price_v2":
+            result[name] = tasks[name](
+                start_date, end_date, execution_id=execution_id, codes=codes,
+            )
+        elif name == "shareholder_return":
+            result[name] = tasks[name](start_date, end_date, codes=codes)
+        elif name in {"price", "valuation"}:
             result[name] = tasks[name](start_date, end_date)
         else:
             result[name] = tasks[name]()

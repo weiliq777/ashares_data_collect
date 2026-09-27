@@ -24,6 +24,11 @@ class ResearchSnapshotRepository(BaseRepository):
     BUNDLE_LINEAGE_TARGET = "research.snapshot_lineage_bundle"
     SOURCE_LINEAGE_TARGET = "research.lineage_source_record"
     LINEAGE_STORAGE_V2 = "v2"
+    # The Foundation financial contract joins materialized snapshot rows to
+    # the large source-record registry. Keep each validation query below the
+    # production statement timeout; the public method still returns one
+    # aggregate issue map for the complete input.
+    FOUNDATION_FINANCIAL_CONTRACT_BATCH_SIZE = 5
     # Snapshot SQL is set-based, but one code batch must also remain below the
     # governed 30-second statement deadline on the oldest/highest-cost dates.
     # 100 codes keeps the stock INSERT ... SELECT below the governed
@@ -78,6 +83,7 @@ class ResearchSnapshotRepository(BaseRepository):
     # must be restartable and must never leave an orphaned, multi-minute
     # statement holding the database I/O queue hostage on WSL/PostgreSQL.
     REPLACEMENT_LINEAGE_CODE_BATCH_SIZE = 100
+    REPLACEMENT_INTEGRITY_BATCH_SIZE = 20
     # All persisted stock fields are copied from the immutable source Snapshot
     # before the Foundation-v2 financial enrichment runs.  Keeping this
     # allowlisted projection explicit avoids SELECT * drift when the table is
@@ -1427,6 +1433,118 @@ class ResearchSnapshotRepository(BaseRepository):
             counts[key] = int(rows[0]["value"] or 0)
         return counts
 
+    def snapshot_materialization_counts_batch(
+        self,
+        snapshot_dates: Iterable[tuple[str, date]],
+        context: RunContext,
+    ) -> dict[str, dict[str, int]]:
+        """Read child counts for several snapshots with partition pruning.
+
+        Replacement recovery used to issue three queries for every target and
+        three more for its immutable source.  That is correct but needlessly
+        expensive on a partitioned PostgreSQL warehouse.  This bounded query
+        reads the stock/bundle partitions for a small date range and returns
+        the same per-snapshot counts, while the caller remains responsible for
+        deciding whether a target is complete.
+        """
+        pairs = [(str(snapshot_id), cutoff) for snapshot_id, cutoff in snapshot_dates]
+        if not pairs:
+            return {}
+        if any(not isinstance(cutoff, date) for _snapshot_id, cutoff in pairs):
+            raise TypeError("snapshot materialization cutoff must be date values")
+        range_start = min(cutoff for _snapshot_id, cutoff in pairs)
+        range_end = max(cutoff for _snapshot_id, cutoff in pairs)
+        rows = self.kernel.read._repository_query(
+            context,
+            "research.stock_snapshot_daily",
+            f"""
+            WITH requested AS MATERIALIZED (
+                SELECT *
+                  FROM unnest(%s::uuid[], %s::date[])
+                       AS p(snapshot_id, research_date)
+            ), counted AS (
+                SELECT 'stock_rows'::text AS kind, s.snapshot_id,
+                       COUNT(*)::bigint AS value
+                  FROM requested p
+                  JOIN research.stock_snapshot_daily s
+                    ON s.snapshot_id=p.snapshot_id
+                   AND s.research_date=p.research_date
+                 WHERE s.research_date BETWEEN DATE '{range_start.isoformat()}'
+                                             AND DATE '{range_end.isoformat()}'
+                 GROUP BY s.snapshot_id
+                UNION ALL
+                SELECT 'bundle_rows'::text AS kind, b.snapshot_id,
+                       COUNT(*)::bigint AS value
+                  FROM requested p
+                  JOIN research.snapshot_lineage_bundle b
+                    ON b.snapshot_id=p.snapshot_id
+                   AND b.research_date=p.research_date
+                 WHERE b.research_date BETWEEN DATE '{range_start.isoformat()}'
+                                              AND DATE '{range_end.isoformat()}'
+                 GROUP BY b.snapshot_id
+                UNION ALL
+                SELECT 'input_rows'::text AS kind, i.snapshot_id,
+                       COUNT(*)::bigint AS value
+                  FROM requested p
+                  JOIN research.snapshot_input i
+                    ON i.snapshot_id=p.snapshot_id
+                 GROUP BY i.snapshot_id
+            )
+            SELECT snapshot_id, kind, value
+              FROM counted
+            """,
+            (
+                [snapshot_id for snapshot_id, _cutoff in pairs],
+                [cutoff for _snapshot_id, cutoff in pairs],
+            ),
+            WorkScope(
+                date_from=range_start,
+                date_to=range_end,
+                partition="snapshot:replacement-integrity",
+            ),
+            max_rows=max(2, len(pairs) * 3 + 1),
+        )
+        result = {
+            snapshot_id: {
+                "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
+            }
+            for snapshot_id, _cutoff in pairs
+        }
+        for row in rows:
+            snapshot_id = str(row["snapshot_id"])
+            if snapshot_id in result and row["kind"] in result[snapshot_id]:
+                result[snapshot_id][row["kind"]] = int(row["value"] or 0)
+        return result
+
+    def snapshot_manifests(
+        self, snapshot_ids: Iterable[str], context: RunContext,
+    ) -> dict[str, dict[str, Any]]:
+        """Read replacement manifests in one bounded metadata query."""
+        ids = tuple(dict.fromkeys(str(value) for value in snapshot_ids))
+        if not ids:
+            return {}
+        rows = self.kernel.read._repository_query(
+            context,
+            "research.snapshot_manifest",
+            """
+            SELECT snapshot_id, research_cutoff_date AS cutoff,
+                   data_baseline_tag AS baseline, schema_version, status,
+                   lineage_storage_version, code_version, git_commit,
+                   git_dirty, diff_hash, code_archive_path, code_archive_sha256,
+                   code_archive_size_bytes AS code_archive_size,
+                   quality_report_hash AS quality_hash,
+                   baseline_quality_report_hash AS baseline_quality_hash,
+                   baseline_source_manifest_hash, input_manifest_hash AS input_hash,
+                   quality_report
+              FROM research.snapshot_manifest
+             WHERE snapshot_id=ANY(%s::uuid[])
+            """,
+            (list(ids),),
+            WorkScope(partition="snapshot:replacement-manifests"),
+            max_rows=len(ids) + 1,
+        )
+        return {str(row["snapshot_id"]): row for row in rows}
+
     def materialize_legacy_lineage_v2(
         self,
         snapshot_ids: Iterable[str],
@@ -1571,11 +1689,9 @@ class ResearchSnapshotRepository(BaseRepository):
             SELECT *
               FROM unnest(%s::uuid[], %s::date[])
                    AS p(snapshot_id, research_date)
-        ), rows AS (
+        ), base AS MATERIALIZED (
             SELECT b.snapshot_id, b.research_date, b.ts_code,
                    b.financial_source_ref_id,
-                   d.source_ref_id, d.source_table, d.source_record_key,
-                   d.source_record_version, d.source_payload_hash,
                    s.financial_record_version, s.financial_source_record_key,
                    s.financial_payload_hash, s.financial_source_fingerprint,
                    s.financial_feature_contract_version,
@@ -1584,10 +1700,22 @@ class ResearchSnapshotRepository(BaseRepository):
               JOIN research.snapshot_lineage_bundle b
                 ON b.snapshot_id=p.snapshot_id
                AND b.research_date=p.research_date
+               AND b.research_date BETWEEN %s AND %s
               JOIN research.stock_snapshot_daily s
                 ON s.snapshot_id=b.snapshot_id
                AND s.research_date=b.research_date
                AND s.ts_code=b.ts_code
+               AND s.research_date BETWEEN %s AND %s
+        ), rows AS (
+            SELECT b.snapshot_id, b.research_date, b.ts_code,
+                   b.financial_source_ref_id,
+                   d.source_ref_id, d.source_table, d.source_record_key,
+                   d.source_record_version, d.source_payload_hash,
+                   b.financial_record_version, b.financial_source_record_key,
+                   b.financial_payload_hash, b.financial_source_fingerprint,
+                   b.financial_feature_contract_version,
+                   b.financial_data_available_timestamp
+              FROM base b
               LEFT JOIN research.lineage_source_record d
                 ON d.source_ref_id=b.financial_source_ref_id
         )
@@ -1626,30 +1754,66 @@ class ResearchSnapshotRepository(BaseRepository):
             for item in manifests
         ):
             return {}
-        snapshot_ids = [str(item["snapshot_id"]) for item in manifests]
-        cutoffs = [item["cutoff"] for item in manifests]
-        rows = self.kernel.read._repository_query(
-            context,
-            self.BUNDLE_LINEAGE_TARGET,
-            self.foundation_financial_contract_sql(),
-            (snapshot_ids, cutoffs),
-            WorkScope(
-                date_from=min(cutoffs), date_to=max(cutoffs),
-                partition="snapshot-foundation-financial-contract",
-            ),
-            max_rows=max(2, len(snapshot_ids) + 1),
-        )
         issues: dict[str, dict[str, int]] = {}
-        for row in rows:
-            values = {
-                key: int(row.get(key) or 0)
-                for key in (
-                    "snapshot_rows", "missing_lineage_rows",
-                    "non_v2_source_rows", "invalid_v2_rows",
+        # ``snapshot_lineage_bundle`` is monthly range-partitioned and its
+        # primary index starts with research_date. Bind parameters inside a
+        # named cursor can leave PostgreSQL with a generic plan, which scans
+        # every historical partition before applying the requested dates.
+        # Embedding the validated date range for each small batch makes
+        # partition pruning deterministic while snapshot IDs and all business
+        # values remain bound parameters. More importantly, it prevents one
+        # Dataset handoff from holding the source-registry join until
+        # statement_timeout; callers still receive a complete issue map.
+        for offset in range(
+            0, len(manifests), self.FOUNDATION_FINANCIAL_CONTRACT_BATCH_SIZE
+        ):
+            batch = manifests[
+                offset:offset + self.FOUNDATION_FINANCIAL_CONTRACT_BATCH_SIZE
+            ]
+            snapshot_ids = [str(item["snapshot_id"]) for item in batch]
+            cutoffs = [item["cutoff"] for item in batch]
+            range_start = min(cutoffs)
+            range_end = max(cutoffs)
+            if not isinstance(range_start, date) or not isinstance(range_end, date):
+                raise TypeError(
+                    "Foundation financial contract cutoff must be date values"
                 )
-            }
-            if any(values[key] for key in values if key != "snapshot_rows"):
-                issues[str(row["snapshot_id"])] = values
+            contract_sql = self.foundation_financial_contract_sql().replace(
+                "b.research_date BETWEEN %s AND %s",
+                f"b.research_date BETWEEN DATE '{range_start.isoformat()}' "
+                f"AND DATE '{range_end.isoformat()}'",
+                1,
+            )
+            contract_sql = contract_sql.replace(
+                "s.research_date BETWEEN %s AND %s",
+                f"s.research_date BETWEEN DATE '{range_start.isoformat()}' "
+                f"AND DATE '{range_end.isoformat()}'",
+                1,
+            )
+            rows = self.kernel.read._repository_query(
+                context,
+                self.BUNDLE_LINEAGE_TARGET,
+                contract_sql,
+                (snapshot_ids, cutoffs),
+                WorkScope(
+                    date_from=range_start, date_to=range_end,
+                    partition=(
+                        "snapshot-foundation-financial-contract-"
+                        f"{offset // self.FOUNDATION_FINANCIAL_CONTRACT_BATCH_SIZE}"
+                    ),
+                ),
+                max_rows=max(2, len(snapshot_ids) + 1),
+            )
+            for row in rows:
+                values = {
+                    key: int(row.get(key) or 0)
+                    for key in (
+                        "snapshot_rows", "missing_lineage_rows",
+                        "non_v2_source_rows", "invalid_v2_rows",
+                    )
+                }
+                if any(values[key] for key in values if key != "snapshot_rows"):
+                    issues[str(row["snapshot_id"])] = values
         return issues
 
     def build_financial_replacement_snapshot(
@@ -2479,13 +2643,13 @@ class ResearchSnapshotRepository(BaseRepository):
         rows = self.kernel.read._repository_query(
             context,
             "ops.tushare_data_release",
-            """SELECT release_tag, baseline_cutoff_date, status,
+            """SELECT release_tag, baseline_domain, baseline_cutoff_date, status,
                        quality_report_hash, source_manifest_hash,
                        source_manifest, schema_version, quality_report
                   FROM ops.tushare_data_release WHERE release_tag=%s""",
             (tag,), WorkScope(date_to=cutoff, partition=f"release:{tag}"), 2,
         )
-        if not rows or rows[0]["status"] != "validated":
+        if not rows or rows[0]["status"] != "validated" or rows[0]["baseline_domain"] != "RESEARCH":
             raise RuntimeError(f"data baseline must be validated: {tag}")
         row = rows[0]
         if cutoff > row["baseline_cutoff_date"]:

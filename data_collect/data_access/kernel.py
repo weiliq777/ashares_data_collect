@@ -8,11 +8,12 @@ from __future__ import annotations
 import hashlib
 import functools
 import json
+import os
 from datetime import datetime, timezone
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Callable, TypeVar
 
-from data_collect.data_access.context import RunContext, WorkScope
+from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
 from data_collect.data_access.checkpoint import Checkpoint, CheckpointStore, InMemoryCheckpointStore, PostgresCheckpointStore
 from data_collect.data_access.chunk_planner import ChunkConfig, ChunkPlanner
 from data_collect.data_access.errors import TransactionBudgetExceeded
@@ -21,6 +22,10 @@ from data_collect.data_access.lock_manager import LockManager
 from data_collect.data_access.publish_gateway import PublishGateway
 from data_collect.data_access.quality_gateway import QualityGateway
 from data_collect.data_access.query_guard import QueryGuard
+from data_collect.data_access.release_change_capture import (
+    RELEASE_CHANGE_LOCK_KEY,
+    build_change_event,
+)
 from data_collect.data_access.raw_gateway import RawAppendGateway
 from data_collect.data_access.read_gateway import ReadGateway
 from data_collect.data_access.rebuild_gateway import RebuildGateway
@@ -41,6 +46,7 @@ class DataAccessKernel:
         chunk_config: ChunkConfig | None = None,
         connection_factory: Callable[[], object] | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        capture_release_changes: bool | None = None,
     ) -> None:
         # A supplied connection factory is the explicit fake/test seam. A
         # custom checkpoint store does not make the database connection fake;
@@ -85,6 +91,13 @@ class DataAccessKernel:
         self._manifest_failures: dict[str, str] = {}
         self._manifest_rows_read: dict[str, int] = {}
         self._manifest_rows_written: dict[str, int] = {}
+        # Roll out only after migration 110 and a clean full-audit bootstrap.
+        # An explicit constructor option is the test seam; production may opt
+        # in through the deployment environment without changing every Job.
+        self._capture_release_changes = (
+            production_kernel and os.getenv("DATA_RELEASE_CHANGE_CAPTURE", "").strip().lower() in {"1", "true", "yes"}
+            if capture_release_changes is None else bool(capture_release_changes)
+        )
 
         # 六个 Gateway（业务层唯一入口）
         self.raw: RawAppendGateway = RawAppendGateway(self)
@@ -94,6 +107,11 @@ class DataAccessKernel:
         self.publish: PublishGateway = PublishGateway(self)
         self.quality: QualityGateway = QualityGateway(self)
         self._install_manifest_hooks()
+
+    @property
+    def release_change_capture_enabled(self) -> bool:
+        """Whether source writes are transactionally represented in the change ledger."""
+        return self._capture_release_changes
 
     def close(self) -> None:
         self._finalize_run_manifests()
@@ -288,18 +306,25 @@ class DataAccessKernel:
         """Framework-private connection bridge used only by Gateway code."""
         return self.transaction_manager._connection()
 
-    def _run_chunk(self, operation, *, idempotent: bool = True):
+    def _run_chunk(self, operation, *, idempotent: bool = True, change_event=None):
         """Framework-private transaction + retry boundary for one idempotent chunk."""
         if self.transaction_manager.in_atomic:
             # A Repository-owned atomic workflow has its own retry boundary.
             # Joining here prevents a child Gateway call from committing only
             # part of a multi-table business operation.
-            return operation()
+            if self._capture_release_changes and change_event is not None:
+                self._lock_release_change_ledger(shared=True)
+            result = operation()
+            self._append_release_change_event(change_event, result)
+            return result
 
         def attempt():
             self.transaction_manager.begin_chunk()
             try:
+                if self._capture_release_changes and change_event is not None:
+                    self._lock_release_change_ledger(shared=True)
                 result = operation()
+                self._append_release_change_event(change_event, result)
                 self.transaction_manager.commit_chunk()
                 return result
             except Exception:
@@ -309,6 +334,101 @@ class DataAccessKernel:
         if not idempotent:
             return attempt()
         return self.retry_policy.run(attempt, rollback=self.transaction_manager.rollback)
+
+    def _lock_release_change_ledger(self, *, shared: bool) -> None:
+        """Coordinate source mutations with exact release-event boundaries."""
+        lock_function = (
+            "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
+        )
+        conn = self._db_connection()
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {lock_function}(%s)", (RELEASE_CHANGE_LOCK_KEY,))
+
+    def _append_release_change_event(self, event, result) -> None:
+        """Append a bounded control-plane event in the fact-write transaction.
+
+        A failed event insert aborts the surrounding data mutation. This is
+        intentionally opt-in until the event table is deployed and the initial
+        full-audit bootstrap establishes a trustworthy parent watermark.
+        """
+        if not self._capture_release_changes or event is None:
+            return
+        if not isinstance(event, Mapping):
+            raise TypeError("release change event must be a mapping")
+        affected = None
+        if isinstance(result, bool):
+            affected = None
+        elif isinstance(result, int):
+            affected = max(0, result)
+        elif isinstance(result, tuple) and result and all(isinstance(v, int) for v in result):
+            affected = max(0, result[-1])
+        if affected == 0 and not bool(event.get("record_empty")):
+            return
+        required = {
+            "event_key", "run_id", "job_name", "code_version", "pipeline_version",
+            "target", "operation", "scope", "scope_hash", "scope_precision", "input_hash",
+            "input_row_count", "delta_eligible", "full_audit_reason",
+        }
+        missing = required - set(event)
+        if missing:
+            raise ValueError(f"release change event missing fields: {sorted(missing)}")
+        ledger_scope = WorkScope(partition=f"release-change:{event['event_key']}")
+        for target in ("ops.release_change_scope", "ops.release_change_event"):
+            self.query_guard.check(
+                SqlPlan(
+                    operation=Operation.BULK_INSERT,
+                    target=target,
+                    scope=ledger_scope,
+                    expected_mode="ROW_BASED",
+                    estimated_rows=1,
+                )
+            )
+        conn = self._db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO ops.release_change_scope
+                       (scope_hash,scope,scope_precision,delta_eligible,full_audit_reason)
+                     VALUES (%s,%s::jsonb,%s,%s,%s)
+                     ON CONFLICT (scope_hash) DO NOTHING""",
+                (
+                    event["scope_hash"],
+                    json.dumps(event["scope"], sort_keys=True, default=str),
+                    event["scope_precision"], bool(event["delta_eligible"]),
+                    event["full_audit_reason"],
+                ),
+            )
+            cur.execute(
+                """INSERT INTO ops.release_change_event
+                       (event_key,run_id,job_name,code_version,pipeline_version,
+                        target,operation,scope_hash,input_hash,input_row_count,affected_rows)
+                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     ON CONFLICT (event_key) DO NOTHING""",
+                (
+                    event["event_key"], event["run_id"], event["job_name"],
+                    event["code_version"], event["pipeline_version"],
+                    event["target"], event["operation"], event["scope_hash"],
+                    event["input_hash"], int(event["input_row_count"]), affected,
+                ),
+            )
+
+    def _build_release_change_event(
+        self, context: RunContext, operation: str, target: str, scope: WorkScope,
+        *, rows=(), statement: str | None = None, params=(),
+        force_full_audit_reason: str | None = None,
+    ):
+        """Build event metadata only when the rollout flag is enabled."""
+        if not self._capture_release_changes:
+            return None
+        statement_fingerprint = None
+        if statement is not None:
+            statement_fingerprint = hashlib.sha256(
+                (statement + repr(tuple(params) if params else ())).encode("utf-8")
+            ).hexdigest()
+        return build_change_event(
+            context, operation, target, scope, rows=rows,
+            statement_fingerprint=statement_fingerprint,
+            force_full_audit_reason=force_full_audit_reason,
+        )
 
     def _checkpoint_progress(
         self, run_id: str, job_name: str, scope_key: str, cursor: int
@@ -439,6 +559,7 @@ class DataAccessKernel:
         *,
         estimated_rows: int = 0,
         idempotent: bool = False,
+        change_events: Sequence[Mapping[str, Any]] = (),
     ) -> T:
         """Run one short Repository workflow as one governed transaction.
 
@@ -461,7 +582,11 @@ class DataAccessKernel:
             self._atomic_reserved_bytes = 0
             self.transaction_manager.begin_atomic()
             try:
+                if self._capture_release_changes and change_events:
+                    self._lock_release_change_ledger(shared=True)
                 result = operation()
+                for event in change_events:
+                    self._append_release_change_event(event, result)
                 actions = tuple(self._deferred_checkpoint_actions)
                 self.transaction_manager.commit_chunk()
                 return result, actions

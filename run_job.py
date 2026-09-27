@@ -74,7 +74,12 @@ def start_scheduler(
     如 "news_flash,news_hourly,news_daily,news_stock"——新闻系统在 Linux 上单独调度）。
     hour/minute 仅在恰好指定一个 pipeline 时生效（覆盖配置）。
     """
-    from data_collect.pipeline import run_pipeline, print_dag
+    from data_collect.pipeline import (
+        _PRODUCTION_SPLIT_PIPELINES,
+        _validate_production_schedule_contract,
+        run_pipeline,
+        print_dag,
+    )
     from data_collect.config import get_pipeline_config
 
     pipelines = get_pipeline_config()
@@ -85,6 +90,12 @@ def start_scheduler(
         if unknown:
             print(f"错误：pipeline {unknown} 不存在，可用: {list(pipelines.keys())}")
             return
+        split_names = sorted(set(names) & set(_PRODUCTION_SPLIT_PIPELINES))
+        if split_names:
+            raise ValueError(
+                f"{split_names} are manual/diagnostic pipelines and cannot be "
+                "scheduled independently; schedule tushare_production_daily"
+            )
         targets = {n: pipelines[n] for n in names}
     else:
         targets = {n: c for n, c in pipelines.items() if c.get("schedule")}
@@ -92,6 +103,12 @@ def start_scheduler(
     if not targets:
         print("错误：未找到任何带 schedule 段的 pipeline")
         return
+
+    unscheduled = sorted(name for name, cfg in targets.items() if not cfg.get("schedule"))
+    if unscheduled:
+        raise ValueError(f"不能调度未配置 schedule 的 pipeline: {unscheduled}")
+    if pipeline_name is None or "tushare_production_daily" in targets:
+        _validate_production_schedule_contract(pipelines)
 
     timezone = next(iter(targets.values())).get("schedule", {}).get("timezone", "Asia/Shanghai")
 

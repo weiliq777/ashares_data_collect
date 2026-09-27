@@ -154,7 +154,9 @@ class RebuildGateway:
                 )
                 self._staging_hash(staging, target)
 
-                attached = self._publish(mode, target, staging, scope)
+                attached = self._publish(
+                    mode, target, staging, scope, context=context,
+                )
                 published = True
                 self._kernel._checkpoint_done(
                     context.run_id, context.job_name, scope_key
@@ -585,7 +587,15 @@ class RebuildGateway:
                     raise ValueError("counted scoped merge must return attempted and affected counts")
                 return int(row[0] or 0), int(row[1] or 0)
 
-        return self._kernel._run_chunk(run_sql, idempotent=False)
+        event = self._kernel._build_release_change_event(
+            context, "RUN_SCOPED_MERGE_COUNTED", plan.target, plan.scope,
+            statement=sql, params=tuple(params) if params else (),
+        )
+        if event is not None:
+            event["record_empty"] = True
+        return self._kernel._run_chunk(
+            run_sql, idempotent=False, change_event=event,
+        )
 
     def run_partition_replace(self, sql: str, plan: SqlPlan, context: RunContext, params=None) -> int:
         return self._run_set_based("run_partition_replace", sql, plan, context, params)
@@ -665,11 +675,21 @@ class RebuildGateway:
                             affected.append(int(cur.rowcount or 0))
                     return affected[0]
 
+                change_events = []
+                for target in targets:
+                    event = self._kernel._build_release_change_event(
+                        context, "PARTITION_REPLACE", target, scope, rows=rows,
+                    )
+                    if event is not None:
+                        event["record_empty"] = True
+                        change_events.append(event)
+
                 return self._kernel.run_atomic(
                     context,
                     scope,
                     publish,
                     estimated_rows=len(rows) * len(targets),
+                    change_events=change_events,
                 )
             finally:
                 for stage in staging:
@@ -724,12 +744,23 @@ class RebuildGateway:
         staging = self._staging_name(target, context)
         filled = fill_sql.replace("{staging}", staging)
         self._validate_table_fill_sql(filled, staging)
+        if target not in {"std.security_lifecycle", "pit.financial_asof"}:
+            raise ValueError(
+                "run_table_replace only supports the registered lifecycle/as-of targets"
+            )
         n = 0
         try:
             def create_staging() -> None:
                 conn = self._kernel._db_connection()
                 with conn.cursor() as cur:
-                    cur.execute(f"CREATE TABLE {staging} (LIKE {target})")
+                    # The application role intentionally has no CREATE/ALTER
+                    # privilege on business schemas. These two registered
+                    # TABLE_REPLACE workflows use a narrow database-side DDL
+                    # bridge; the set-based fill SQL remains in the Repository.
+                    cur.execute(
+                        "SELECT ops.create_table_replace_staging(%s, %s)",
+                        (target, staging),
+                    )
 
             self._kernel._run_chunk(create_staging, idempotent=False)
             # 填充 staging（SET-based，statement_timeout 熔断）
@@ -744,10 +775,20 @@ class RebuildGateway:
                 conn = self._kernel._db_connection()
                 with conn.cursor() as cur:
                     old = self._swap_old_name(target, staging)
-                    cur.execute(f"ALTER TABLE {target} RENAME TO {old.rsplit('.', 1)[-1]}")
-                    cur.execute(f"ALTER TABLE {staging} RENAME TO {target.rsplit('.', 1)[-1]}")
-                    cur.execute(f"DROP TABLE {old}")
-            self._kernel._run_chunk(swap_tables, idempotent=False)
+                    cur.execute(
+                        "SELECT ops.swap_table_replace_staging(%s, %s, %s)",
+                        (target, staging, old),
+                    )
+            event = self._kernel._build_release_change_event(
+                context, "TABLE_REPLACE", target, WorkScope(),
+                statement=filled, params=tuple(params) if params else (),
+                force_full_audit_reason="whole-table replacement requires a full audit",
+            )
+            if event is not None:
+                event["record_empty"] = True
+            self._kernel._run_chunk(
+                swap_tables, idempotent=False, change_event=event,
+            )
             return n
         finally:
             self._drop_staging(staging)
@@ -775,7 +816,15 @@ class RebuildGateway:
                 cur.execute(sql, tuple(params) if params else ())
                 return int(cur.rowcount or 0)
 
-        return self._kernel._run_chunk(run_sql, idempotent=False)
+        event = self._kernel._build_release_change_event(
+            context, method.upper(), plan.target, plan.scope,
+            statement=sql, params=tuple(params) if params else (),
+        )
+        if event is not None:
+            event["record_empty"] = True
+        return self._kernel._run_chunk(
+            run_sql, idempotent=False, change_event=event,
+        )
 
     @staticmethod
     def _validate_set_sql(method: str, sql: str, plan: SqlPlan) -> None:
@@ -1114,7 +1163,10 @@ class RebuildGateway:
 
         return self._kernel._run_chunk(hash_staging)
 
-    def _publish(self, mode: RebuildMode, target: str, staging: str, scope: WorkScope) -> bool:
+    def _publish(
+        self, mode: RebuildMode, target: str, staging: str, scope: WorkScope,
+        *, context: RunContext | None = None,
+    ) -> bool:
         def publish_tx() -> bool:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
@@ -1154,12 +1206,31 @@ class RebuildGateway:
                 elif mode == RebuildMode.SCOPED_MERGE:
                     self._delete_scope(cur, target, scope)
                     cur.execute(f"INSERT INTO {target} SELECT * FROM {staging} ON CONFLICT DO NOTHING")
+                    # False means the staging relation is not attached or
+                    # renamed; the caller removes it after publication.
                 else:  # pragma: no cover
                     raise ValueError(f"未知 RebuildMode: {mode}")
 
         # Publish is a short catalog/data transaction. It must be committed;
         # previously this method relied on connection context-manager behavior.
-        return bool(self._kernel._run_chunk(publish_tx, idempotent=False))
+        event = None
+        if context is not None:
+            event = self._kernel._build_release_change_event(
+                context, f"PUBLISH_{mode.value}", target, scope,
+                statement=f"{mode.value}|{target}|{scope!r}",
+                force_full_audit_reason=(
+                    "whole-table replacement requires a full audit"
+                    if mode == RebuildMode.TABLE_REPLACE else None
+                ),
+            )
+        if event is not None:
+            # A scoped replacement can remove rows while publishing an empty
+            # staging slice. Record the committed publication regardless of
+            # the count reported by the final INSERT.
+            event["record_empty"] = True
+        return bool(self._kernel._run_chunk(
+            publish_tx, idempotent=False, change_event=event,
+        ))
 
     @staticmethod
     def _partition_bounds(scope: WorkScope) -> tuple[date, date] | None:
@@ -1209,7 +1280,13 @@ class RebuildGateway:
         def drop_tx() -> None:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {staging}")
+                if staging.startswith(("std._staging_", "pit._staging_")):
+                    cur.execute(
+                        "SELECT ops.drop_table_replace_staging(%s)",
+                        (staging,),
+                    )
+                else:
+                    cur.execute(f"DROP TABLE IF EXISTS {staging}")
         self._kernel._run_chunk(drop_tx)
 
     @staticmethod

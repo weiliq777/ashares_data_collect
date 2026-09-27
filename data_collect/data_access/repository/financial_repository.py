@@ -19,6 +19,8 @@ CONTRACT_VERSION = "feature-contract-v2.0"
 
 
 class FinancialRepository(BaseRepository):
+    _VALUATION_CODE_BATCH_LIMIT = 15
+    MAX_VALUATION_INPUT_ROWS_PER_QUERY = 25_000
     # Financial feature calculation already works in five-stock partitions.
     # Keep the repository read bounded even when a caller supplies a larger
     # code set, instead of bypassing DatasetPolicy with a 500k-row request.
@@ -454,12 +456,11 @@ class FinancialRepository(BaseRepository):
         codes = tuple(codes)
         if not codes:
             return []
-        sql = f"""
-            SELECT {self._VALUATION_COLUMNS}
-              FROM std.valuation_daily
-             WHERE stock_code=ANY(%s) AND trade_date BETWEEN %s AND %s
-             ORDER BY stock_code, trade_date
-        """
+        if len(codes) > self._VALUATION_CODE_BATCH_LIMIT:
+            raise ValueError(
+                "valuation history reads are limited to 15 securities per query"
+            )
+        sql = self._valuation_inputs_sql()
         scope = WorkScope(
             date_from=warmup_start,
             date_to=output_end,
@@ -471,8 +472,47 @@ class FinancialRepository(BaseRepository):
             sql=sql,
             params=(list(codes), warmup_start, output_end),
             scope=scope,
-            max_rows=100_000,
+            # A five-year warmup is intentionally fetched per small security
+            # batch. Fail closed if source multiplicity or a widened batch
+            # would exceed the expected memory/I/O envelope.
+            max_rows=self.MAX_VALUATION_INPUT_ROWS_PER_QUERY,
         )
+
+    def explain_valuation_inputs(
+        self,
+        codes: Iterable[str],
+        warmup_start: date,
+        output_end: date,
+        context: RunContext,
+    ) -> dict[str, Any]:
+        """Return the non-executing PostgreSQL plan for the production query."""
+        codes = tuple(codes)
+        if not codes:
+            raise ValueError("valuation explain requires at least one security")
+        if len(codes) > self._VALUATION_CODE_BATCH_LIMIT:
+            raise ValueError("valuation explain is limited to 15 securities")
+        if warmup_start > output_end:
+            raise ValueError("valuation explain date range is reversed")
+        return self.kernel.read._repository_explain(
+            context=context,
+            source="std.valuation_daily",
+            sql=self._valuation_inputs_sql(),
+            params=(list(codes), warmup_start, output_end),
+            scope=WorkScope(
+                date_from=warmup_start,
+                date_to=output_end,
+                codes=codes,
+            ),
+        )
+
+    @classmethod
+    def _valuation_inputs_sql(cls) -> str:
+        return f"""
+            SELECT {cls._VALUATION_COLUMNS}
+              FROM std.valuation_daily
+             WHERE stock_code=ANY(%s) AND trade_date BETWEEN %s AND %s
+             ORDER BY stock_code, trade_date
+        """
 
     def publish_valuation_partition(
         self,
@@ -753,7 +793,10 @@ class FinancialRepository(BaseRepository):
         if not isinstance(parameters, dict):
             parameters = {}
         if stage_identities:
-            parameters["_stage_code_identities"] = {
+            # Keep the identities captured at run creation immutable.  The
+            # current identities are resume evidence, not a replacement for
+            # the code that produced already-completed checkpoints.
+            parameters["_last_resume_stage_code_identities"] = {
                 stage: current for stage, (_, current) in stage_identities.items()
             }
         resume_row = {

@@ -450,24 +450,77 @@ def build_equity_curve(
             "cash_ratio": _round((_float(row.get("cash_balance")) or 0.0) / equity if equity else None),
             "position_count": position_count.get(trade_date, 0),
             "valuation_status": row.get("valuation_status"),
+            "decision_reason": _json_object(row.get("decision_reason")),
         })
     return curve
 
 
+def build_decision_log(performance: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Expose the bounded daily decision explanations and their compact summary."""
+    rows: list[dict[str, Any]] = []
+    reason_counts: dict[str, int] = defaultdict(int)
+    dominant_failure_counts: dict[str, int] = defaultdict(int)
+    for row in performance:
+        reason = _json_object(row.get("decision_reason"))
+        if not reason:
+            continue
+        trade_date = _iso(row.get("trade_date"))
+        rows.append({"trade_date": trade_date, "reason": reason})
+        code = reason.get("no_action_reason_code") or reason.get("reason_code")
+        if code:
+            reason_counts[str(code)] += 1
+        dominant = reason.get("dominant_failure_code")
+        if dominant:
+            dominant_failure_counts[str(dominant)] += 1
+    return {
+        "rows": rows,
+        "summary": {
+            "days": len(rows),
+            "no_action_days": sum(
+                count for code, count in reason_counts.items()
+                if code.startswith("NO_") or code in {
+                    "NOT_SCHEDULED_SIGNAL_DAY", "EVALUATION_END_NO_NEXT_TRADING_DAY",
+                }
+            ),
+            "reason_counts": dict(sorted(reason_counts.items())),
+            "dominant_failure_counts": dict(sorted(dominant_failure_counts.items())),
+        },
+    }
+
+
 def aggregate_period_returns(performance: Sequence[Mapping[str, Any]], period: str) -> list[dict[str, Any]]:
     """Compound persisted daily returns into calendar-month/year bars."""
-    groups: dict[str, list[float]] = defaultdict(list)
+    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in performance:
         trade_date = row.get("trade_date")
         daily_return = _float(row.get("daily_return"))
         if not isinstance(trade_date, date) or daily_return is None:
             continue
         key = trade_date.strftime("%Y-%m" if period == "month" else "%Y")
-        groups[key].append(daily_return)
-    return [
-        {"period": key, "return": _round(math.prod(1.0 + value for value in values) - 1.0)}
-        for key, values in sorted(groups.items())
-    ]
+        groups[key].append(row)
+    output = []
+    for key, rows in sorted(groups.items()):
+        position_values = [_float(row.get("position_value")) for row in rows]
+        known_position_values = [value for value in position_values if value is not None]
+        invested_days = sum(value > 0 for value in known_position_values)
+        activity_status = (
+            "UNKNOWN"
+            if len(known_position_values) != len(rows)
+            else "CASH_ONLY"
+            if invested_days == 0
+            else "INVESTED"
+        )
+        output.append({
+            "period": key,
+            "return": _round(math.prod(
+                1.0 + _float(row["daily_return"]) for row in rows
+            ) - 1.0),
+            "observation_days": len(rows),
+            "invested_days": invested_days if activity_status != "UNKNOWN" else None,
+            "cash_only_days": len(rows) - invested_days if activity_status != "UNKNOWN" else None,
+            "activity_status": activity_status,
+        })
+    return output
 
 
 def build_report(
@@ -528,6 +581,7 @@ def build_report(
             "position_lots": len(lots), "performance_daily": len(performance),
         },
         "equity_curve": build_equity_curve(performance, positions, benchmark, initial_cash),
+        "decision_log": build_decision_log(performance),
         "monthly_returns": aggregate_period_returns(performance, "month"),
         "annual_returns": aggregate_period_returns(performance, "year"),
         "benchmark_series": benchmark_series,

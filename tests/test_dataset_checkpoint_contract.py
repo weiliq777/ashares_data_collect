@@ -20,6 +20,13 @@ def test_handoff_supports_stage_resume_without_changing_build_engine():
     assert "manifest[\"status\"] == \"VALIDATED\"" in source
 
 
+def test_force_rebuild_reopens_only_validated_dataset():
+    source = (ROOT / "data_collect" / "jobs" / "backtest_dataset_handoff.py").read_text(encoding="utf-8")
+    assert 'if args.force_rebuild and manifest["status"] == "VALIDATED":' in source
+    assert '("VALIDATED",),\n                "FAILED"' in source
+    assert '"explicit force rebuild requested after validation"' in source
+
+
 def test_checkpoint_does_not_touch_raw_or_standard_layers():
     source = (ROOT / "sql" / "042_backtest_dataset_build_checkpoint.sql").read_text(encoding="utf-8")
     assert "tushare_" not in source

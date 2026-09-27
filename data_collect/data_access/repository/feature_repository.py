@@ -215,16 +215,24 @@ WITH seed AS (
         ON a.ts_code=d.stock_code AND a.trade_date=d.trade_date
      WHERE d.stock_code=ANY(%s) AND d.trade_date < %s
      ORDER BY d.stock_code, d.trade_date DESC
+), latest_dividend_versions AS (
+    SELECT DISTINCT ON (source, source_record_key)
+           dividend_id, ts_code, source, source_record_key, record_version,
+           implementation_status, ex_date, implementation_announce_date,
+           announce_date, report_date, cash_div, stock_div
+      FROM std.dividend_event
+     WHERE ts_code=ANY(%s)
+     ORDER BY source, source_record_key, record_version DESC, dividend_id DESC
 ), events AS (
     SELECT ts_code, ex_date,
            COALESCE(SUM(cash_div), 0.0) AS cash_div,
            COALESCE(SUM(stock_div), 0.0) AS stock_rate,
            COUNT(*)::integer AS event_count
-      FROM std.dividend_event
+      FROM latest_dividend_versions
      WHERE implementation_status = '实施' AND ex_date IS NOT NULL
        AND COALESCE(implementation_announce_date, announce_date,
                     report_date, ex_date) <= ex_date
-       AND ts_code=ANY(%s) AND ex_date <= %s
+       AND ex_date <= %s
      GROUP BY ts_code, ex_date
 ), raw AS (
     SELECT d.stock_code AS ts_code, d.trade_date, d.close AS raw_close,
@@ -710,12 +718,20 @@ _SHAREHOLDER_RETURN_SQL = """DELETE FROM feature.shareholder_return_v1 WHERE ts_
 INSERT INTO feature.shareholder_return_v1
         (ts_code, asof_date, cash_div_12m, dividend_event_count_3y,
          dividend_year_count_3y, quality_status)
+    WITH latest_dividend_versions AS (
+        SELECT DISTINCT ON (source, source_record_key)
+               dividend_id, ts_code, source, source_record_key, record_version,
+               implementation_status, ex_date, cash_div
+          FROM std.dividend_event
+         WHERE ts_code=ANY(%s)
+         ORDER BY source, source_record_key, record_version DESC, dividend_id DESC
+    )
     SELECT d.stock_code, d.trade_date,
            COALESCE(SUM(e.cash_div) FILTER (WHERE e.ex_date > d.trade_date - INTERVAL '365 days'), 0), COUNT(e.dividend_id),
            COUNT(DISTINCT EXTRACT(YEAR FROM e.ex_date)),
            CASE WHEN COUNT(e.dividend_id) = 0 THEN 'WARNING' ELSE 'VALID' END
     FROM std.daily_kline d
-    LEFT JOIN std.dividend_event e
+    LEFT JOIN latest_dividend_versions e
       ON e.ts_code=d.stock_code AND e.ex_date > d.trade_date - INTERVAL '3 years'
      AND e.ex_date <= d.trade_date
      AND e.implementation_status = '实施'
@@ -748,16 +764,34 @@ class _FeatureRepositoryMore:
         if not codes:
             raise ValueError("rebuild_shareholder_return 需要 codes")
         total = 0
-        for batch in self._batches(codes):
-            params = (batch, scope.date_from, scope.date_to, batch, scope.date_from, scope.date_to)
-            plan = SqlPlan(
-                operation=Operation.REBUILD, target="feature.shareholder_return_v1",
-                scope=scope, expected_mode="SET_BASED",
-                estimated_rows=0, allow_insert_select=True, allow_delete=True,
-            )
-            total += self.kernel.rebuild.run_scoped_merge(
-                sql=_SHAREHOLDER_RETURN_SQL, plan=plan, context=context, params=params
-            )
+        for batch_index, batch in enumerate(self._batches(codes, size=5), start=1):
+            for window_index, (window_start, window_end) in enumerate(
+                self._date_windows(scope.date_from, scope.date_to, days=365), start=1
+            ):
+                batch_scope = WorkScope(
+                    date_from=window_start,
+                    date_to=window_end,
+                    codes=tuple(batch),
+                    partition=scope.partition or "feature:shareholder_return_v1",
+                    dimensions={
+                        **scope.dimensions,
+                        "code_batch": batch_index,
+                        "date_window": window_index,
+                    },
+                )
+                params = (
+                    batch, window_start, window_end,
+                    batch,
+                    batch, window_start, window_end,
+                )
+                plan = SqlPlan(
+                    operation=Operation.REBUILD, target="feature.shareholder_return_v1",
+                    scope=batch_scope, expected_mode="SET_BASED",
+                    estimated_rows=2_000, allow_insert_select=True, allow_delete=True,
+                )
+                total += self.kernel.rebuild.run_scoped_merge(
+                    sql=_SHAREHOLDER_RETURN_SQL, plan=plan, context=context, params=params
+                )
         return total
 
     def register_features(self, context: RunContext) -> int:

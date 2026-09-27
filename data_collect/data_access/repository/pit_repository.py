@@ -67,8 +67,31 @@ ON CONFLICT (trade_date, ts_code) DO UPDATE SET
   calculated_at=CURRENT_TIMESTAMP
 """
 
+# A single trading day can still contain several thousand securities.  Keep
+# the delete and INSERT...SELECT scoped to a code batch as well as to the day;
+# this avoids turning a bounded date window into a statement-timeout hotspot on
+# a cold PostgreSQL/WSL cache.
+_UNIVERSE_REBUILD_CODE_SQL = _UNIVERSE_REBUILD_SQL.replace(
+    "DELETE FROM pit.universe_daily WHERE trade_date BETWEEN %s AND %s;",
+    "DELETE FROM pit.universe_daily WHERE trade_date BETWEEN %s AND %s "
+    "AND ts_code = ANY(%s);",
+).replace(
+    "WHERE s.trade_date BETWEEN %s AND %s\nON CONFLICT",
+    "WHERE s.trade_date BETWEEN %s AND %s AND s.ts_code = ANY(%s)\nON CONFLICT",
+)
+_TRADEABILITY_REBUILD_CODE_SQL = _TRADEABILITY_REBUILD_SQL.replace(
+    "DELETE FROM pit.security_tradeability_daily WHERE trade_date BETWEEN %s AND %s;",
+    "DELETE FROM pit.security_tradeability_daily WHERE trade_date BETWEEN %s AND %s "
+    "AND ts_code = ANY(%s);",
+).replace(
+    "WHERE trade_date BETWEEN %s AND %s\nON CONFLICT",
+    "WHERE trade_date BETWEEN %s AND %s AND ts_code = ANY(%s)\nON CONFLICT",
+)
+
 
 class PitRepository(BaseRepository):
+    CODE_BATCH_SIZE = 500
+
     @staticmethod
     def _daily_scopes(scope: WorkScope):
         """Yield one-date scopes so JOIN-heavy PIT rebuilds stay short."""
@@ -88,22 +111,32 @@ class PitRepository(BaseRepository):
         self._require_date_range(scope, "rebuild_universe")
         total = 0
         for day_scope in self._daily_scopes(scope):
-            plan = SqlPlan(
-                operation=Operation.REBUILD,
-                target="pit.universe_daily",
-                scope=day_scope,
-                expected_mode="SET_BASED",
-                estimated_rows=10_000,
-                allow_insert_select=True,
-                allow_delete=True,
-            )
-            params = (
-                day_scope.date_from, day_scope.date_to,
-                day_scope.date_from, day_scope.date_to,
-            )
-            total += self.kernel.rebuild.run_scoped_merge(
-                sql=_UNIVERSE_REBUILD_SQL, plan=plan, context=context, params=params
-            )
+            for code_batch in self._code_batches(day_scope, "pit.universe_daily", context):
+                batch_scope = self._batch_scope(day_scope, code_batch)
+                plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="pit.universe_daily",
+                    scope=batch_scope,
+                    expected_mode="SET_BASED",
+                    estimated_rows=self.CODE_BATCH_SIZE,
+                    allow_insert_select=True,
+                    allow_delete=True,
+                )
+                if code_batch is None:
+                    params = (
+                        day_scope.date_from, day_scope.date_to,
+                        day_scope.date_from, day_scope.date_to,
+                    )
+                    sql = _UNIVERSE_REBUILD_SQL
+                else:
+                    params = (
+                        day_scope.date_from, day_scope.date_to, list(code_batch),
+                        day_scope.date_from, day_scope.date_to, list(code_batch),
+                    )
+                    sql = _UNIVERSE_REBUILD_CODE_SQL
+                total += self.kernel.rebuild.run_scoped_merge(
+                    sql=sql, plan=plan, context=context, params=params
+                )
         return total
 
     def rebuild_tradeability(self, scope: WorkScope, context: RunContext) -> int:
@@ -111,23 +144,87 @@ class PitRepository(BaseRepository):
         self._require_date_range(scope, "rebuild_tradeability")
         total = 0
         for day_scope in self._daily_scopes(scope):
-            plan = SqlPlan(
-                operation=Operation.REBUILD,
-                target="pit.security_tradeability_daily",
-                scope=day_scope,
-                expected_mode="SET_BASED",
-                estimated_rows=10_000,
-                allow_insert_select=True,
-                allow_delete=True,
-            )
-            params = (
-                day_scope.date_from, day_scope.date_to,
-                day_scope.date_from, day_scope.date_to,
-            )
-            total += self.kernel.rebuild.run_scoped_merge(
-                sql=_TRADEABILITY_REBUILD_SQL, plan=plan, context=context, params=params
-            )
+            for code_batch in self._code_batches(
+                day_scope, "pit.security_tradeability_daily", context
+            ):
+                batch_scope = self._batch_scope(day_scope, code_batch)
+                plan = SqlPlan(
+                    operation=Operation.REBUILD,
+                    target="pit.security_tradeability_daily",
+                    scope=batch_scope,
+                    expected_mode="SET_BASED",
+                    estimated_rows=self.CODE_BATCH_SIZE,
+                    allow_insert_select=True,
+                    allow_delete=True,
+                )
+                if code_batch is None:
+                    params = (
+                        day_scope.date_from, day_scope.date_to,
+                        day_scope.date_from, day_scope.date_to,
+                    )
+                    sql = _TRADEABILITY_REBUILD_SQL
+                else:
+                    params = (
+                        day_scope.date_from, day_scope.date_to, list(code_batch),
+                        day_scope.date_from, day_scope.date_to, list(code_batch),
+                    )
+                    sql = _TRADEABILITY_REBUILD_CODE_SQL
+                total += self.kernel.rebuild.run_scoped_merge(
+                    sql=sql, plan=plan, context=context, params=params
+                )
         return total
+
+    def _code_batches(
+        self,
+        day_scope: WorkScope,
+        target: str,
+        context: RunContext,
+    ):
+        """Return bounded code batches, retaining stale target rows for deletion."""
+        if day_scope.codes is not None:
+            if not day_scope.codes:
+                return
+            codes = set(day_scope.codes)
+        else:
+            read_scope = WorkScope(
+                date_from=day_scope.date_from,
+                date_to=day_scope.date_to,
+                partition=f"pit-code-set:{target}",
+            )
+            source_rows = self.kernel.read.query(
+                context=context,
+                source="std.security_status_daily",
+                columns=["ts_code"],
+                where={"trade_date__eq": day_scope.date_from},
+                limit=10_000,
+                scope=read_scope,
+            )
+            target_rows = self.kernel.read.query(
+                context=context,
+                source=target,
+                columns=["ts_code"],
+                where={"trade_date__eq": day_scope.date_from},
+                limit=10_000,
+                scope=read_scope,
+            )
+            codes = {str(row[0]) for row in source_rows}
+            codes.update(str(row[0]) for row in target_rows)
+        ordered = sorted(codes)
+        for offset in range(0, len(ordered), self.CODE_BATCH_SIZE):
+            yield tuple(ordered[offset : offset + self.CODE_BATCH_SIZE])
+        if not ordered:
+            # An empty source day must still clear stale target rows.
+            yield None
+
+    @staticmethod
+    def _batch_scope(day_scope: WorkScope, code_batch: tuple[str, ...] | None) -> WorkScope:
+        return WorkScope(
+            date_from=day_scope.date_from,
+            date_to=day_scope.date_to,
+            codes=code_batch,
+            dimensions=day_scope.dimensions,
+            partition=day_scope.partition,
+        )
 
     @staticmethod
     def _require_date_range(scope: WorkScope, fn: str) -> None:

@@ -146,6 +146,10 @@ def test_missing_pit_financial_input_is_not_treated_as_quality_pass():
     strategy._avg_amount_20["000001.SZ"] = 60_000_000.0
     strategy._current_amount["000001.SZ"] = 60_000_000.0
     assert strategy.generate_signals(day, (observation,), {}) == []
+    decision = strategy.last_decision_reason()
+    assert decision["no_action_reason_code"] == "NO_ELIGIBLE_CANDIDATE"
+    assert decision["failure_counts"]["FINANCIAL_AVAILABLE_DATE_UNAVAILABLE"] == 1
+    assert decision["failure_examples"]["FINANCIAL_AVAILABLE_DATE_UNAVAILABLE"] == ["000001.SZ"]
 
 
 def test_missing_st_status_is_fail_closed_for_entry_and_existing_holding():

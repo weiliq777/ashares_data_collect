@@ -12,6 +12,95 @@ from data_collect.data_access.repository.base import BaseRepository
 
 
 class DatasetRepository(BaseRepository):
+    def __init__(self, kernel) -> None:
+        super().__init__(kernel)
+        # A streaming backtest asks for bars/observations once per date. Cache
+        # the tiny component manifest once per Dataset so those reads never
+        # turn into one extra metadata query per trading day.
+        self._component_cache: dict[str, list[dict[str, Any]]] = {}
+        self._dataset_kind_cache: dict[str, str] = {}
+
+    def composition_components(
+        self, dataset_id: str, context: RunContext, *, allow_empty: bool = False,
+    ) -> list[dict[str, Any]]:
+        key = str(dataset_id)
+        if key not in self._component_cache:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_component",
+                """SELECT ordinal, component_dataset_id, effective_from, effective_to,
+                          component_input_manifest_hash, component_manifest_hash,
+                          component_baseline_tag, component_baseline_quality_report_hash
+                     FROM backtest.dataset_component
+                    WHERE composite_dataset_id=%s ORDER BY ordinal""",
+                (key,), WorkScope(partition=f"dataset-components:{key}"), 129,
+            )
+            if len(rows) > 128:
+                raise RuntimeError("组合数据集分段超过安全上限 128")
+            self._component_cache[key] = list(rows)
+            if rows:
+                self._dataset_kind_cache[key] = "COMPOSITE"
+        components = self._component_cache[key]
+        if not components:
+            kind = self._dataset_kind_cache.get(key)
+            if kind is None:
+                manifests = self.kernel.read._repository_query(
+                    context, "backtest.dataset_manifest",
+                    "SELECT dataset_kind FROM backtest.dataset_manifest WHERE dataset_id=%s",
+                    (key,), WorkScope(partition=f"dataset-kind:{key}"), 2,
+                )
+                kind = (
+                    str(manifests[0].get("dataset_kind") or "MATERIALIZED")
+                    if manifests else "MATERIALIZED"
+                )
+                if manifests:
+                    self._dataset_kind_cache[key] = kind
+            if kind == "COMPOSITE" and not allow_empty:
+                raise RuntimeError(f"COMPOSITE Dataset has no component rows: {key}")
+        return components
+
+    def create_composition_components(
+        self, composite_dataset_id: str, rows: Sequence[dict[str, Any]],
+        context: RunContext,
+    ) -> int:
+        if not rows:
+            raise ValueError("组合数据集必须包含至少一个组件")
+        materialized = [
+            {"composite_dataset_id": composite_dataset_id, **dict(row)}
+            for row in rows
+        ]
+        changed = self.kernel.write.upsert(
+            context,
+            WorkScope(partition=f"dataset-components:{composite_dataset_id}",
+                      dimensions={"dataset_id": composite_dataset_id}),
+            "backtest.dataset_component", materialized,
+            key=("composite_dataset_id", "ordinal"),
+            update_columns=(
+                "component_dataset_id", "effective_from", "effective_to",
+                "component_input_manifest_hash", "component_manifest_hash",
+                "component_baseline_tag", "component_baseline_quality_report_hash",
+            ),
+            skip_noop=True,
+        )
+        self._component_cache.pop(composite_dataset_id, None)
+        return changed
+
+    def _component_for_date(
+        self, dataset_id: str, day, context: RunContext,
+    ) -> dict[str, Any] | None:
+        for component in self.composition_components(dataset_id, context):
+            if component["effective_from"] <= day <= component["effective_to"]:
+                return component
+        return None
+
+    @staticmethod
+    def _component_cte() -> str:
+        return """WITH components AS (
+            SELECT ordinal, component_dataset_id AS dataset_id,
+                   effective_from, effective_to
+              FROM backtest.dataset_component
+             WHERE composite_dataset_id=%s
+        )"""
+
     def _set_based_plan(self, target: str, scope: WorkScope, *, allow_delete: bool = False) -> SqlPlan:
         return SqlPlan(operation=Operation.REBUILD, target=target, scope=scope, expected_mode="SET_BASED", allow_delete=allow_delete, estimated_rows=100_000)
 
@@ -51,7 +140,7 @@ class DatasetRepository(BaseRepository):
     def batch_checkpoint(self, dataset_id: str, batch_start, context: RunContext) -> dict[str, Any] | None:
         rows = self.kernel.read._repository_query(
             context, "backtest.dataset_build_batch_checkpoint",
-            """SELECT status,batch_end,row_count,batch_hash,code_version
+            """SELECT status,batch_end,row_count,batch_hash,code_version,details
                          FROM backtest.dataset_build_batch_checkpoint
                         WHERE dataset_id=%s AND stage='BUILD' AND batch_start=%s""",
             (dataset_id, batch_start), WorkScope(partition=f"batch:{dataset_id}"), 2,
@@ -443,7 +532,7 @@ class DatasetRepository(BaseRepository):
     def baseline(self, baseline_tag: str, context: RunContext) -> dict[str, Any] | None:
         rows = self.kernel.read._repository_query(
             context, "ops.tushare_data_release",
-            """SELECT status, baseline_cutoff_date, quality_report_hash,
+            """SELECT status, baseline_domain, baseline_cutoff_date, quality_report_hash,
                               source_manifest_hash, source_manifest
                          FROM ops.tushare_data_release
                         WHERE release_tag=%s""",
@@ -451,6 +540,8 @@ class DatasetRepository(BaseRepository):
         )
         if not rows:
             return None
+        if rows[0]["baseline_domain"] != "RESEARCH":
+            raise ValueError(f"backtest Dataset requires a RESEARCH baseline: {baseline_tag}")
         return rows[0]
 
     def calendar_status(self, days: Sequence, context: RunContext) -> dict[Any, Any]:
@@ -627,6 +718,23 @@ class DatasetRepository(BaseRepository):
         return [tuple(row[key] for key in keys) for row in rows]
 
     def dataset_open_dates(self, dataset_id: str, start, end, context: RunContext) -> list[Any]:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_calendar",
+                self._component_cte() + """
+                SELECT DISTINCT d.trade_date
+                  FROM components c
+                  JOIN backtest.dataset_calendar d ON d.dataset_id=c.dataset_id
+                   AND d.trade_date BETWEEN c.effective_from AND c.effective_to
+                 WHERE d.is_open IS TRUE AND d.trade_date BETWEEN %s AND %s
+                 ORDER BY d.trade_date
+                """,
+                (dataset_id, start, end),
+                WorkScope(date_from=start, date_to=end, partition=dataset_id),
+                100_000,
+            )
+            return [row["trade_date"] for row in rows]
         rows = self.kernel.read._repository_query(
             context, "backtest.dataset_calendar",
             """SELECT trade_date FROM backtest.dataset_calendar
@@ -681,18 +789,22 @@ class DatasetRepository(BaseRepository):
         rows = self.kernel.read._repository_query(
             context, "backtest.dataset_manifest",
             """SELECT dataset_id,dataset_version,dataset_name,data_baseline_tag AS baseline,
+                dataset_kind,
                 baseline_quality_report_hash,baseline_source_manifest_hash,schema_version,adapter_version,
-                feature_version,warmup_start,evaluation_start,evaluation_end,out_of_sample_start,
-                market_rule_version,fee_rule_version,status,built_at,validated_at,frozen_at,input_manifest_hash,
+                feature_version,price_adjustment_mode,warmup_start,evaluation_start,evaluation_end,out_of_sample_start,
+                calendar_rule_version,market_rule_version,fee_rule_version,status,built_at,validated_at,frozen_at,input_manifest_hash,
                 selection_predicate,selected_columns,hash_algorithm,availability_rules,calendar_hash,rules_hash,
                 execution_hash,corporate_action_hash,benchmark_code,benchmark_hash,
-                benchmark_source_manifest,benchmark_source_manifest_hash,quality_report_hash,
+                benchmark_source_manifest,benchmark_source_manifest_hash,quality_report,quality_report_hash,
                 code_version,git_commit,git_dirty,diff_hash,code_archive_path,code_archive_sha256,
                 code_archive_size_bytes FROM backtest.dataset_manifest WHERE dataset_id=%s""",
             (dataset_id,), WorkScope(partition=str(dataset_id), dimensions={"dataset_id": dataset_id}), 2,
         )
         if not rows:
             raise ValueError(f"不存在的 Backtest Dataset: {dataset_id}")
+        self._dataset_kind_cache[str(dataset_id)] = str(
+            rows[0].get("dataset_kind") or "MATERIALIZED"
+        )
         return rows[0]
 
     def frozen_snapshot_ids(self, baseline_tag: str, schema_version: str, start, end, context: RunContext) -> list[str]:
@@ -745,10 +857,10 @@ class DatasetRepository(BaseRepository):
         )
 
     def resume_failed(self, dataset_id: str, context: RunContext) -> int:
-        return self.kernel.write.upsert(
-            context, WorkScope(partition=str(dataset_id), dimensions={"dataset_id": dataset_id}),
-            "backtest.dataset_manifest", [{"dataset_id": dataset_id, "status": "BUILDING", "failure_reason": None, "failed_at": None}],
-            key=("dataset_id",), update_columns=("status", "failure_reason", "failed_at"), skip_noop=True,
+        return self.kernel.write.resume_failed_dataset_manifest(
+            context,
+            WorkScope(partition=str(dataset_id), dimensions={"dataset_id": dataset_id}),
+            dataset_id,
         )
     """Typed repository boundary for backtest Dataset artifacts.
 
@@ -771,6 +883,19 @@ class DatasetRepository(BaseRepository):
         return rows[0]
 
     def read_members(self, dataset_id: str, context: RunContext) -> list[dict[str, Any]]:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            return self.kernel.read._repository_query(
+                context, "backtest.dataset_member",
+                self._component_cte() + """
+                SELECT m.research_date, m.member_role, m.research_snapshot_id
+                  FROM components c
+                  JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                 WHERE m.research_date BETWEEN c.effective_from AND c.effective_to
+                 ORDER BY m.research_date
+                """,
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
         return self.kernel.read._repository_query(
             context=context,
             source="backtest.dataset_member",
@@ -789,6 +914,27 @@ class DatasetRepository(BaseRepository):
         self, dataset_id: str, context: RunContext,
     ) -> list[dict[str, Any]]:
         """Read Dataset members with their immutable Research contract identity."""
+        components = self.composition_components(dataset_id, context)
+        if components:
+            return self.kernel.read._repository_query(
+                context,
+                "backtest.dataset_member",
+                self._component_cte() + """
+                SELECT m.research_date, m.research_snapshot_id,
+                       s.status AS snapshot_status,
+                       s.schema_version AS research_schema_version,
+                       s.data_baseline_tag AS research_baseline
+                  FROM components c
+                  JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                  JOIN research.snapshot_manifest s
+                    ON s.snapshot_id=m.research_snapshot_id
+                 WHERE m.research_date BETWEEN c.effective_from AND c.effective_to
+                 ORDER BY m.research_date, m.research_snapshot_id
+                """,
+                (dataset_id,),
+                WorkScope(partition=dataset_id),
+                max_rows=100_000,
+            )
         return self.kernel.read._repository_query(
             context,
             "backtest.dataset_member",
@@ -817,6 +963,13 @@ class DatasetRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("execution page limit must be between 1 and 50000")
+        components = self.composition_components(dataset_id, context)
+        if components:
+            raise RuntimeError(
+                "execution_page is a materialized-table validation reader; "
+                "COMPOSITE validation must inherit frozen component proofs and "
+                "must not rescan merged execution facts"
+            )
         keyset = "" if last_key is None else " AND (trade_date, ts_code) > (%s, %s)"
         params = (dataset_id,) if last_key is None else (dataset_id, *last_key)
         return self.kernel.read._repository_query(
@@ -841,6 +994,21 @@ class DatasetRepository(BaseRepository):
         )
 
     def open_calendar(self, dataset_id: str, context: RunContext) -> tuple:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_calendar",
+                self._component_cte() + """
+                SELECT DISTINCT d.trade_date
+                  FROM components c
+                  JOIN backtest.dataset_calendar d ON d.dataset_id=c.dataset_id
+                   AND d.trade_date BETWEEN c.effective_from AND c.effective_to
+                 WHERE d.is_open IS TRUE
+                 ORDER BY d.trade_date
+                """,
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
+            return tuple(row["trade_date"] for row in rows)
         rows = self.kernel.read._repository_query(
             context, "backtest.dataset_calendar",
             """SELECT trade_date FROM backtest.dataset_calendar
@@ -856,6 +1024,43 @@ class DatasetRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("bar page limit must be between 1 and 50000")
+        components = self.composition_components(dataset_id, context)
+        if components:
+            if date_from is not None and date_to is not None and date_from == date_to:
+                component = self._component_for_date(dataset_id, date_from, context)
+                if component is None:
+                    return []
+                return self.bar_page(
+                    str(component["component_dataset_id"]), context, last_key, limit,
+                    date_from=date_from, date_to=date_to,
+                )
+            keyset = "" if last_key is None else " AND (b.trade_date, b.ts_code) > (%s, %s)"
+            bounds = ""
+            params: tuple[Any, ...] = (dataset_id,)
+            if date_from is not None:
+                bounds += " AND b.trade_date >= %s"
+                params += (date_from,)
+            if date_to is not None:
+                bounds += " AND b.trade_date <= %s"
+                params += (date_to,)
+            if last_key is not None:
+                params += tuple(last_key)
+            return self.kernel.read._repository_query(
+                context, "backtest.dataset_execution_bar",
+                self._component_cte() + f"""
+                SELECT b.trade_date, b.ts_code, b.raw_open, b.raw_high, b.raw_low,
+                       b.raw_close, b.volume, b.amount, b.up_limit, b.down_limit,
+                       b.is_suspended, b.can_buy, b.can_sell, b.limit_status, b.market
+                  FROM components c
+                  JOIN backtest.dataset_execution_bar b ON b.dataset_id=c.dataset_id
+                   AND b.trade_date BETWEEN c.effective_from AND c.effective_to
+                 WHERE TRUE {bounds} {keyset}
+                 ORDER BY b.trade_date, b.ts_code LIMIT {int(limit)}
+                """,
+                params,
+                WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to),
+                limit,
+            )
         keyset = "" if last_key is None else " AND (trade_date, ts_code) > (%s, %s)"
         bounds = ""
         params: tuple[Any, ...] = (dataset_id,)
@@ -888,6 +1093,44 @@ class DatasetRepository(BaseRepository):
         if not columns or any(not str(column).isidentifier() for column in columns):
             raise ValueError("observation columns must be identifiers")
         selected = ", ".join(f"s.{column}" for column in columns)
+        components = self.composition_components(dataset_id, context)
+        if components:
+            if date_from is not None and date_to is not None and date_from == date_to:
+                component = self._component_for_date(dataset_id, date_from, context)
+                if component is None:
+                    return []
+                return self.observation_page(
+                    str(component["component_dataset_id"]), columns, context,
+                    last_key, limit, date_from=date_from, date_to=date_to,
+                )
+            keyset = "" if last_key is None else " AND (s.research_date, s.ts_code) > (%s, %s)"
+            bounds = ""
+            params: tuple[Any, ...] = (dataset_id,)
+            if date_from is not None:
+                bounds += " AND s.research_date >= %s"
+                params += (date_from,)
+            if date_to is not None:
+                bounds += " AND s.research_date <= %s"
+                params += (date_to,)
+            if last_key is not None:
+                params += tuple(last_key)
+            return self.kernel.read._repository_query(
+                context, "backtest.dataset_member",
+                self._component_cte() + f"""
+                SELECT {selected}
+                  FROM components c
+                  JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                   AND m.research_date BETWEEN c.effective_from AND c.effective_to
+                  JOIN research.stock_snapshot_daily s
+                    ON s.snapshot_id=m.research_snapshot_id
+                   AND s.research_date=m.research_date
+                 WHERE TRUE {bounds} {keyset}
+                 ORDER BY s.research_date, s.ts_code LIMIT {int(limit)}
+                """,
+                params,
+                WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to),
+                limit,
+            )
         keyset = "" if last_key is None else " AND (s.research_date, s.ts_code) > (%s, %s)"
         bounds = ""
         params: tuple[Any, ...] = (dataset_id,)
@@ -912,12 +1155,94 @@ class DatasetRepository(BaseRepository):
         )
 
     def load_dividends(self, dataset_id: str, context: RunContext) -> list[tuple]:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_dividend_event",
+                self._component_cte() + """
+                SELECT d.ts_code, d.report_date, d.announce_date, d.implementation_status,
+                       d.stock_div, d.stock_bonus_rate, d.stock_conversion_rate, d.cash_div,
+                       d.cash_div_tax, d.record_date, d.ex_date, d.pay_date, d.div_list_date,
+                       d.implementation_announce_date, d.source_record_key,
+                       d.source_record_version, d.source_payload_hash
+                  FROM components c
+                  JOIN backtest.dataset_dividend_event d ON d.dataset_id=c.dataset_id
+                   AND d.ex_date BETWEEN c.effective_from AND c.effective_to
+                 ORDER BY d.ex_date, d.ts_code, d.source_record_key, d.source_record_version
+                """,
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
+            keys = (
+                "ts_code", "report_date", "announce_date", "implementation_status",
+                "stock_div", "stock_bonus_rate", "stock_conversion_rate", "cash_div",
+                "cash_div_tax", "record_date", "ex_date", "pay_date", "div_list_date",
+                "implementation_announce_date", "source_record_key",
+                "source_record_version", "source_payload_hash",
+            )
+            return [tuple(row[key] for key in keys) for row in rows]
         return self.materialized_dividend_rows(dataset_id, context)
 
     def load_rules(self, dataset_id: str, context: RunContext) -> list[tuple]:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_rule_snapshot",
+                self._component_cte() + """
+                SELECT c.ordinal, r.rule_version, r.market_rule_version, r.fee_rule_version,
+                       r.effective_from, r.effective_to, r.market, r.min_buy_lot,
+                       r.allow_sell_odd_lot, r.t_plus_one, r.price_tick,
+                       r.cash_settlement_days, r.limit_pct, r.commission_rate,
+                       r.min_commission, r.stamp_duty_sell_rate, r.transfer_fee_rate,
+                       r.slippage_bps, r.parameters, r.rule_hash
+                  FROM components c
+                  JOIN backtest.dataset_rule_snapshot r ON r.dataset_id=c.dataset_id
+                   AND r.effective_from <= c.effective_to
+                   AND COALESCE(r.effective_to, DATE '9999-12-31') >= c.effective_from
+                 ORDER BY r.effective_from, r.market, r.rule_version, c.ordinal DESC
+                """,
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
+            deduplicated: dict[tuple[Any, ...], tuple] = {}
+            keys = (
+                "rule_version", "market_rule_version", "fee_rule_version",
+                "effective_from", "effective_to", "market", "min_buy_lot",
+                "allow_sell_odd_lot", "t_plus_one", "price_tick",
+                "cash_settlement_days", "limit_pct", "commission_rate",
+                "min_commission", "stamp_duty_sell_rate", "transfer_fee_rate",
+                "slippage_bps", "parameters", "rule_hash",
+            )
+            identity_keys = ("rule_version", "market_rule_version", "fee_rule_version", "effective_from", "market")
+            for row in rows:
+                identity = tuple(row[key] for key in identity_keys)
+                value = tuple(row[key] for key in keys)
+                previous = deduplicated.get(identity)
+                if previous is not None and previous != value:
+                    raise RuntimeError(
+                        "组合 Dataset 的重复生效规则内容不一致: "
+                        f"{identity}"
+                    )
+                deduplicated[identity] = value
+            return sorted(
+                deduplicated.values(), key=lambda row: (row[3], row[5], row[0])
+            )
         return self.materialized_rule_rows(dataset_id, context)
 
     def load_benchmark_closes(self, dataset_id: str, benchmark_code: str, context: RunContext) -> dict[Any, float]:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_benchmark_bar",
+                self._component_cte() + """
+                SELECT b.trade_date, b.close
+                  FROM components c
+                  JOIN backtest.dataset_benchmark_bar b ON b.dataset_id=c.dataset_id
+                   AND b.trade_date BETWEEN c.effective_from AND c.effective_to
+                 WHERE b.ts_code=%s ORDER BY b.trade_date
+                """,
+                (dataset_id, benchmark_code),
+                WorkScope(partition=dataset_id), 100_000,
+            )
+            return {row["trade_date"]: float(row["close"]) for row in rows}
         rows = self.kernel.read._repository_query(
             context, "backtest.dataset_benchmark_bar",
             "SELECT trade_date, close FROM backtest.dataset_benchmark_bar WHERE dataset_id=%s AND ts_code=%s ORDER BY trade_date",
@@ -926,6 +1251,26 @@ class DatasetRepository(BaseRepository):
         return {row["trade_date"]: float(row["close"]) for row in rows}
 
     def member_roles_and_snapshots(self, dataset_id: str, context: RunContext) -> tuple[dict[Any, str], dict[Any, str]]:
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_member",
+                self._component_cte() + """
+                SELECT m.research_date, m.member_role, m.research_snapshot_id
+                  FROM components c
+                  JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                   AND m.research_date BETWEEN c.effective_from AND c.effective_to
+                 ORDER BY m.research_date
+                """,
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
+            dates = [row["research_date"] for row in rows]
+            if len(dates) != len(set(dates)):
+                raise RuntimeError("组合 Dataset 同一交易日存在多个快照成员")
+            return (
+                {row["research_date"]: row["member_role"] for row in rows},
+                {row["research_date"]: str(row["research_snapshot_id"]) for row in rows},
+            )
         rows = self.kernel.read._repository_query(
             context, "backtest.dataset_member",
             "SELECT research_date, member_role, research_snapshot_id FROM backtest.dataset_member WHERE dataset_id=%s",
@@ -942,14 +1287,11 @@ class DatasetRepository(BaseRepository):
         context: RunContext,
         batch_rows: int = 5_000,
     ):
-        # Resolve each bounded date/code key once per source table.  The old
-        # implementation performed four LATERAL lookups for every snapshot
-        # row.  That was logically correct but produced tens of thousands of
-        # tiny index probes per five-day batch and could make a single FETCH
-        # exceed the Kernel statement timeout on a cold WSL/PostgreSQL cache.
-        # These materialized, date-bounded source sets preserve the same
-        # latest-version and Raw fallback semantics while keeping the query
-        # set-based and bounded to the current Dataset batch.
+        # Resolve each bounded date/code key once per source table.  Source
+        # rows are narrowed by the current source date window before joining
+        # the Dataset keys.  This avoids one index probe per snapshot row and
+        # keeps the query set-based and bounded even when PostgreSQL has stale
+        # statistics for the partitioned snapshot table.
         sql = """
             WITH base AS MATERIALIZED (
                 SELECT m.research_date AS day, s.ts_code AS code, s.market AS market,

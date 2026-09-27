@@ -20,7 +20,14 @@ def _report():
             "execution_model_version": "daily-next-open-v2",
             "git_commit": "commit-1",
         },
-        "scope": {"signal_date_from": "2021-01-01", "signal_date_to": "2025-12-31"},
+        "scope": {
+            "evaluation_date_from": "2021-09-01",
+            "evaluation_date_to": "2026-08-21",
+            "performance_date_from": "2021-09-01",
+            "performance_date_to": "2026-08-21",
+            "signal_date_from": "2021-11-05",
+            "signal_date_to": "2023-09-08",
+        },
         "persisted_metrics": {
             "final_equity": 4032.39,
             "total_return": -0.5968,
@@ -59,9 +66,23 @@ def _report():
             "net_return": -0.2, "exit_reason": "MA60_EXIT", "entry_ret60": 0.25,
         }],
         "forward_returns": {"horizon_20d": {"available_count": 1, "returns": {"mean": -0.1, "median": -0.1, "min": -0.1, "max": -0.1}}},
+        "decision_log": {
+            "summary": {"days": 2, "no_action_days": 1,
+                         "reason_counts": {"NO_ELIGIBLE_CANDIDATE": 1},
+                         "dominant_failure_counts": {"ROE_MISSING": 1}},
+            "rows": [{"trade_date": "2024-01-02", "reason": {
+                "decision_type": "NO_ACTION", "no_action_reason_code": "NO_ELIGIBLE_CANDIDATE",
+                "dominant_failure_code": "ROE_MISSING", "eligible_candidate_count": 0,
+                "buy_signal_count": 0, "sell_signal_count": 0,
+            }}],
+        },
         "evaluation": {
             "calendar": {
-                "month": [{"period": "2024-01", "strategy_return": -0.1, "benchmark_return": 0.01, "excess_return": -0.11}],
+                "month": [{
+                    "period": "2024-01", "strategy_return": -0.1, "benchmark_return": 0.01,
+                    "excess_return": -0.11, "observation_days": 22, "invested_days": 22,
+                    "cash_only_days": 0, "activity_status": "INVESTED",
+                }],
                 "quarter": [], "year": [],
             },
             "rolling_12m": [],
@@ -82,6 +103,11 @@ def test_diagnostic_markdown_contains_identity_and_audit_boundaries():
     assert "未来价格路径（事后 Evaluation）" in output
     assert "不得把事后数据倒灌回历史信号" in output
     assert "Raw（原始层）、Standard（标准层）" in output
+    assert "2021-09-01 ～ 2026-08-21" in output
+    assert "2021-11-05 ～ 2023-09-08" in output
+    assert "活动状态" in output
+    assert "每日决策与空仓原因" in output
+    assert "NO_ELIGIBLE_CANDIDATE" in output
 
 
 def test_diagnostic_markdown_escapes_table_delimiters_and_capital_appendix():

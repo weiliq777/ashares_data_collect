@@ -5,6 +5,7 @@ import pytest
 from data_collect.pipeline import (
     _topological_sort,
     _get_current_platform,
+    _run_one_task,
     TaskResult,
     execute_in_subprocess,
 )
@@ -71,6 +72,83 @@ def test_task_result_dataclass():
     assert r.name == "test"
     assert r.success
     assert not r.skipped
+
+
+def test_financial_retry_reuses_one_parent_batch_id(monkeypatch):
+    import data_collect.pipeline as pipeline
+
+    seen = []
+
+    def fake_execute(job_path, fn_name, timeout=None, **kwargs):
+        seen.append(kwargs["batch_id"])
+        if len(seen) == 1:
+            raise RuntimeError("transient")
+        return "ok"
+
+    monkeypatch.setattr(pipeline, "execute_in_subprocess", fake_execute)
+    result = _run_one_task(
+        {
+            "name": "financial_retry",
+            "job": "data_collect.jobs.tushare_financial_vip_incremental",
+            "retries": 1,
+        },
+        "20260905",
+        {},
+    )
+    assert result.success
+    assert len(seen) == 2
+    assert seen[0] == seen[1]
+
+
+def test_financial_consumer_retry_reuses_execution_id_and_marks_attempt(monkeypatch):
+    import data_collect.pipeline as pipeline
+
+    seen = []
+
+    def fake_execute(job_path, fn_name, timeout=None, **kwargs):
+        seen.append((kwargs["execution_id"], kwargs["attempt"]))
+        if len(seen) == 1:
+            raise RuntimeError("transient")
+        return "ok"
+
+    monkeypatch.setattr(pipeline, "execute_in_subprocess", fake_execute)
+    result = _run_one_task(
+        {
+            "name": "financial_consumer_retry",
+            "job": "data_collect.jobs.tushare_production_financial_derived",
+            "retries": 1,
+        },
+        "20260905",
+        {},
+    )
+    assert result.success
+    assert seen[0][0] == seen[1][0]
+    assert [item[1] for item in seen] == [1, 2]
+
+
+def test_market_derived_retry_reuses_execution_id_but_new_run_gets_new_id(monkeypatch):
+    import data_collect.pipeline as pipeline
+
+    seen = []
+
+    def fake_execute(job_path, fn_name, timeout=None, **kwargs):
+        seen.append(kwargs["execution_id"])
+        if len(seen) == 1:
+            raise RuntimeError("transient")
+        return "ok"
+
+    monkeypatch.setattr(pipeline, "execute_in_subprocess", fake_execute)
+    task = {
+        "name": "market_derived",
+        "job": "data_collect.jobs.tushare_production_market_derived",
+        "retries": 1,
+    }
+    assert _run_one_task(task, "20260925", {}).success
+    first_execution_id = seen[0]
+    assert seen[1] == first_execution_id
+
+    assert _run_one_task(task, "20260925", {}).success
+    assert seen[2] != first_execution_id
 
 
 # ===== execute_in_subprocess 超时/成功 =====

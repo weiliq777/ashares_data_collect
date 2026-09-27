@@ -116,9 +116,13 @@ class Phase2RawRepository(BaseRepository):
         rows = self.kernel.read._repository_query(
             context, "ops.tushare_data_release",
             """SELECT baseline_cutoff_date FROM ops.tushare_data_release
-                WHERE status='validated' ORDER BY validated_at DESC NULLS LAST, release_id DESC LIMIT 1""",
+                WHERE status IN ('validated', 'superseded')
+                  AND baseline_domain='RESEARCH'
+                ORDER BY CASE WHEN status='validated' THEN 0 ELSE 1 END,
+                         baseline_cutoff_date DESC,
+                         validated_at DESC NULLS LAST, release_id DESC LIMIT 1""",
             scope=WorkScope(partition="phase2:baseline"), max_rows=2,
         )
         if not rows:
-            raise RuntimeError("no validated data release baseline")
+            raise RuntimeError("no non-revoked RESEARCH data release watermark")
         return rows[0]["baseline_cutoff_date"]

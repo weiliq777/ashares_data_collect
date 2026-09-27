@@ -5,10 +5,14 @@ bulk_insert 大量纯插入（staging / 新版本）。
 """
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import date
 from typing import Any, Mapping, Sequence
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
+from data_collect.data_access.release_change_capture import RELEASE_CHANGE_LOCK_KEY
 from data_collect.data_access.query_guard import validate_qualified_name, validate_table_name
 from data_collect.data_access.bulk_loader import (
     copy_or_execute_values,
@@ -90,7 +94,10 @@ class WriteGateway:
                 continue
             self._kernel._reserve_atomic_chunk(chunk)
             n = self._kernel._run_chunk(
-                lambda: self._upsert_chunk(t, columns, chunk, key, update_columns, skip_noop)
+                lambda: self._upsert_chunk(t, columns, chunk, key, update_columns, skip_noop),
+                change_event=self._kernel._build_release_change_event(
+                    context, "UPSERT", t, scope, rows=chunk,
+                ),
             )
             written += n
             self._kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, idx)
@@ -147,6 +154,9 @@ class WriteGateway:
             n = self._kernel._run_chunk(
                 lambda: self._insert_chunk(t, columns, chunk),
                 idempotent=False,
+                change_event=self._kernel._build_release_change_event(
+                    context, "BULK_INSERT", t, scope, rows=chunk,
+                ),
             )
             written += n
             self._kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, idx)
@@ -180,19 +190,47 @@ class WriteGateway:
             if idx <= resume_after:
                 continue
             self._kernel._reserve_atomic_chunk(chunk)
-            written += self._kernel._run_chunk(lambda: self._insert_ignore_chunk(t, columns, chunk))
+            written += self._kernel._run_chunk(
+                lambda: self._insert_ignore_chunk(t, columns, chunk),
+                change_event=self._kernel._build_release_change_event(
+                    context, "BULK_INSERT_IGNORE", t, scope, rows=chunk,
+                ),
+            )
             self._kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, idx)
         self._kernel._checkpoint_done(context.run_id, context.job_name, scope_key)
         return len(rows), written
 
     def claim_financial_queue(
         self, context: RunContext, scope: WorkScope, limit: int = 10000,
+        lease_seconds: int = 4 * 60 * 60, max_attempts: int = 5,
+        claim_owner_id: str | None = None, takeover: bool = False,
+        through_date: date | None = None,
     ) -> tuple[list[int], list[str]]:
-        """Claim a bounded financial change queue batch atomically."""
+        """Claim a bounded financial change queue batch atomically.
+
+        A claim is a lease owned by ``context.run_id``.  Expired claims are
+        reclaimed before picking new work; items that have exhausted their
+        retry budget are quarantined instead of being retried forever.
+        """
         if not isinstance(context, RunContext) or not isinstance(scope, WorkScope):
             raise TypeError("claim_financial_queue requires RunContext and WorkScope")
+        if not isinstance(through_date, date):
+            raise ValueError(
+                "financial queue claim requires through_date; "
+                "an unscoped claim is not allowed"
+            )
         if limit <= 0 or limit > 10000:
             raise ValueError("financial queue claim limit must be in 1..10000")
+        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or not 60 <= lease_seconds <= 7 * 24 * 60 * 60:
+            raise ValueError("financial queue lease_seconds must be an integer in 60..604800")
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 100:
+            raise ValueError("financial queue max_attempts must be an integer in 1..100")
+        if claim_owner_id is None:
+            claim_owner_id = context.run_id
+        if not isinstance(claim_owner_id, str) or not claim_owner_id.strip() or len(claim_owner_id) > 160:
+            raise ValueError("financial queue claim_owner_id must be a non-empty string of at most 160 characters")
+        if not isinstance(takeover, bool):
+            raise TypeError("financial queue takeover must be bool")
         if limit > self._kernel.transaction_manager.config.max_rows_per_tx:
             raise ValueError("financial queue claim exceeds transaction row budget")
         plan = SqlPlan(operation=Operation.UPSERT, target="ops.financial_change_queue", scope=scope, expected_mode="ROW_BASED", estimated_rows=limit)
@@ -201,18 +239,80 @@ class WriteGateway:
         def claim() -> tuple[list[int], list[str]]:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
+                # Bound recovery as well as claiming.  This keeps a large
+                # historical outage from turning the recovery step into a
+                # single unbounded write transaction.
+                cur.execute(
+                    """WITH reclaimable AS (
+                           SELECT q.queue_id
+                             FROM ops.financial_change_queue q
+                            WHERE (
+                                      q.status='RUNNING'
+                                  AND (
+                                         q.lease_expires_at <= CURRENT_TIMESTAMP
+                                      OR (
+                                             q.lease_expires_at IS NULL
+                                         AND q.updated_at <= CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                                      )
+                                      OR (
+                                             %s
+                                         AND q.claim_run_id=%s
+                                         AND q.claim_owner_id IS DISTINCT FROM %s
+                                      )
+                                  )
+                                  AND (q.available_date IS NULL OR q.available_date <= %s)
+                            )
+                               OR (
+                                      q.status IN ('PENDING','FAILED')
+                                  AND q.attempts >= %s
+                                  AND (q.available_date IS NULL OR q.available_date <= %s)
+                            )
+                            ORDER BY q.queue_id
+                            LIMIT %s
+                            FOR UPDATE SKIP LOCKED
+                       )
+                       UPDATE ops.financial_change_queue q
+                          SET status=CASE
+                                         WHEN q.attempts >= %s THEN 'QUARANTINED'
+                                         ELSE 'FAILED'
+                                     END,
+                              last_error=CASE
+                                             WHEN q.attempts >= %s
+                                             THEN 'financial queue retry budget exhausted'
+                                             ELSE 'financial queue lease expired and was reclaimed'
+                              END,
+                              claim_run_id=NULL,
+                              claim_owner_id=NULL,
+                              lease_expires_at=NULL,
+                              updated_at=CURRENT_TIMESTAMP
+                         FROM reclaimable r
+                        WHERE q.queue_id=r.queue_id""",
+                    (
+                        takeover, context.run_id, claim_owner_id,
+                        through_date, max_attempts, through_date,
+                        limit, max_attempts, max_attempts,
+                    ),
+                )
                 cur.execute(
                     """WITH picked AS (
                            SELECT queue_id FROM ops.financial_change_queue
                             WHERE status IN ('PENDING','FAILED')
+                              AND attempts < %s
+                              AND available_date IS NOT NULL
+                              AND available_date <= %s
                             ORDER BY queue_id LIMIT %s FOR UPDATE SKIP LOCKED
                        )
                        UPDATE ops.financial_change_queue q
-                          SET status='RUNNING', attempts=q.attempts+1, updated_at=CURRENT_TIMESTAMP
+                          SET status='RUNNING',
+                              attempts=q.attempts+1,
+                              claim_run_id=%s,
+                              claim_owner_id=%s,
+                              lease_expires_at=CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                              updated_at=CURRENT_TIMESTAMP
                          FROM picked
                         WHERE q.queue_id=picked.queue_id
                        RETURNING q.queue_id, q.ts_code""",
-                    (limit,),
+                    (max_attempts, through_date, limit, context.run_id, claim_owner_id, lease_seconds),
                 )
                 rows = cur.fetchall()
             return [int(row[0]) for row in rows], [str(row[1]) for row in rows]
@@ -224,7 +324,8 @@ class WriteGateway:
 
     def update_financial_queue(
         self, context: RunContext, scope: WorkScope, queue_ids: Sequence[int],
-        status: str, error: str | None,
+        status: str, error: str | None, claim_owner_id: str | None = None,
+        processed_through: date | None = None,
     ) -> int:
         """Complete/fail a typed financial queue batch."""
         ids = tuple(int(value) for value in queue_ids)
@@ -232,6 +333,13 @@ class WriteGateway:
             return 0
         if status not in {"DONE", "FAILED", "PENDING"}:
             raise ValueError(f"unsupported financial queue status: {status}")
+        if status == "DONE" and not isinstance(processed_through, date):
+            raise ValueError("DONE financial queue updates require processed_through")
+        if status != "DONE" and processed_through is not None:
+            raise ValueError("processed_through is only valid for DONE financial queue updates")
+        owner = context.run_id if claim_owner_id is None else claim_owner_id
+        if not isinstance(owner, str) or not owner.strip() or len(owner) > 160:
+            raise ValueError("financial queue claim_owner_id must be a non-empty string of at most 160 characters")
         plan = SqlPlan(operation=Operation.UPSERT, target="ops.financial_change_queue", scope=scope, expected_mode="ROW_BASED", estimated_rows=len(ids))
         self._kernel.query_guard.check(plan)
 
@@ -241,31 +349,179 @@ class WriteGateway:
                 cur.execute(
                     """UPDATE ops.financial_change_queue
                           SET status=%s, last_error=%s, updated_at=CURRENT_TIMESTAMP,
-                              completed_at=CASE WHEN %s='DONE' THEN CURRENT_TIMESTAMP ELSE completed_at END
-                        WHERE queue_id = ANY(%s)""",
-                    (status, error, status, list(chunk)),
+                              completed_at=CASE WHEN %s='DONE' THEN CURRENT_TIMESTAMP ELSE completed_at END,
+                              processed_through=CASE WHEN %s='DONE' THEN %s ELSE processed_through END,
+                              claim_run_id=NULL,
+                              claim_owner_id=NULL,
+                              lease_expires_at=NULL
+                        WHERE queue_id = ANY(%s)
+                          AND status='RUNNING'
+                          AND claim_owner_id=%s""",
+                    (status, error, status, status, processed_through, list(chunk), owner),
                 )
                 return int(cur.rowcount or 0)
 
         total = 0
-        scope_key = self._kernel._checkpoint_batch_scope_key(
-            "financial-queue", status, scope, ids
-        )
-        resume_after, done = self._kernel._checkpoint_cursor(context, scope_key)
-        if done:
-            return 0
         for index, chunk in enumerate(
             self._kernel.chunk_planner.iter_chunks(ids, bytes_per_row=8), 1
         ):
-            if index <= resume_after:
-                continue
             self._kernel._reserve_atomic_chunk(chunk)
             total += self._kernel._run_chunk(lambda chunk=chunk: update(chunk))
-            self._kernel._checkpoint_progress(
-                context.run_id, context.job_name, scope_key, index
-            )
-        self._kernel._checkpoint_done(context.run_id, context.job_name, scope_key)
         return total
+
+    def requeue_quarantined_financial_queue(
+        self, context: RunContext, scope: WorkScope, queue_ids: Sequence[int],
+        approved_by: str, reason: str, reset_attempts: bool = True,
+    ) -> int:
+        """Move explicitly approved quarantine rows back to PENDING.
+
+        This is an administrative recovery boundary, not an automatic retry.
+        The bounded, owner-independent update is auditable and refuses partial
+        transitions so an operator cannot believe that all requested rows were
+        recovered when one of them had already changed state.
+        """
+        ids = tuple(dict.fromkeys(int(value) for value in queue_ids))
+        if not ids:
+            return 0
+        if len(ids) > 1000:
+            raise ValueError("at most 1000 quarantined queue IDs may be transitioned per operation")
+        self._validate_queue_resolution(approved_by, reason, reset_attempts)
+        plan = SqlPlan(operation=Operation.UPSERT, target="ops.financial_change_queue", scope=scope, expected_mode="ROW_BASED", estimated_rows=len(ids))
+        self._kernel.query_guard.check(plan)
+
+        def requeue(chunk) -> int:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE ops.financial_change_queue
+                              SET status='PENDING',
+                                  attempts=CASE WHEN %s THEN 0 ELSE attempts END,
+                                  last_error=%s,
+                                  claim_run_id=NULL,
+                                  claim_owner_id=NULL,
+                                  lease_expires_at=NULL,
+                                  completed_at=NULL,
+                                  processed_through=NULL,
+                                  quarantine_resolved_by=%s,
+                                  quarantine_resolved_at=CURRENT_TIMESTAMP,
+                                  quarantine_resolution_reason=%s,
+                                  updated_at=CURRENT_TIMESTAMP
+                            WHERE queue_id=ANY(%s)
+                              AND status='QUARANTINED'""",
+                    (reset_attempts, f"requeued: {reason}", approved_by, reason, list(chunk)),
+                )
+                return int(cur.rowcount or 0)
+
+        return self._transition_quarantined_queue(
+            ids, scope, plan, requeue, context, expected_status="PENDING"
+        )
+
+    def resolve_quarantined_financial_queue(
+        self, context: RunContext, scope: WorkScope, queue_ids: Sequence[int],
+        approved_by: str, reason: str,
+    ) -> int:
+        """Close explicitly reviewed quarantine rows without deriving them."""
+        ids = tuple(dict.fromkeys(int(value) for value in queue_ids))
+        if not ids:
+            return 0
+        if len(ids) > 1000:
+            raise ValueError("at most 1000 quarantined queue IDs may be transitioned per operation")
+        self._validate_queue_resolution(approved_by, reason, True)
+        plan = SqlPlan(operation=Operation.UPSERT, target="ops.financial_change_queue", scope=scope, expected_mode="ROW_BASED", estimated_rows=len(ids))
+        self._kernel.query_guard.check(plan)
+
+        def resolve(chunk) -> int:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE ops.financial_change_queue
+                              SET status='RESOLVED',
+                                  last_error=%s,
+                                  claim_run_id=NULL,
+                                  claim_owner_id=NULL,
+                                  lease_expires_at=NULL,
+                                  quarantine_resolved_by=%s,
+                                  quarantine_resolved_at=CURRENT_TIMESTAMP,
+                                  quarantine_resolution_reason=%s,
+                                  updated_at=CURRENT_TIMESTAMP
+                            WHERE queue_id=ANY(%s)
+                              AND status='QUARANTINED'""",
+                    (f"resolved: {reason}", approved_by, reason, list(chunk)),
+                )
+                return int(cur.rowcount or 0)
+
+        return self._transition_quarantined_queue(
+            ids, scope, plan, resolve, context, expected_status="RESOLVED"
+        )
+
+    @staticmethod
+    def _validate_queue_resolution(approved_by: str, reason: str, reset_attempts: bool) -> None:
+        if not isinstance(approved_by, str) or not approved_by.strip() or len(approved_by) > 160:
+            raise ValueError("approved_by must be a non-empty string of at most 160 characters")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            raise ValueError("reason must be a non-empty string of at most 2000 characters")
+        if not isinstance(reset_attempts, bool):
+            raise TypeError("reset_attempts must be bool")
+
+    def _transition_quarantined_queue(
+        self, ids: tuple[int, ...], scope: WorkScope, plan: SqlPlan,
+        operation, context: RunContext, expected_status: str,
+    ) -> int:
+        if len(ids) > self._kernel.transaction_manager.config.max_rows_per_tx:
+            raise ValueError("quarantine transition exceeds transaction row budget")
+        self._kernel._reserve_atomic_chunk(ids)
+
+        def transition_all_or_rollback() -> int:
+            changed = operation(ids)
+            if changed != len(ids):
+                # Raise before _run_chunk commits so a stale/mixed ID batch
+                # cannot partially change queue state and then report failure.
+                raise RuntimeError(
+                    "financial quarantine transition was partial; "
+                    f"expected={len(ids)} changed={changed} target_status={expected_status} "
+                    f"run_id={context.run_id}"
+                )
+            return changed
+
+        return self._kernel._run_chunk(transition_all_or_rollback, idempotent=False)
+
+    def renew_financial_queue_lease(
+        self, context: RunContext, scope: WorkScope, queue_ids: Sequence[int],
+        lease_seconds: int = 4 * 60 * 60, claim_owner_id: str | None = None,
+    ) -> int:
+        """Extend only leases still owned by this RunContext."""
+        ids = tuple(dict.fromkeys(int(value) for value in queue_ids))
+        if not ids:
+            return 0
+        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or not 60 <= lease_seconds <= 7 * 24 * 60 * 60:
+            raise ValueError("financial queue lease_seconds must be an integer in 60..604800")
+        owner = context.run_id if claim_owner_id is None else claim_owner_id
+        if not isinstance(owner, str) or not owner.strip() or len(owner) > 160:
+            raise ValueError("financial queue claim_owner_id must be a non-empty string of at most 160 characters")
+        plan = SqlPlan(operation=Operation.UPSERT, target="ops.financial_change_queue", scope=scope, expected_mode="ROW_BASED", estimated_rows=len(ids))
+        self._kernel.query_guard.check(plan)
+
+        def renew() -> int:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE ops.financial_change_queue
+                          SET lease_expires_at=CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                              updated_at=CURRENT_TIMESTAMP
+                        WHERE queue_id=ANY(%s)
+                          AND status='RUNNING'
+                          AND claim_owner_id=%s""",
+                    (lease_seconds, list(ids), owner),
+                )
+                changed = int(cur.rowcount or 0)
+            if changed != len(ids):
+                raise RuntimeError(
+                    "financial queue lease ownership lost; "
+                    f"expected={len(ids)} renewed={changed} run_id={context.run_id}"
+                )
+            return changed
+
+        return self._kernel._run_chunk(renew, idempotent=True)
 
     def update_history_checkpoints(
         self, context: RunContext, scope: WorkScope, dataset: str,
@@ -408,33 +664,303 @@ class WriteGateway:
     def commit_release_validation(
         self, context: RunContext, scope: WorkScope, result: Mapping[str, Any],
     ) -> int:
-        """Atomically promote one release and supersede prior validated releases."""
+        """Promote one release, superseding only its domain's previous release."""
+        baseline_domain = str(result.get("baseline_domain") or "").strip()
+        if baseline_domain not in {"RESEARCH", "MARKET_ACTIVITY"}:
+            raise ValueError(f"unsupported release baseline domain: {baseline_domain!r}")
         plan = SqlPlan(operation=Operation.UPSERT, target="ops.tushare_data_release", scope=scope, expected_mode="ROW_BASED", estimated_rows=2)
         self._kernel.query_guard.check(plan)
+
+        watermark = result.get("release_change_watermark")
+        if self._kernel.release_change_capture_enabled and watermark is None:
+            raise RuntimeError(
+                "release change capture is enabled; full release validation must "
+                "include its audited event watermark"
+            )
+        if watermark is not None:
+            self._kernel.query_guard.check(SqlPlan(
+                operation=Operation.READ, target="ops.release_change_event",
+                scope=scope, estimated_rows=1,
+            ))
 
         def update() -> int:
             conn = self._kernel._db_connection()
             with conn.cursor() as cur:
+                if watermark is not None:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (RELEASE_CHANGE_LOCK_KEY,),
+                    )
+                    cur.execute(
+                        "SELECT COALESCE(MAX(event_id), 0) FROM ops.release_change_event"
+                    )
+                    current = int((cur.fetchone() or (0,))[0])
+                    if current != int(watermark):
+                        raise RuntimeError(
+                            "source changes occurred during full release validation; "
+                            "rerun the quality audit before publishing"
+                        )
+                if watermark is not None:
+                    cur.execute(
+                        "SELECT release_id FROM ops.tushare_data_release "
+                        "WHERE release_tag=%s AND status='draft' FOR UPDATE",
+                        (result["tag"],),
+                    )
+                    if cur.fetchone() is None:
+                        raise RuntimeError(f"draft release not found: {result['tag']}")
                 cur.execute(
                     "UPDATE ops.tushare_data_release SET status='superseded' "
-                    "WHERE status='validated' AND release_tag<>%s",
-                    (result["tag"],),
+                    "WHERE status='validated' AND baseline_domain=%s AND release_tag<>%s",
+                    (baseline_domain, result["tag"]),
                 )
-                cur.execute(
-                    """UPDATE ops.tushare_data_release
-                          SET status='validated', quality_report_hash=%s,
-                              quality_report=%s, source_manifest=%s,
-                              source_manifest_hash=%s,
-                              data_cutoff_timestamp=COALESCE(data_cutoff_timestamp, CURRENT_TIMESTAMP),
-                              visibility_policy_version=COALESCE(visibility_policy_version, 'business-pit-v2'),
-                              temporal_evidence_level=COALESCE(temporal_evidence_level, 'LEGACY'),
-                              validated_at=CURRENT_TIMESTAMP
-                        WHERE release_tag=%s AND status='draft'""",
-                    (result["quality_hash"], result["gate_json"], result["manifest_json"], result["source_manifest_hash"], result["tag"]),
-                )
-                return int(cur.rowcount or 0)
+                if watermark is None:
+                    cur.execute(
+                        """UPDATE ops.tushare_data_release
+                              SET status='validated', quality_report_hash=%s,
+                                  quality_report=%s, source_manifest=%s,
+                                  source_manifest_hash=%s,
+                                  data_cutoff_timestamp=COALESCE(data_cutoff_timestamp, CURRENT_TIMESTAMP),
+                                  visibility_policy_version=COALESCE(visibility_policy_version, 'business-pit-v2'),
+                                  temporal_evidence_level=COALESCE(temporal_evidence_level, 'LEGACY'),
+                                  validated_at=CURRENT_TIMESTAMP
+                            WHERE release_tag=%s AND status='draft'""",
+                        (result["quality_hash"], result["gate_json"], result["manifest_json"], result["source_manifest_hash"], result["tag"]),
+                    )
+                else:
+                    cur.execute(
+                        """UPDATE ops.tushare_data_release
+                              SET status='validated', quality_report_hash=%s,
+                                  quality_report=%s, source_manifest=%s,
+                                  source_manifest_hash=%s,
+                                  release_change_watermark=%s,
+                                  data_cutoff_timestamp=COALESCE(data_cutoff_timestamp, CURRENT_TIMESTAMP),
+                                  visibility_policy_version=COALESCE(visibility_policy_version, 'business-pit-v2'),
+                                  temporal_evidence_level=COALESCE(temporal_evidence_level, 'LEGACY'),
+                                  validated_at=CURRENT_TIMESTAMP
+                            WHERE release_tag=%s AND status='draft'""",
+                        (result["quality_hash"], result["gate_json"], result["manifest_json"], result["source_manifest_hash"], int(watermark), result["tag"]),
+                    )
+                changed = int(cur.rowcount or 0)
+                if watermark is not None and changed != 1:
+                    raise RuntimeError(f"failed to publish draft release: {result['tag']}")
+                return changed
 
         return self._kernel._run_chunk(update)
+
+    def begin_release_validation_boundary(
+        self, context: RunContext, scope: WorkScope,
+    ) -> int | None:
+        """Capture a source-event boundary before a full release quality audit.
+
+        The exclusive transaction lock waits for all captured fact writers and
+        prevents new ones from entering until this short watermark read commits.
+        """
+        if not self._kernel.release_change_capture_enabled:
+            return None
+        plan = SqlPlan(
+            operation=Operation.READ, target="ops.release_change_event",
+            scope=scope, estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+
+        def read_boundary() -> int:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (RELEASE_CHANGE_LOCK_KEY,),
+                )
+                cur.execute(
+                    "SELECT COALESCE(MAX(event_id), 0) FROM ops.release_change_event"
+                )
+                return int((cur.fetchone() or (0,))[0])
+
+        return self._kernel._run_chunk(read_boundary, idempotent=False)
+
+    def capture_release_delta_candidate(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        baseline_release_id: int,
+        baseline_domain: str,
+        *,
+        max_events: int = 1_000,
+    ) -> dict[str, Any]:
+        """Seal one bounded, unvalidated event candidate against a full release.
+
+        This only records the exact event set. It does not validate or promote a
+        data release; unknown, oversized, incomplete, or failed inputs fail closed.
+        """
+        domain = str(baseline_domain).strip().upper()
+        if domain not in {"RESEARCH", "MARKET_ACTIVITY"}:
+            raise ValueError(f"unsupported release baseline domain: {domain!r}")
+        if not 1 <= int(max_events) <= 1_000:
+            raise ValueError("max_events must be between 1 and 1000")
+        if not self._kernel.release_change_capture_enabled:
+            raise RuntimeError("release change capture is disabled")
+        package_plan = SqlPlan(
+            operation=Operation.PUBLISH,
+            target="ops.release_delta_package", scope=scope,
+            expected_mode="ROW_BASED", estimated_rows=max_events + 1,
+        )
+        event_plan = SqlPlan(
+            operation=Operation.PUBLISH,
+            target="ops.release_delta_event", scope=scope,
+            expected_mode="ROW_BASED", estimated_rows=max_events,
+        )
+        parent_plan = SqlPlan(
+            operation=Operation.READ,
+            target="ops.tushare_data_release", scope=scope, estimated_rows=1,
+        )
+        event_read_plan = SqlPlan(
+            operation=Operation.READ,
+            target="ops.release_change_event", scope=scope,
+            estimated_rows=max_events + 1,
+        )
+        self._kernel.query_guard.check(package_plan)
+        self._kernel.query_guard.check(event_plan)
+        self._kernel.query_guard.check(parent_plan)
+        self._kernel.query_guard.check(event_read_plan)
+
+        def seal() -> dict[str, Any]:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (RELEASE_CHANGE_LOCK_KEY,),
+                )
+                cur.execute(
+                    """SELECT release_id, release_change_watermark
+                         FROM ops.tushare_data_release
+                        WHERE release_id=%s AND baseline_domain=%s AND status='validated'
+                        FOR SHARE""",
+                    (int(baseline_release_id), domain),
+                )
+                parent = cur.fetchone()
+                if parent is None or parent[1] is None:
+                    raise RuntimeError(
+                        "delta capture requires the current validated full baseline "
+                        "to have a release-change watermark; run a captured full audit first"
+                    )
+                watermark = int(parent[1])
+                cur.execute("SELECT COALESCE(MAX(event_id), 0) FROM ops.release_change_event")
+                high_watermark = int((cur.fetchone() or (0,))[0])
+
+                cur.execute(
+                    """SELECT package_id, event_through_id, event_manifest_hash, event_count
+                         FROM ops.release_delta_package
+                        WHERE baseline_release_id=%s
+                        ORDER BY created_at DESC LIMIT 1""",
+                    (int(baseline_release_id),),
+                )
+                previous = cur.fetchone()
+                if previous is not None:
+                    if high_watermark > int(previous[1]):
+                        raise RuntimeError(
+                            "a captured delta candidate is still awaiting target-specific "
+                            "quality validation; refusing to extend or consume it twice"
+                        )
+                    return {
+                        "status": "CAPTURED",
+                        "package_id": str(previous[0]),
+                        "event_through_id": int(previous[1]),
+                        "event_manifest_hash": str(previous[2]),
+                        "event_count": int(previous[3]),
+                        "idempotent_replay": True,
+                    }
+                if high_watermark <= watermark:
+                    return {
+                        "status": "NO_CHANGES", "baseline_release_id": int(baseline_release_id),
+                        "event_through_id": watermark, "event_count": 0,
+                    }
+
+                cur.execute(
+                    """SELECT e.event_id, e.event_key, e.run_id, e.target, e.operation,
+                              e.scope_hash, s.delta_eligible, s.full_audit_reason, r.status
+                         FROM ops.release_change_event e
+                         JOIN ops.release_change_scope s USING (scope_hash)
+                         LEFT JOIN ops.run_manifest r USING (run_id)
+                        WHERE e.event_id>%s AND e.event_id<=%s
+                        ORDER BY e.event_id LIMIT %s""",
+                    (watermark, high_watermark, int(max_events) + 1),
+                )
+                events = cur.fetchall()
+                if len(events) > int(max_events):
+                    raise RuntimeError(
+                        f"release delta event window exceeds {max_events}; full audit required"
+                    )
+                if not events:
+                    # Gaps in BIGSERIAL are normal after rollback; no committed
+                    # events in this range means there is nothing to package.
+                    return {
+                        "status": "NO_CHANGES", "baseline_release_id": int(baseline_release_id),
+                        "event_through_id": high_watermark, "event_count": 0,
+                    }
+                invalid = [
+                    row for row in events
+                    if not bool(row[6]) or row[8] != "SUCCEEDED"
+                ]
+                if invalid:
+                    details = [
+                        {
+                            "event_id": int(row[0]), "target": str(row[3]),
+                            "reason": str(row[7] or "producer Run Manifest is not SUCCEEDED"),
+                            "run_status": row[8],
+                        }
+                        for row in invalid[:10]
+                    ]
+                    raise RuntimeError(
+                        "release delta requires a full audit because captured events "
+                        f"are unbounded or their producer runs are incomplete: {details}"
+                    )
+
+                event_digest = hashlib.sha256()
+                target_counts: dict[str, int] = {}
+                scope_hashes: set[str] = set()
+                for row in events:
+                    event_id, event_key, _, target, _, scope_hash = row[:6]
+                    event_digest.update(f"{int(event_id)}:{str(event_key)}\n".encode("ascii"))
+                    target_counts[str(target)] = target_counts.get(str(target), 0) + 1
+                    scope_hashes.add(str(scope_hash))
+                event_hash = event_digest.hexdigest()
+                package_id = str(uuid5(
+                    NAMESPACE_URL,
+                    f"release-delta:{domain}:{baseline_release_id}:{watermark}:{high_watermark}:{event_hash}",
+                ))
+                scope_manifest = {
+                    "format": "release-delta-scope-v1",
+                    "scope_hashes": sorted(scope_hashes),
+                    "target_event_counts": dict(sorted(target_counts.items())),
+                }
+                cur.execute(
+                    """INSERT INTO ops.release_delta_package
+                           (package_id, baseline_release_id, baseline_domain,
+                            event_from_id, event_through_id, event_count,
+                            event_manifest_hash, scope_manifest, captured_run_id)
+                         VALUES (%s::uuid,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)""",
+                    (
+                        package_id, int(baseline_release_id), domain,
+                        int(events[0][0]), high_watermark, len(events), event_hash,
+                        json.dumps(scope_manifest, sort_keys=True), context.run_id,
+                    ),
+                )
+                cur.executemany(
+                    """INSERT INTO ops.release_delta_event
+                           (package_id, baseline_domain, event_id)
+                         VALUES (%s::uuid,%s,%s)""",
+                    [(package_id, domain, int(row[0])) for row in events],
+                )
+                return {
+                    "status": "CAPTURED", "package_id": package_id,
+                    "baseline_release_id": int(baseline_release_id),
+                    "event_from_id": int(events[0][0]),
+                    "event_through_id": high_watermark,
+                    "event_count": len(events), "event_manifest_hash": event_hash,
+                    "scope_manifest": scope_manifest,
+                    "requires_quality_validation": True,
+                }
+
+        return self._kernel._run_chunk(seal, idempotent=False)
 
     def revoke_release(
         self, context: RunContext, scope: WorkScope, tag: str,
@@ -530,7 +1056,12 @@ class WriteGateway:
                     affected = int(cur.rowcount or 0)
                 return len(rows), affected
         self._kernel._reserve_atomic_chunk(rows)
-        return self._kernel._run_chunk(replace)
+        event = self._kernel._build_release_change_event(
+            context, "REPLACE_DAY", t, scope, rows=rows,
+        )
+        if event is not None:
+            event["record_empty"] = True
+        return self._kernel._run_chunk(replace, change_event=event)
 
     def transition_snapshot_manifest(
         self,
@@ -688,11 +1219,21 @@ class WriteGateway:
         columns = tuple(sorted(fields))
         values = [snapshot_id, *(fields.get(column) for column in columns)]
         placeholders = ", ".join(["%s"] * len(values))
+        type_casts = {
+            "quality_report": "jsonb",
+            "code_identity": "jsonb",
+            "date_count": "integer",
+            "row_count": "bigint",
+            "stock_count": "bigint",
+            "sector_count": "bigint",
+            "built_at": "timestamptz",
+            "validated_at": "timestamptz",
+            "frozen_at": "timestamptz",
+            "failed_at": "timestamptz",
+        }
         assignments = ", ".join(
-            f"{column}=v.{column}::jsonb" if column in {"quality_report", "code_identity"}
-            else f"{column}=v.{column}::integer" if column == "date_count"
-            else f"{column}=v.{column}::bigint" if column in {"row_count", "stock_count", "sector_count"}
-            else f"{column}=v.{column}"
+            f"{column}=v.{column}::{type_casts[column]}"
+            if column in type_casts else f"{column}=v.{column}"
             for column in columns
         )
         value_columns = ", ".join(("snapshot_id", *columns))
@@ -706,6 +1247,109 @@ class WriteGateway:
         plan = SqlPlan(
             operation=Operation.UPSERT,
             target="observation.snapshot",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(
+                sql, [to_status, *values, list(from_statuses)]
+            )
+        )
+
+    def transition_market_activity_snapshot(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        activity_snapshot_id: str,
+        from_statuses: Sequence[str],
+        to_status: str,
+        fields: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Transition one market-activity snapshot through its named lifecycle.
+
+        This is deliberately separate from the Observation snapshot transition:
+        market activity has its own identity and child tables, while sharing the
+        same fail-closed lifecycle semantics.  The SQL remains private to the
+        Gateway and the database trigger is the final frozen-state authority.
+        """
+        if not isinstance(context, RunContext) or not isinstance(scope, WorkScope):
+            raise TypeError(
+                "market activity snapshot transition requires RunContext and WorkScope"
+            )
+        transitions = {
+            "DRAFT": {"BUILDING", "FAILED"},
+            "FAILED": {"BUILDING", "FAILED"},
+            "BUILDING": {"BUILDING", "VALIDATED", "FAILED"},
+            "VALIDATED": {"FROZEN", "FAILED"},
+        }
+        if not from_statuses or any(
+            to_status not in transitions.get(str(status), set()) for status in from_statuses
+        ):
+            raise ValueError(
+                "invalid market activity snapshot transition: "
+                f"{tuple(from_statuses)} -> {to_status}"
+            )
+        fields = dict(fields or {})
+        allowed = {
+            "input_manifest_hash", "quality_report_hash", "quality_report",
+            "code_identity", "row_count", "stock_count", "date_count",
+            "total_input_row_count", "target_row_count", "invalid_target_row_count",
+            "invalid_history_row_count", "insufficient_history_stock_count",
+            "failure_reason", "built_at", "validated_at", "frozen_at", "failed_at",
+        }
+        unsupported = set(fields) - allowed
+        if unsupported:
+            raise ValueError(
+                "unsupported market activity snapshot fields: "
+                f"{sorted(unsupported)}"
+            )
+        if to_status in {"VALIDATED", "FROZEN"} and any(
+            not fields.get(name)
+            for name in ("input_manifest_hash", "quality_report_hash", "validated_at")
+        ):
+            raise ValueError(
+                f"{to_status} market activity snapshot requires input/quality hashes and validated_at"
+            )
+        if to_status == "FROZEN" and not fields.get("frozen_at"):
+            raise ValueError("FROZEN market activity snapshot requires frozen_at")
+
+        columns = tuple(sorted(fields))
+        values = [activity_snapshot_id, *(fields.get(column) for column in columns)]
+        placeholders = ", ".join(["%s"] * len(values))
+        type_casts = {
+            "quality_report": "jsonb",
+            "code_identity": "jsonb",
+            "date_count": "integer",
+            "row_count": "bigint",
+            "stock_count": "bigint",
+            "total_input_row_count": "bigint",
+            "target_row_count": "bigint",
+            "invalid_target_row_count": "bigint",
+            "invalid_history_row_count": "bigint",
+            "insufficient_history_stock_count": "bigint",
+            "built_at": "timestamptz",
+            "validated_at": "timestamptz",
+            "frozen_at": "timestamptz",
+            "failed_at": "timestamptz",
+        }
+        assignments = ", ".join(
+            f"{column}=v.{column}::{type_casts[column]}"
+            if column in type_casts else f"{column}=v.{column}"
+            for column in columns
+        )
+        value_columns = ", ".join(("activity_snapshot_id", *columns))
+        sql = (
+            "UPDATE observation.market_activity_snapshot AS m SET status=%s"
+            + (f", {assignments}" if assignments else "")
+            + f" FROM (VALUES ({placeholders})) AS v({value_columns})"
+            + " WHERE m.activity_snapshot_id=v.activity_snapshot_id::uuid"
+            + " AND m.status=ANY(%s::text[])"
+        )
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="observation.market_activity_snapshot",
             scope=scope,
             expected_mode="ROW_BASED",
             estimated_rows=1,
@@ -1007,6 +1651,35 @@ class WriteGateway:
         plan = SqlPlan(operation=Operation.UPSERT, target="backtest.dataset_manifest", scope=scope, expected_mode="ROW_BASED", estimated_rows=1)
         self._kernel.query_guard.check(plan)
         return self._kernel._run_chunk(lambda: self._update_snapshot_manifest(sql, [*fields.values(), dataset_id, list(allowed_statuses)]))
+
+    def resume_failed_dataset_manifest(
+        self,
+        context: RunContext,
+        scope: WorkScope,
+        dataset_id: str,
+    ) -> int:
+        """Reopen an existing failed Dataset using UPDATE-only semantics.
+
+        A partial upsert is unsafe here: the Dataset manifest has immutable
+        baseline identity columns and the baseline trigger runs for the
+        attempted INSERT before PostgreSQL reaches its conflict branch.
+        """
+        sql = (
+            "UPDATE backtest.dataset_manifest "
+            "SET status='BUILDING', failure_reason=NULL, failed_at=NULL "
+            "WHERE dataset_id=%s AND status='FAILED'"
+        )
+        plan = SqlPlan(
+            operation=Operation.UPSERT,
+            target="backtest.dataset_manifest",
+            scope=scope,
+            expected_mode="ROW_BASED",
+            estimated_rows=1,
+        )
+        self._kernel.query_guard.check(plan)
+        return self._kernel._run_chunk(
+            lambda: self._update_snapshot_manifest(sql, (dataset_id,))
+        )
 
     def update_dataset_member_stats(
         self,

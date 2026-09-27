@@ -147,9 +147,11 @@ def test_entry_diagnostics_flags_historical_st_only_when_pit_says_true():
 def test_equity_curve_contains_benchmark_cash_and_position_utilization():
     performance = [
         {"trade_date": date(2024, 1, 2), "total_equity": 10000, "cash_balance": 7000,
-         "position_value": 3000, "drawdown": 0, "daily_return": None, "valuation_status": "VALID"},
+         "position_value": 3000, "drawdown": 0, "daily_return": None, "valuation_status": "VALID",
+         "decision_reason": {"decision_type": "ACTIONS", "buy_signal_count": 1}},
         {"trade_date": date(2024, 1, 3), "total_equity": 9500, "cash_balance": 6500,
-         "position_value": 3000, "drawdown": -0.05, "daily_return": -0.05, "valuation_status": "VALID"},
+         "position_value": 3000, "drawdown": -0.05, "daily_return": -0.05, "valuation_status": "VALID",
+         "decision_reason": {"decision_type": "NO_ACTION", "no_action_reason_code": "NOT_SCHEDULED_SIGNAL_DAY"}},
     ]
     positions = [
         {"trade_date": date(2024, 1, 2), "ts_code": "000001.SZ", "hold_shares": 100},
@@ -164,16 +166,56 @@ def test_equity_curve_contains_benchmark_cash_and_position_utilization():
     assert curve[1]["benchmark_nav"] == 1.02
     assert curve[1]["cash_ratio"] == pytest.approx(6500 / 9500, abs=1e-8)
     assert curve[1]["position_count"] == 1
+    assert curve[0]["decision_reason"]["buy_signal_count"] == 1
+    assert curve[1]["decision_reason"]["no_action_reason_code"] == "NOT_SCHEDULED_SIGNAL_DAY"
+
+
+def test_decision_log_summarizes_daily_reasons():
+    performance = [
+        {"trade_date": date(2024, 1, 2), "decision_reason": {
+            "decision_type": "NO_ACTION", "no_action_reason_code": "NO_ELIGIBLE_CANDIDATE",
+            "dominant_failure_code": "ROE_MISSING",
+        }},
+        {"trade_date": date(2024, 1, 3), "decision_reason": {
+            "decision_type": "ACTIONS", "dominant_failure_code": "ROE_MISSING",
+        }},
+    ]
+    from data_collect.jobs.backtest_diagnostics import build_decision_log
+
+    result = build_decision_log(performance)
+    assert result["summary"]["days"] == 2
+    assert result["summary"]["no_action_days"] == 1
+    assert result["summary"]["reason_counts"]["NO_ELIGIBLE_CANDIDATE"] == 1
+    assert result["summary"]["dominant_failure_counts"]["ROE_MISSING"] == 2
 
 
 def test_period_returns_compound_daily_returns():
     performance = [
-        {"trade_date": date(2024, 1, 2), "daily_return": 0.10},
-        {"trade_date": date(2024, 1, 3), "daily_return": -0.10},
-        {"trade_date": date(2024, 2, 1), "daily_return": 0.05},
+        {"trade_date": date(2024, 1, 2), "daily_return": 0.10, "position_value": 100},
+        {"trade_date": date(2024, 1, 3), "daily_return": -0.10, "position_value": 100},
+        {"trade_date": date(2024, 2, 1), "daily_return": 0.05, "position_value": 0},
     ]
     monthly = aggregate_period_returns(performance, "month")
     annual = aggregate_period_returns(performance, "year")
-    assert monthly[0] == {"period": "2024-01", "return": -0.01}
+    assert monthly[0] == {
+        "period": "2024-01",
+        "return": -0.01,
+        "observation_days": 2,
+        "invested_days": 2,
+        "cash_only_days": 0,
+        "activity_status": "INVESTED",
+    }
     assert annual[0]["period"] == "2024"
     assert annual[0]["return"] == 0.0395
+    assert annual[0]["activity_status"] == "INVESTED"
+
+
+def test_period_returns_marks_cash_only_period():
+    performance = [
+        {"trade_date": date(2024, 2, 1), "daily_return": 0, "position_value": 0},
+        {"trade_date": date(2024, 2, 2), "daily_return": 0, "position_value": 0},
+    ]
+    monthly = aggregate_period_returns(performance, "month")
+    assert monthly[0]["activity_status"] == "CASH_ONLY"
+    assert monthly[0]["invested_days"] == 0
+    assert monthly[0]["cash_only_days"] == 2

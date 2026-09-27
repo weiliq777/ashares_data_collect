@@ -58,6 +58,11 @@ def main() -> None:
     parser.add_argument("--benchmark-code", default="000300.SH")
     parser.add_argument("--code-archive-path")
     parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate and freeze an already completed build without rebuilding it.",
+    )
+    parser.add_argument(
         "--force-rebuild",
         action="store_true",
         help="忽略已完成的 BUILD checkpoint，强制重新物化 Dataset",
@@ -70,6 +75,10 @@ def main() -> None:
     )
     parser.add_argument("--dataset-id", help="续跑已有的 DRAFT/FAILED Dataset")
     args = parser.parse_args()
+    if args.validate_only and args.force_rebuild:
+        raise ValueError("--validate-only cannot be combined with --force-rebuild")
+    if args.validate_only and not args.dataset_id:
+        raise ValueError("--validate-only requires --dataset-id")
 
     warmup_start = date.fromisoformat(args.warmup_start)
     evaluation_start = date.fromisoformat(args.evaluation_start)
@@ -114,6 +123,51 @@ def main() -> None:
         manifest = repository.manifest(dataset_id, context)
     finally:
         kernel.close()
+
+    # A validated Dataset may only be rebuilt through an explicit operator
+    # request.  This is needed when the build/validation code identity changed
+    # after validation (for example, after fixing manifest projection), while
+    # preserving the lifecycle audit trail and the FROZEN immutability rule.
+    if args.force_rebuild and manifest["status"] == "VALIDATED":
+        kernel, repository, context = _service("reopen-forced-rebuild")
+        try:
+            changed = repository.transition_manifest(
+                context,
+                dataset_id,
+                ("VALIDATED",),
+                "FAILED",
+                {
+                    "failure_reason": "explicit force rebuild requested after validation",
+                    "failed_at": None,
+                    "validated_at": None,
+                    "quality_report": None,
+                    "quality_report_hash": None,
+                    "calendar_hash": None,
+                    "rules_hash": None,
+                    "execution_hash": None,
+                    "corporate_action_hash": None,
+                    "benchmark_hash": None,
+                    "input_manifest_hash": None,
+                    "code_version": None,
+                    "git_commit": None,
+                    # dataset_manifest.git_dirty is NOT NULL; FALSE is the
+                    # explicit cleared sentinel before the next build writes
+                    # the actual current-worktree identity.
+                    "git_dirty": False,
+                    "diff_hash": None,
+                    "code_archive_path": None,
+                    "code_archive_sha256": None,
+                    "code_archive_size_bytes": None,
+                },
+            )
+            if changed != 1:
+                raise RuntimeError(
+                    f"failed to reopen validated Dataset for explicit rebuild: {dataset_id}"
+                )
+            manifest["status"] = "FAILED"
+        finally:
+            kernel.close()
+
     if manifest["status"] == "FROZEN":
         kernel, repository, context = _service("frozen")
         freeze_checkpoint = repository.checkpoint(dataset_id, "FREEZE", context)
@@ -125,6 +179,62 @@ def main() -> None:
             finally:
                 kernel.close()
         print(f"FROZEN_DATASET_ID={dataset_id} (already frozen)", flush=True)
+        return
+
+    if args.validate_only:
+        if manifest["status"] not in {"FAILED", "VALIDATED"}:
+            raise RuntimeError(
+                f"--validate-only requires a FAILED or VALIDATED Dataset, got {manifest['status']}"
+            )
+        if manifest["status"] == "FAILED":
+            kernel, repository, context = _service("validate-only-checkpoint")
+            try:
+                build_checkpoint = repository.checkpoint(dataset_id, "BUILD", context)
+            finally:
+                kernel.close()
+            if not build_checkpoint or build_checkpoint["status"] != "COMPLETED":
+                raise RuntimeError(
+                    "--validate-only requires a completed BUILD checkpoint; "
+                    "use the normal handoff to rebuild the Dataset"
+                )
+            if not manifest.get("execution_hash") or not manifest.get("input_manifest_hash"):
+                raise RuntimeError(
+                    "--validate-only requires materialized Dataset hashes; "
+                    "use the normal handoff to rebuild the Dataset"
+                )
+            kernel, repository, context = _service("validate-only-resume")
+            try:
+                repository.resume_failed(dataset_id, context)
+            finally:
+                kernel.close()
+            _set_checkpoint(dataset_id, "VALIDATE", "RUNNING", details={"mode": "validate_only"})
+            try:
+                validate_result = validate_dataset(dataset_id)
+                _set_checkpoint(
+                    dataset_id,
+                    "VALIDATE",
+                    "COMPLETED",
+                    progress_done=int(validate_result.get("execution_rows", 0)),
+                    progress_total=int(validate_result.get("execution_rows", 0)),
+                    stage_hash=validate_result.get("input_hash"),
+                    details=validate_result,
+                )
+                print(f"VALIDATE={validate_result}", flush=True)
+            except Exception as exc:
+                _set_checkpoint(dataset_id, "VALIDATE", "FAILED", error_message=str(exc)[:4000])
+                raise
+        _set_checkpoint(dataset_id, "FREEZE", "RUNNING")
+        try:
+            freeze_dataset(
+                dataset_id,
+                code_archive_path=args.code_archive_path,
+                allow_validation_only=True,
+            )
+            _set_checkpoint(dataset_id, "FREEZE", "COMPLETED")
+            print(f"FROZEN_DATASET_ID={dataset_id}", flush=True)
+        except Exception as exc:
+            _set_checkpoint(dataset_id, "FREEZE", "FAILED", error_message=str(exc)[:4000])
+            raise
         return
 
     kernel, repository, context = _service("checkpoint")

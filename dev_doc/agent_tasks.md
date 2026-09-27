@@ -1,5 +1,13 @@
 # Agent 任务清单
 
+## T-042｜stock_basic 行业每日观测增量（2026-09-25）
+
+- 状态：代码与本地验证完成；生产库迁移已应用，今日收盘后单次采集已排程，待执行与抽样验收。
+- 设计：复用每日股票基础资料任务的同一次 `stock_basic` 响应；通过独立 `IndustryMembershipRepository` 写入 `pit.industry_membership_daily`。只记录交易日收盘后的供应商当前行业名称，证据状态为 `DAILY_CAPTURED`/`UNKNOWN`，不伪造行业代码、不回填历史、不升级为有效 PIT。
+- 安全：单日期、最多 10,000 行、日期级 advisory lock；重复内容幂等；中断后按股票代码校验已有子集并只追加缺失行，已有内容不一致则失败关闭；行业日表 Policy 仅允许批量追加。
+- 迁移：`sql/107_tushare_industry_daily_capture.sql` 已于 2026-09-25 应用到 `ashares` 生产库；验证 `industry_code` 已可空，`ashares_app` 有 SELECT/INSERT 权限。迁移由数据库管理员账号执行，程序仍使用 `ashares_app`。
+- 验证：行业仓储/任务与 Kernel、Repository、写安全及 Pipeline 回归共 `234 passed`；Data Access Contract 扫描 236 个文件、0 违规；修改文件编译和 `git diff --check` 通过。尚未调用 Tushare 或写行业观测数据；单次任务 `AsharesIndustryCaptureOnce_20260925` 计划上海时间 18:05 执行，日志为 `logs/industry_capture_20260925.log`，届时再抽样验收。
+
 ## T-041｜Research v1.3 历史快照批量物化（2026-08-08）
 
 - 状态：进行中，后台断点执行。
@@ -480,3 +488,28 @@ Run 仍是唯一可引用的完成回测结果，Raw 不允许被 Dataset 流程
 - 工程审查：已补齐 vendor ROE 的精确 `comp_type` 匹配、上海时区日期、完整 Feature 结果哈希、Standard no-op UPDATE 跳过、估值可见时间空值和分位范围硬门禁、Snapshot fail-closed 验证，以及 Release 质量/Manifest/状态切换的单事务原子性。所有高吞吐写者共享全局 session lock，高容量路径改为日/月/股票分区短事务；真实写入禁用 `limit_stocks`，财务派生检查点可独立恢复，代码身份变更时会废弃旧 checkpoint 重算。
 - 资源纪律：数据库正式回填期间禁止并发全量 pytest、迁移、全表质量聚合或第二个回填任务；只允许低频、带 `statement_timeout` 的 checkpoint/资源查询。Docker/PostgreSQL 重启后必须先等待 crash recovery 完成并确认 `pg_is_in_recovery=false`；续跑程序取得全局 advisory lock 后可自动接管无活动 worker 遗留的陈旧 `RUNNING`，无需人工改写运行状态。
 - 下一步：等待正式派生回填完成，单独执行 V2 全量质量门禁，发布 `feature-contract-v2.0` 数据基线，创建并验证 `research-v2.0` Snapshot，最后同步实测行数和发布证据。
+
+## T-039｜每日 Tushare 生产增量收口（2026-09-26）
+
+- 目标：让每日 Raw（原始层）→ Standard（标准层）/PIT（时点层）/Feature（特征层）→ 财务派生→生产质量门禁只由一条串行 DAG（有向无环任务流）触发，避免行情与财务拆分定时造成重复执行或先验收后更新。
+- 当前结果：当前机器的本地 `config.yaml`（被 Git 忽略的运行配置）把 `tushare_production_daily` 配置为每日 20:00（Asia/Shanghai）唯一 Tushare 定时链；市场派生先于较慢的财务抓取执行，最终质量门禁同时依赖市场和财务派生。`tushare_daily`、`tushare_financial` 保留手动诊断，但取消独立定时；调度器和代码契约会拒绝缺阶段、参数漂移及旧拆分链独立定时。行业每日采集沿用 `stock_basic`（股票基础信息接口）同次响应，不增加额外接口调用。其他部署环境需把这段非敏感 DAG 配置同步到其运行配置。
+- 范围与安全：市场/阶段二输入仍是最近 20 个交易日、公司行为窗口 30 个自然日；财务按最近披露窗口及变更队列运行；最终质量门禁检查最近 20 个交易日。估值滚动分位数仍按既有契约读取最多 5 年预热数据，但通过 `(stock_code, trade_date, source)` 键按 15 只股票分批读取、每批短事务发布；这是重复读 IO 成本，不是单个全市场大查询或长事务，首次生产运行仍需核对 `EXPLAIN`（执行计划）及实际耗时。未增加历史全量重建、表迁移或数据库操作；Research Data Baseline（研究数据基线）和 FROZEN Research Snapshot / Backtest Dataset（冻结研究快照/回测数据集）保持独立发布，不纳入每日采集 DAG。
+- 验证：`tests/test_production_pipeline.py` 与 `tests/test_pipeline.py` 共 33 项通过；数据访问契约扫描 237 个文件、0 违规。尚未执行 dry-run 或真实生产增量，也未启动调度器。
+- 下一步：在用户指定的生产窗口执行一次有界 dry-run 和一次真实日增量，核对任务日志、财务队列清空、日期覆盖与门禁；验收通过后再启动/重启常驻调度器。策略读取最新日期还需单独完成基线发布及新增 FROZEN 快照/Dataset 扩展。
+
+## T-042｜日增量数据库查询预算硬门禁（2026-09-26）
+
+- 目标：避免调度参数或环境变量意外把每日 Raw→Feature（原始层→特征层）任务扩成大范围回建，保护大体量 PostgreSQL。
+- 实现：市场增量/阶段二增量最多回看 31 个交易日、事件最多回看 90 个自然日；生产派生输出最多跨 45 个自然日；每日质量窗口最多 31 日。估值 5 年预热仍按代码分批读取，每条查询最多 15 只股票且最多返回 25,000 行；超限失败，不放大内存或静默截断。生产 DAG（有向无环任务流）要求任务名/拓扑显式登记，并拒绝未审查任务，尤其是全历史 Release、Snapshot、Dataset 入口。
+- 验证：相关测试 118 项通过；数据访问契约扫描 237 个文件、0 违规；未连接数据库、未运行数据任务。
+- 边界：这些门禁限制单次查询/输出范围，不代表估值全市场累计历史读取很小；首次实跑仍需用低负载窗口观察日志与数据库读负载。Research（研究域）增量 Release 门禁仍未实现，日常不能调用全历史 `tushare_release validate` 来绕过；最新日期策略可用性仍需完成有界研究发布及新增 FROZEN Snapshot/Dataset（冻结研究快照/回测数据集）链路。
+
+## T-043｜每日质量查询计划核验与部署 DAG 固化（2026-09-26）
+
+- 目标：用生产 PostgreSQL 的只读 `EXPLAIN`（执行计划）检查每日估值预热与最近窗口质量查询，避免把“有返回行上限”误当成“数据库扫描有界”；补齐干净部署缺少每日 DAG 的配置缺口。
+- 实测计划：估值输入查询（15 只股票，2021-08-01～2026-09-25）命中 `std.valuation_daily` 2021～2026 年分区上的主键 Bitmap Index Scan，没有全表 Seq Scan，规划估算约 18,061 行。该五年读取是跨批累计 IO，不是单条全表读取；每批最多返回 25,000 行。
+- 质量门禁：19 个工作日合并的代码集合校验虽使用各事实表日期索引，但计划估算约 455,873 个中间键并排序/归并；单日计划约 27,572 个中间键。已改为逐交易日执行完全相同的双向精确集合差异比较和指纹校验，每条最多 5 个结果，并限制最多 31 个预期交易日；没有放宽验收语义。质量门禁的大表访问均使用日期索引；仅约 78 行的 `ops.market_data_quality_gate` 控制表选择 Seq Scan，属小表安全扫描。
+- 安全边界：所有计划通过 Repository → Kernel → `ReadGateway` 生成；专用入口仅允许单条 `SELECT/WITH`，固定 `EXPLAIN (FORMAT JSON)`，拒绝 `ANALYZE` 和写入语句。没有运行源查询、ANALYZE、数据任务或迁移，也没有写运行清单；EXPLAIN 成本是规划器估算，不等同真实耗时。
+- 配置：将本机已验证的 20:00 Asia/Shanghai 串行 `tushare_production_daily` DAG（有向无环任务流）加入受版本控制的 `config.example.yaml`，不含密钥；保留本机忽略配置原样，未启动调度器。
+- 验证：Gateway/Repository/财务特征/生产流水线/调度专项 `213 passed`；数据访问契约扫描 237 文件、0 违规；编译与 `git diff --check` 通过。
+- 未完成边界：每日 Raw→Standard/PIT/Feature→生产质量门禁的代码与配置已有有界链路；Research 数据发布增量、每日 FROZEN Snapshot（冻结研究快照）及 Backtest Dataset（回测数据集）扩展仍未实现。Research 质量规则跨多张可变历史事实表，当前唯一安全路径仍是完整审计；禁止把它挂到日增量 DAG 或用最近日期过滤冒充完整验收。下一阶段须逐条定义影响范围并做完整审计/增量多日影子对账，再实现发布推进。

@@ -116,10 +116,11 @@ class StockAnomalyObservationRepository(BaseRepository):
             context=context,
             source="ops.tushare_data_release",
             sql="""
-                SELECT release_tag, baseline_cutoff_date, status,
+                SELECT release_tag, baseline_domain, baseline_cutoff_date, status,
                        data_cutoff_timestamp, quality_report_hash
                   FROM ops.tushare_data_release
-                 WHERE release_tag=%s AND lower(status)=lower('validated')
+                 WHERE release_tag=%s AND baseline_domain='RESEARCH'
+                   AND lower(status)=lower('validated')
                  LIMIT 1
             """,
             params=(baseline_id,),

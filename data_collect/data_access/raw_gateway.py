@@ -83,7 +83,10 @@ class RawAppendGateway:
             n = self._kernel._run_chunk(
                 lambda: self._append_chunk_set_based(
                     target, columns, chunk, business_key, payload_hash_column
-                )
+                ),
+                change_event=self._kernel._build_release_change_event(
+                    context, "RAW_APPEND", target, append_scope, rows=chunk,
+                ),
             )
             written += n
             self._kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, idx)
@@ -138,7 +141,10 @@ class RawAppendGateway:
                 continue
             self._kernel._reserve_atomic_chunk(chunk)
             written += self._kernel._run_chunk(
-                lambda: self._append_payload_chunk(target, columns, chunk)
+                lambda: self._append_payload_chunk(target, columns, chunk),
+                change_event=self._kernel._build_release_change_event(
+                    context, "RAW_APPEND_PAYLOAD", target, scope, rows=chunk,
+                ),
             )
             self._kernel._checkpoint_progress(context.run_id, context.job_name, scope_key, index)
         self._kernel._checkpoint_done(context.run_id, context.job_name, scope_key)
@@ -190,7 +196,11 @@ class RawAppendGateway:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 return int(cur.rowcount or 0)
-        return self._kernel._run_chunk(run_chunk)
+        change_event = self._kernel._build_release_change_event(
+            context, "RAW_RECOVERY_APPEND", target_name, scope,
+            statement=sql, params=tuple(params),
+        )
+        return self._kernel._run_chunk(run_chunk, change_event=change_event)
 
     # ---- 内部实现 ----
 
@@ -248,6 +258,7 @@ class RawAppendGateway:
                         WHERE {bkey_eq}
                           AND d.{payload_hash_column} = s.{payload_hash_column}
                  )
+                ON CONFLICT DO NOTHING
                 """
             )
             return int(cur.rowcount or 0)

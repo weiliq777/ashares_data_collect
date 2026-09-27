@@ -147,7 +147,8 @@ def test_incremental_pipeline_has_one_bounded_derived_rebuild_owner():
         "tushare_financial:", 1
     )[0]
     assert "rebuild_derived: false" in market_block
-    assert "rebuild_derived: true" in phase2_block
+    assert "rebuild_standard: true" in phase2_block
+    assert "rebuild_derived: true" not in phase2_block
 
     source = Path(
         "data_collect/jobs/tushare_phase2_incremental.py"

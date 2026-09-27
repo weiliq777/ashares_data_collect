@@ -104,6 +104,9 @@ def test_append_version_judgement_is_set_based_not_n_plus_1():
     # 版本判断：一次 SET-based（WHERE NOT EXISTS），而不是 n 次 SELECT
     judgement = [e for e in conn.executed if "WHERE NOT EXISTS" in e["sql"]]
     assert len(judgement) == 1
+    # The input staging batch itself may contain duplicate payloads; the
+    # target unique key must not turn that into a transaction failure.
+    assert "ON CONFLICT DO NOTHING" in judgement[0]["sql"]
 
 
 def test_raw_append_uses_small_indexed_chunks():
@@ -540,6 +543,7 @@ def test_release_state_callbacks_are_atomic_operations_without_chunk_argument():
     kernel, conn = make_kernel(build_default_registry())
     result = {
         "tag": "release-test",
+        "baseline_domain": "RESEARCH",
         "quality_hash": "q" * 64,
         "gate_json": "{}",
         "manifest_json": "{}",
@@ -554,6 +558,36 @@ def test_release_state_callbacks_are_atomic_operations_without_chunk_argument():
     ) == 0
     assert conn.committed == 2
     assert conn.rolled_back == 0
+
+
+def test_release_validation_supersedes_only_the_same_baseline_domain():
+    kernel, conn = make_kernel(build_default_registry())
+    result = {
+        "tag": "activity-release",
+        "baseline_domain": "MARKET_ACTIVITY",
+        "quality_hash": "q" * 64,
+        "gate_json": "{}",
+        "manifest_json": "{}",
+        "source_manifest_hash": "m" * 64,
+    }
+    kernel.write.commit_release_validation(
+        ctx(), WorkScope(partition="activity-release"), result,
+    )
+    supersede = next(
+        entry for entry in conn.executed
+        if "SET status='superseded'" in entry["sql"]
+    )
+    assert "baseline_domain=%s" in supersede["sql"]
+    assert supersede["params"] == ("MARKET_ACTIVITY", "activity-release")
+
+
+def test_release_validation_rejects_missing_domain_before_database_access():
+    kernel, conn = make_kernel(build_default_registry())
+    with pytest.raises(ValueError, match="unsupported release baseline domain"):
+        kernel.write.commit_release_validation(
+            ctx(), WorkScope(partition="release-without-domain"), {"tag": "x"},
+        )
+    assert conn.executed == []
 
 
 def test_read_requires_scope_on_scope_required():
@@ -755,7 +789,7 @@ def test_rebuild_rejects_read_plan_before_sql_execution():
     kernel, conn = make_kernel()
     plan = SqlPlan(
         operation=Operation.READ,
-        target="feature.price_daily_v2",
+        target="std.security_lifecycle",
         scope=WorkScope(date_from=date(2026, 1, 1)),
         expected_mode="SET_BASED",
         allow_insert_select=True,
@@ -1248,20 +1282,20 @@ def test_table_replace_rejects_non_insert_fill_sql():
 
 
 def test_table_replace_uses_unqualified_rename_and_atomic_swap():
-    kernel, conn = make_kernel()
+    kernel, conn = make_kernel(build_default_registry())
     plan = SqlPlan(
-        operation=Operation.REBUILD, target="feature.price_daily_v2",
+        operation=Operation.REBUILD, target="std.security_lifecycle",
         scope=WorkScope(date_from=date(2026, 1, 1)), expected_mode="SET_BASED",
         allow_insert_select=True,
     )
     kernel.rebuild.run_table_replace(
-        "INSERT INTO {staging} (ts_code) SELECT ts_code FROM feature.price_daily_v2",
+        "INSERT INTO {staging} (ts_code) SELECT ts_code FROM std.security_lifecycle",
         plan=plan, context=ctx(),
     )
     sqls = [entry["sql"] for entry in conn.executed]
-    assert any("ALTER TABLE feature.price_daily_v2 RENAME TO _old_price_daily_v2_" in sql for sql in sqls)
-    assert any("ALTER TABLE feature._staging_price_daily_v2_" in sql and "RENAME TO price_daily_v2" in sql for sql in sqls)
-    assert not any("DROP TABLE IF EXISTS feature.price_daily_v2" in sql for sql in sqls)
+    assert any("ops.create_table_replace_staging" in sql for sql in sqls)
+    assert any("ops.swap_table_replace_staging" in sql for sql in sqls)
+    assert not any("DROP TABLE IF EXISTS std.security_lifecycle" in sql for sql in sqls)
 
 
 def test_table_replace_publish_mode_keeps_target_present_during_swap():
@@ -1380,3 +1414,46 @@ def test_repository_query_does_not_accept_different_qualified_relation():
             "SELECT COUNT(*) AS row_count FROM secret.daily_kline",
             (), WorkScope(date_from=date(2026, 8, 20)), 2,
         )
+
+
+def test_repository_explain_is_read_only_and_never_uses_analyze():
+    kernel, conn = make_kernel(build_default_registry())
+    plan = kernel.read._repository_explain(
+        ctx(),
+        "std.valuation_daily",
+        "SELECT stock_code FROM std.valuation_daily "
+        "WHERE stock_code=ANY(%s) AND trade_date BETWEEN %s AND %s "
+        "ORDER BY stock_code, trade_date",
+        (["600000.SH"], date(2025, 1, 1), date(2026, 9, 25)),
+        WorkScope(
+            date_from=date(2025, 1, 1), date_to=date(2026, 9, 25),
+            codes=("600000.SH",),
+        ),
+    )
+
+    statement = next(item["sql"] for item in conn.executed if item["sql"].startswith("EXPLAIN"))
+    assert plan["Plan"]["Node Type"] == "Index Scan"
+    assert statement.startswith("EXPLAIN (FORMAT JSON, COSTS TRUE, VERBOSE FALSE) SELECT")
+    assert "ANALYZE" not in statement.upper()
+    assert conn.committed == 1
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM std.valuation_daily; SELECT 1",
+        "SELECT * INTO temp_copy FROM std.valuation_daily",
+        "SELECT pg_sleep(1) FROM std.valuation_daily",
+        "SELECT pg_advisory_xact_lock(1) FROM std.valuation_daily",
+        "SELECT * FROM std.valuation_daily FOR UPDATE",
+        "INSERT INTO std.valuation_daily SELECT * FROM std.valuation_daily",
+    ],
+)
+def test_repository_explain_rejects_mutating_or_unbounded_sql(sql):
+    kernel, conn = make_kernel(build_default_registry())
+    with pytest.raises(ValueError):
+        kernel.read._repository_explain(
+            ctx(), "std.valuation_daily", sql, (),
+            WorkScope(date_from=date(2026, 9, 25), date_to=date(2026, 9, 25)),
+        )
+    assert not any(item["sql"].startswith("EXPLAIN") for item in conn.executed)

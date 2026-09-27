@@ -174,11 +174,45 @@ def repair_dataset(
     statuses = {}
     quality_reports: dict[str, tuple[dict, str]] = {}
     try:
+        target_ids = [item["snapshot_id"] for item in created]
+        target_manifests = repository.snapshot_manifests(target_ids, context)
+        if len(target_manifests) != len(target_ids):
+            missing = [item for item in target_ids if item not in target_manifests]
+            raise RuntimeError(
+                f"replacement Snapshot manifest missing: {missing[:5]}"
+            )
+
+        # Check all existing targets and immutable sources in bounded batches.
+        # The old implementation performed three reads per target, which made
+        # a restart spend hours in preflight before any useful work resumed.
+        integrity_pairs = []
+        for row in issue_rows:
+            target_id = replacements_by_date[row["research_date"]]
+            target_manifest = target_manifests[target_id]
+            if target_manifest["status"] in {"BUILDING", "FAILED"}:
+                integrity_pairs.extend([
+                    (row["snapshot_id"], target_manifest["cutoff"]),
+                    (target_id, target_manifest["cutoff"]),
+                ])
+        materialization = {}
+        for offset in range(
+            0, len(integrity_pairs),
+            repository.REPLACEMENT_INTEGRITY_BATCH_SIZE,
+        ):
+            materialization.update(
+                repository.snapshot_materialization_counts_batch(
+                    integrity_pairs[
+                        offset:offset + repository.REPLACEMENT_INTEGRITY_BATCH_SIZE
+                    ],
+                    context,
+                )
+            )
+
         pending_build = []
         for row in issue_rows:
             target_id = replacements_by_date[row["research_date"]]
             source_id = source_by_date[row["research_date"]]
-            target_manifest = repository.manifest(target_id, context)
+            target_manifest = target_manifests[target_id]
             statuses[target_id] = target_manifest["status"]
             if not target_manifest.get("quality_report") or not target_manifest.get("quality_hash"):
                 raise RuntimeError(
@@ -194,12 +228,12 @@ def repair_dataset(
                 # through the first child table.  Distinguish those states by
                 # bounded child counts so resume never rebuilds a complete
                 # replacement and never validates a partial one.
-                source_counts = repository.snapshot_materialization_counts(
-                    source_id, target_manifest["cutoff"], context,
-                )
-                target_counts = repository.snapshot_materialization_counts(
-                    target_id, target_manifest["cutoff"], context,
-                )
+                source_counts = materialization.get(source_id, {
+                    "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
+                })
+                target_counts = materialization.get(target_id, {
+                    "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
+                })
                 complete = (
                     source_counts["stock_rows"] > 0
                     and target_counts["stock_rows"] == source_counts["stock_rows"]
@@ -249,14 +283,12 @@ def repair_dataset(
                         "replacement lineage row count mismatch: "
                         f"snapshot_id={target_id}, result={result}"
                     )
+                statuses[target_id] = "BUILDING"
             print(
                 f"replacement snapshot build progress "
                 f"{min(offset + len(batch), len(pending_build))}/{len(pending_build)}",
                 flush=True,
             )
-        for item in created:
-            target_id = item["snapshot_id"]
-            statuses[target_id] = repository.manifest(target_id, context)["status"]
     finally:
         kernel.close()
 

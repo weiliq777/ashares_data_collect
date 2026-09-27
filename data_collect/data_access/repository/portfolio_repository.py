@@ -85,7 +85,26 @@ class PortfolioRepository(BaseRepository):
         return rows[0] if rows else None
 
     def dataset_member_snapshot(self, dataset_id: str, decision_date: date, context: RunContext) -> str | None:
-        rows = self.kernel.read._repository_query(context, "backtest.dataset_member", "SELECT research_snapshot_id FROM backtest.dataset_member WHERE dataset_id=%s AND research_date=%s", (dataset_id, decision_date), WorkScope(partition=dataset_id, date_from=decision_date, date_to=decision_date), 2)
+        rows = self.kernel.read._repository_query(
+            context, "backtest.dataset_member",
+            """WITH components AS (
+                   SELECT component_dataset_id AS dataset_id,effective_from,effective_to
+                     FROM backtest.dataset_component
+                    WHERE composite_dataset_id=%s
+                   UNION ALL
+                   SELECT dataset_id,warmup_start,evaluation_end
+                     FROM backtest.dataset_manifest
+                    WHERE dataset_id=%s AND dataset_kind='MATERIALIZED'
+               )
+               SELECT m.research_snapshot_id
+                 FROM components c
+                 JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                  AND m.research_date BETWEEN c.effective_from AND c.effective_to
+                WHERE m.research_date=%s""",
+            (dataset_id, dataset_id, decision_date),
+            WorkScope(partition=dataset_id, date_from=decision_date, date_to=decision_date),
+            2,
+        )
         return str(rows[0]["research_snapshot_id"]) if rows else None
 
     def watchlist_contains(self, watchlist_id: str, snapshot_id: str, ts_code: str, context: RunContext) -> bool:

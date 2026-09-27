@@ -130,7 +130,11 @@ class MarketRepository(BaseRepository):
         if any(list(row) != columns for row in rows):
             raise ValueError("daily rows have inconsistent columns")
         values_sql = ", ".join("(" + ", ".join(["%s"] * len(columns)) + ")" for _ in rows)
-        canonical_target = {"adj_factor_daily": "std.adj_factor_daily", "valuation_daily": "std.valuation_daily"}.get(target, target)
+        canonical_target = {
+            "daily_kline": "std.daily_kline",
+            "adj_factor_daily": "std.adj_factor_daily",
+            "valuation_daily": "std.valuation_daily",
+        }.get(target, target)
         sql = f"DELETE FROM {canonical_target} WHERE trade_date=%s; INSERT INTO {canonical_target} ({', '.join(columns)}) VALUES {values_sql} ON CONFLICT DO NOTHING"
         params = [trade_date]
         params.extend(value for row in rows for value in (row[column] for column in columns))
@@ -140,7 +144,11 @@ class MarketRepository(BaseRepository):
     def standard_count(self, target: str, trade_date, context: RunContext) -> int:
         if target not in {"daily_kline", "valuation_daily", "adj_factor_daily"}:
             raise ValueError(f"unsupported daily target: {target}")
-        canonical_target = {"adj_factor_daily": "std.adj_factor_daily", "valuation_daily": "std.valuation_daily"}.get(target, target)
+        canonical_target = {
+            "daily_kline": "std.daily_kline",
+            "adj_factor_daily": "std.adj_factor_daily",
+            "valuation_daily": "std.valuation_daily",
+        }[target]
         rows = self.kernel.read._repository_query(
             context=context, source=canonical_target,
             sql=f"SELECT COUNT(*) AS count FROM {canonical_target} WHERE trade_date=%s",
@@ -356,20 +364,29 @@ class MarketRepository(BaseRepository):
         )
         return [(str(row["stock_code"]), int(row["missing"])) for row in rows]
 
-    def validated_baseline_cutoff(self, context: RunContext):
+    def baseline_cutoff(self, context: RunContext):
+        """Return the operational Research watermark, preferring its active release.
+
+        A superseded release remains an immutable historical watermark. It is a
+        safe fallback for incremental Raw ingestion when no active Research
+        release exists; revoked releases are never eligible.
+        """
         rows = self.kernel.read._repository_query(
             context=context,
             source="ops.tushare_data_release",
             sql="""
                 SELECT baseline_cutoff_date
-                  FROM ops.tushare_data_release
-                 WHERE status='validated'
-                 ORDER BY validated_at DESC NULLS LAST, release_id DESC
+                 FROM ops.tushare_data_release
+                 WHERE status IN ('validated', 'superseded')
+                   AND baseline_domain='RESEARCH'
+                 ORDER BY CASE WHEN status='validated' THEN 0 ELSE 1 END,
+                          baseline_cutoff_date DESC,
+                          validated_at DESC NULLS LAST, release_id DESC
                  LIMIT 1
             """,
-            scope=WorkScope(partition="latest-validated-release"),
+            scope=WorkScope(partition="latest-research-watermark"),
             max_rows=1,
         )
         if not rows:
-            raise RuntimeError("no validated historical baseline")
+            raise RuntimeError("no non-revoked RESEARCH baseline watermark")
         return rows[0]["baseline_cutoff_date"]

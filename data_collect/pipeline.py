@@ -15,6 +15,7 @@ import importlib
 import platform
 import time
 import traceback
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
@@ -27,6 +28,78 @@ from data_collect.utils.notify import send_dingtalk
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+_STABLE_RETRY_ARGUMENTS = {
+    # Financial page checkpoints are scoped to this fetch batch.  The parent
+    # scheduler must generate it once so ProcessPool retries resume the same
+    # bounded fetch rather than creating a new checkpoint namespace.
+    "data_collect.jobs.tushare_financial_vip_incremental": "batch_id",
+    "data_collect.jobs.tushare_production_financial_derived": "execution_id",
+    # The price-v2 feature checkpoints must be fresh for each production run,
+    # while all child-process retries of this derived task share one identity.
+    "data_collect.jobs.tushare_production_market_derived": "execution_id",
+}
+
+_RETRY_ATTEMPT_ARGUMENTS = {
+    "data_collect.jobs.tushare_financial_vip_incremental": "attempt",
+    "data_collect.jobs.tushare_production_financial_derived": "attempt",
+}
+
+_PRODUCTION_PIPELINE_CONTRACT = {
+    "tushare_daily": {
+        "producer_job": "data_collect.jobs.tushare_phase2_incremental",
+        "producer_name": "tushare_phase2_raw_first",
+        "quality_job": "data_collect.jobs.tushare_production_quality",
+        "quality_name": "tushare_production_quality",
+    },
+    "tushare_production_daily": {
+        "producer_job": "data_collect.jobs.tushare_production_market_derived",
+        "producer_name": "production_market_derived",
+        "quality_job": "data_collect.jobs.tushare_production_quality",
+        "quality_name": "production_quality",
+    },
+}
+
+_PRODUCTION_DAILY_TASK_CONTRACT = {
+    "production_instrument_raw": (
+        "data_collect.jobs.a_share_instrument_tushare", (),
+    ),
+    "production_market_raw": (
+        "data_collect.jobs.tushare_market_incremental_by_date",
+        ("production_instrument_raw",),
+    ),
+    "production_phase2_raw": (
+        "data_collect.jobs.tushare_phase2_incremental",
+        ("production_market_raw",),
+    ),
+    "production_market_derived": (
+        "data_collect.jobs.tushare_production_market_derived",
+        ("production_phase2_raw",),
+    ),
+    "production_financial_raw": (
+        "data_collect.jobs.tushare_financial_vip_incremental",
+        ("production_phase2_raw",),
+    ),
+    "production_financial_derived": (
+        "data_collect.jobs.tushare_production_financial_derived",
+        ("production_financial_raw",),
+    ),
+    "production_quality": (
+        "data_collect.jobs.tushare_production_quality",
+        ("production_market_derived", "production_financial_derived"),
+    ),
+}
+
+_PRODUCTION_SPLIT_PIPELINES = ("tushare_daily", "tushare_financial")
+_UNBOUNDED_DAILY_PIPELINE_JOBS = frozenset({
+    # These entry points can run full-history release/snapshot/dataset audits.
+    # They must never be attached to the daily production DAG until a separate
+    # bounded delta validator is implemented and verified.
+    "data_collect.jobs.tushare_release",
+    "data_collect.jobs.research_snapshot",
+    "data_collect.jobs.backtest_dataset",
+})
 
 
 @dataclass
@@ -207,6 +280,161 @@ def _resolve_invocation(
     return fn_name, {"run_date": run_date, **invocation_kwargs}
 
 
+def _validate_production_pipeline_contract(pipeline_name: str, tasks: list[Dict[str, Any]]) -> None:
+    """Fail closed when a production DAG omits its final quality gate.
+
+    The deployment config is intentionally local because it contains secrets,
+    so this version-controlled contract prevents an old/partial config from
+    silently running only Raw/derived stages after a clean deployment.
+    """
+    contract = _PRODUCTION_PIPELINE_CONTRACT.get(pipeline_name)
+    if contract is None:
+        return
+    by_name = {task.get("name"): task for task in tasks}
+    producer = by_name.get(contract["producer_name"])
+    quality = by_name.get(contract["quality_name"])
+    if producer is None or producer.get("job") != contract["producer_job"]:
+        raise RuntimeError(
+            f"{pipeline_name} missing required producer task "
+            f"{contract['producer_name']} ({contract['producer_job']})"
+        )
+    if quality is None or quality.get("job") != contract["quality_job"]:
+        raise RuntimeError(
+            f"{pipeline_name} missing final production quality task "
+            f"{contract['quality_name']} ({contract['quality_job']})"
+        )
+    if contract["producer_name"] not in set(quality.get("depends_on", ())):
+        raise RuntimeError(
+            f"{pipeline_name} quality task must depend on "
+            f"{contract['producer_name']}"
+        )
+    if pipeline_name == "tushare_daily":
+        kwargs = dict(producer.get("kwargs") or {})
+        if kwargs.get("rebuild_standard") is not True and kwargs.get("rebuild_derived") is not True:
+            raise RuntimeError(
+                "tushare_daily phase2 task must enable the bounded derived rebuild"
+            )
+    if pipeline_name == "tushare_production_daily":
+        _validate_production_daily_tasks(tasks)
+
+
+def _validate_production_daily_tasks(tasks: list[Dict[str, Any]]) -> None:
+    """Require the full Raw → derived → final-quality production dependency chain."""
+    unbounded = sorted({
+        str(task.get("job"))
+        for task in tasks
+        if task.get("job") in _UNBOUNDED_DAILY_PIPELINE_JOBS
+    })
+    if unbounded:
+        raise RuntimeError(
+            "daily production cannot invoke full-history release/snapshot/dataset "
+            f"jobs without a bounded delta contract: {unbounded}"
+        )
+
+    allowed_jobs = {job for job, _dependencies in _PRODUCTION_DAILY_TASK_CONTRACT.values()}
+    unknown_jobs = sorted({
+        str(task.get("job"))
+        for task in tasks
+        if task.get("job") not in allowed_jobs
+    })
+    if unknown_jobs:
+        raise RuntimeError(
+            "daily production contains an unreviewed job; add a bounded query "
+            f"contract and tests before scheduling it: {unknown_jobs}"
+        )
+
+    by_name = {task.get("name"): task for task in tasks}
+    duplicate_names = len(by_name) != len(tasks)
+    extra_names = sorted(set(by_name) - set(_PRODUCTION_DAILY_TASK_CONTRACT))
+    if duplicate_names or extra_names:
+        raise RuntimeError(
+            "tushare_production_daily task topology is not explicitly reviewed: "
+            f"duplicate_names={duplicate_names}, extra_names={extra_names}"
+        )
+    missing = set(_PRODUCTION_DAILY_TASK_CONTRACT) - set(by_name)
+    if missing:
+        raise RuntimeError(
+            "tushare_production_daily missing required tasks: "
+            f"{sorted(missing)}"
+        )
+
+    for name, (expected_job, expected_dependencies) in _PRODUCTION_DAILY_TASK_CONTRACT.items():
+        task = by_name[name]
+        if task.get("job") != expected_job:
+            raise RuntimeError(
+                f"tushare_production_daily task {name} must use {expected_job}"
+            )
+        if tuple(task.get("depends_on") or ()) != expected_dependencies:
+            raise RuntimeError(
+                f"tushare_production_daily task {name} dependencies must be "
+                f"{expected_dependencies}"
+            )
+
+    expected_false_flags = {
+        "production_market_raw": "rebuild_derived",
+        "production_phase2_raw": "rebuild_standard",
+        "production_financial_raw": "rebuild_derived",
+    }
+    for name, flag in expected_false_flags.items():
+        if dict(by_name[name].get("kwargs") or {}).get(flag) is not False:
+            raise RuntimeError(
+                f"tushare_production_daily {name}.{flag} must be false; "
+                "the dedicated derived task owns that stage"
+            )
+
+    for name in ("production_market_raw", "production_phase2_raw"):
+        lookback = int(dict(by_name[name].get("kwargs") or {}).get("lookback_days", 5))
+        if not 1 <= lookback <= 31:
+            raise RuntimeError(
+                f"tushare_production_daily {name}.lookback_days must be in 1..31"
+            )
+    phase2_event_window = int(
+        dict(by_name["production_phase2_raw"].get("kwargs") or {}).get(
+            "event_lookback_days", 30,
+        )
+    )
+    if not 1 <= phase2_event_window <= 90:
+        raise RuntimeError(
+            "tushare_production_daily production_phase2_raw.event_lookback_days "
+            "must be in 1..90"
+        )
+
+    market_window = int(dict(by_name["production_market_derived"].get("kwargs") or {}).get("lookback_days", 5))
+    quality_window = int(dict(by_name["production_quality"].get("kwargs") or {}).get("lookback_days", 5))
+    if not 1 <= market_window <= 31 or quality_window != market_window:
+        raise RuntimeError(
+            "tushare_production_daily market-derived and quality lookback_days "
+            "must match and be in 1..31"
+        )
+
+
+def _validate_production_schedule_contract(pipelines: Dict[str, Any]) -> None:
+    """Ensure one scheduled Tushare writer owns the entire daily production chain."""
+    production = pipelines.get("tushare_production_daily")
+    if production is None:
+        return
+    schedule = production.get("schedule") or {}
+    if not schedule:
+        raise RuntimeError(
+            "tushare_production_daily must be the scheduled Tushare production pipeline"
+        )
+    timezone = schedule.get("timezone", "Asia/Shanghai")
+    if timezone != "Asia/Shanghai":
+        raise RuntimeError(
+            "tushare_production_daily schedule timezone must be Asia/Shanghai"
+        )
+    for name in _PRODUCTION_SPLIT_PIPELINES:
+        split = pipelines.get(name) or {}
+        if split.get("schedule"):
+            raise RuntimeError(
+                f"{name} is a manual/diagnostic pipeline and must not have a schedule; "
+                "use tushare_production_daily to avoid split or duplicate production runs"
+            )
+    _validate_production_pipeline_contract(
+        "tushare_production_daily", production.get("tasks") or [],
+    )
+
+
 def _notify_retry(task_name: str, attempt: int, total: int, exc: Exception) -> None:
     """重试前发钉钉告警；通知失败仅 log，不影响主流程。"""
     is_timeout = isinstance(exc, TimeoutError)
@@ -231,6 +459,12 @@ def _run_one_task(
     max_retries = max(0, int(task_cfg.get("retries", 0)))
     attempts_total = 1 + max_retries
     fn_name, call_kwargs = _resolve_invocation(task_cfg, run_date, base_kwargs)
+    stable_argument = _STABLE_RETRY_ARGUMENTS.get(job_path)
+    if stable_argument and stable_argument not in call_kwargs:
+        call_kwargs[stable_argument] = f"{task_name}-{uuid.uuid4().hex}"
+    attempt_argument = _RETRY_ATTEMPT_ARGUMENTS.get(job_path)
+    if attempt_argument and attempt_argument in call_kwargs:
+        raise ValueError(f"浠诲姟 {task_name} 涓嶅厑璁哥敤淇℃伅 {attempt_argument}")
 
     print(f"[pipeline] 启动任务: {task_name} (fn={fn_name}, timeout={timeout}, retries={max_retries})")
     start_time = time.monotonic()
@@ -239,7 +473,10 @@ def _run_one_task(
 
     for attempt in range(1, attempts_total + 1):
         try:
-            message = execute_in_subprocess(job_path, fn_name, timeout=timeout, **call_kwargs)
+            attempt_kwargs = dict(call_kwargs)
+            if attempt_argument:
+                attempt_kwargs[attempt_argument] = attempt
+            message = execute_in_subprocess(job_path, fn_name, timeout=timeout, **attempt_kwargs)
             duration = time.monotonic() - start_time
             print(f"[pipeline] 完成: {task_name} ({duration:.1f}s)")
             return TaskResult(name=task_name, success=True, message=message, duration=duration)
@@ -277,6 +514,7 @@ def run_pipeline(
     tasks = pipeline_cfg.get("tasks", [])
     if not tasks:
         raise ValueError(f"Pipeline '{pipeline_name}' 没有定义任务")
+    _validate_production_pipeline_contract(pipeline_name, tasks)
 
     if show_dag:
         print_dag(pipeline_name)

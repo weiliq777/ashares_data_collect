@@ -88,10 +88,15 @@ def test_diagnostic_future_closes_is_bounded_to_dataset_and_date_window():
             _context(),
         )
         assert rows == []
-        query = connection.executed[-1]["sql"]
-        assert "b.dataset_id=%s" in query
+        statement = connection.executed[-1]
+        query = statement["sql"]
+        assert "FROM backtest.dataset_component" in query
+        assert "composite_dataset_id=%s" in query
+        assert "b.dataset_id=c.dataset_id" in query
+        assert "b.trade_date BETWEEN c.effective_from AND c.effective_to" in query
         assert "INTERVAL '120 days'" in query
         assert "row_number() OVER" in query
+        assert query.count("%s") == len(statement["params"])
     finally:
         kernel.close()
 
@@ -112,10 +117,13 @@ def test_diagnostic_future_closes_batches_and_deduplicates_entries():
             "dataset-1", entries, date(2024, 1, 8), _context()
         )
         assert rows == []
-        queries = [item["sql"] for item in connection.executed]
+        statements = connection.executed
+        queries = [item["sql"] for item in statements]
         assert len(queries) == 2
-        assert all("b.dataset_id=%s" in query for query in queries)
+        assert all("FROM backtest.dataset_component" in query for query in queries)
+        assert all("b.dataset_id=c.dataset_id" in query for query in queries)
         assert all("INTERVAL '120 days'" in query for query in queries)
+        assert all(query.count("%s") == len(item["params"]) for query, item in zip(queries, statements))
     finally:
         kernel.close()
 
@@ -133,9 +141,14 @@ def test_diagnostic_trade_chart_binds_to_dataset_members():
             "dataset-1", "000001.SZ", date(2024, 1, 1), date(2024, 3, 31), _context()
         )
         assert rows == []
-        query = connection.executed[-1]["sql"]
-        assert "m.dataset_id=%s" in query
+        statement = connection.executed[-1]
+        query = statement["sql"]
+        assert "FROM backtest.dataset_component" in query
+        assert "m.dataset_id=c.dataset_id" in query
+        assert "m.research_date BETWEEN c.effective_from AND c.effective_to" in query
         assert "JOIN research.stock_snapshot_daily s" in query
         assert "s.snapshot_id=m.research_snapshot_id" in query
+        assert "s.research_date BETWEEN %s AND %s" in query
+        assert query.count("%s") == len(statement["params"])
     finally:
         kernel.close()

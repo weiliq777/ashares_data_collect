@@ -241,6 +241,67 @@ class ReadGateway:
 
         return self._kernel._run_chunk(read_once)
 
+    def _repository_explain(
+        self,
+        context: RunContext,
+        source: str,
+        sql: str,
+        params: Sequence[Any] = (),
+        scope: WorkScope | None = None,
+    ) -> dict[str, Any]:
+        """Return a PostgreSQL plan for one repository-owned read, never execute it.
+
+        This narrow diagnostic seam accepts only a single read-only SELECT/WITH
+        and emits ``EXPLAIN (FORMAT JSON)`` without ANALYZE. It is private to
+        Repository code so application code still cannot submit arbitrary SQL.
+        """
+        if not isinstance(context, RunContext):
+            raise TypeError("repository explain 必须携带 RunContext")
+        target = validate_qualified_name(source)
+        normalized = sql.strip().rstrip(";").strip()
+        if ";" in normalized or not re.match(r"^(SELECT|WITH)\b", normalized, re.I):
+            raise ValueError("Repository explain 只允许单条 SELECT/WITH")
+        if re.search(
+            r"\b(ANALYZE|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|"
+            r"GRANT|REVOKE|INTO|CALL|DO|COPY|VACUUM|NEXTVAL|SETVAL|PG_SLEEP|"
+            r"PG_ADVISORY_[A-Z0-9_]*|PG_NOTIFY|PG_CANCEL_BACKEND|"
+            r"PG_TERMINATE_BACKEND|SET_CONFIG|LO_IMPORT|LO_EXPORT|DBLINK)\b|"
+            r"\bFOR\s+(UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b",
+            normalized,
+            re.I,
+        ):
+            raise ValueError("Repository explain 拒绝 ANALYZE 或可能产生副作用的 SQL")
+        relation_candidates = (
+            target,
+            f'{target.split(".")[0]}."{target.split(".")[1]}"',
+            f'"{target.split(".")[0]}".{target.split(".")[1]}',
+            f'"{target.split(".")[0]}"."{target.split(".")[1]}"',
+        ) if "." in target else (target, f'"{target}"')
+        relation = "|".join(re.escape(value) for value in relation_candidates)
+        if not re.search(rf"\bFROM\s+(?:{relation})(?=\s|$)", normalized, re.I):
+            raise ValueError(f"Repository explain SQL 未包含 source={source}")
+        scope = scope or WorkScope()
+        plan = SqlPlan(operation=Operation.READ, target=target, scope=scope)
+        self._kernel.query_guard.check(plan)
+
+        explain_sql = f"EXPLAIN (FORMAT JSON, COSTS TRUE, VERBOSE FALSE) {normalized}"
+
+        def explain_once() -> dict[str, Any]:
+            conn = self._kernel._db_connection()
+            with conn.cursor() as cur:
+                cur.execute(explain_sql, tuple(params))
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError("PostgreSQL returned no EXPLAIN plan")
+                plan_value = row[0]
+                if isinstance(plan_value, list) and plan_value:
+                    plan_value = plan_value[0]
+                if not isinstance(plan_value, dict):
+                    raise TypeError("PostgreSQL EXPLAIN JSON plan has an unexpected shape")
+                return plan_value
+
+        return self._kernel._run_chunk(explain_once)
+
     def _repository_stream(
         self,
         context: RunContext,
