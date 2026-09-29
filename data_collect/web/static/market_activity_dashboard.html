@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A股成交活跃度观察</title>
+  <style>
+    :root{color-scheme:dark;--bg:#07111f;--panel:#101f32;--panel2:#13263c;--line:#223a54;--text:#e5eef8;--muted:#8ea5bd;--blue:#55a8ff;--cyan:#38d0d0;--green:#36d6a0;--red:#ff6682;--amber:#ffc56a}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 15% -10%,#183451 0,transparent 40%),var(--bg);color:var(--text);font:15px/1.55 "Segoe UI","Microsoft YaHei",sans-serif}
+    .shell{max-width:1320px;margin:auto;padding:28px 24px 60px}.top{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:22px}.brand{display:flex;gap:15px;align-items:center}.mark{width:48px;height:48px;border-radius:15px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;color:#061321;font-weight:900;font-size:23px}.eyebrow{color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:.13em}.title{font-size:27px;font-weight:750;margin:0}.sub{color:var(--muted);margin-top:2px}.live{border:1px solid #28604f;background:#0e2a2a;color:#86efc7;border-radius:999px;padding:7px 12px;font-size:12px;white-space:nowrap}
+    .toolbar,.notice,.card{border:1px solid var(--line);background:linear-gradient(145deg,rgba(19,38,60,.97),rgba(13,27,44,.97));border-radius:16px}.toolbar{padding:15px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}.toolbar label{color:var(--muted);font-size:13px}.toolbar select,.search{background:#091725;border:1px solid #2b4662;color:var(--text);padding:10px 12px;border-radius:10px;font:inherit;outline:none}.toolbar select:focus,.search:focus{border-color:var(--blue)}.tabs{display:flex;gap:7px;margin-left:auto}.tab{border:1px solid #2a425c;border-radius:10px;background:#0b1929;color:#a9bfd5;padding:9px 13px;cursor:pointer;font:inherit}.tab.active{background:#16406a;border-color:#337fbd;color:#fff}.search{width:210px}
+    .notice{margin:13px 0 18px;padding:11px 14px;color:#afc5da;font-size:13px}.notice strong{color:#e7f3ff}.status{margin-left:8px;color:var(--amber)}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px}.card{padding:17px;min-width:0}.metric-label{color:var(--muted);font-size:13px}.metric-value{font-size:25px;font-weight:750;letter-spacing:-.03em;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metric-hint{font-size:12px;color:#7790a9;margin-top:3px}.layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(320px,.85fr);gap:14px;margin-top:14px}.section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}.section-title{font-size:17px;font-weight:700}.section-desc{font-size:12px;color:var(--muted);margin-top:2px}.count{color:var(--muted);font-size:12px;white-space:nowrap}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:690px}th{text-align:right;color:#8ea5bd;font-size:12px;font-weight:600;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:10px;border-bottom:1px solid rgba(38,59,81,.7);font-variant-numeric:tabular-nums;white-space:nowrap}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}.rank{color:#7892ac;width:42px}.ticker{font-weight:700;color:#deebf8}.barcell{min-width:135px}.bar{height:6px;background:#1d344c;border-radius:8px;overflow:hidden;margin-top:5px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:8px}.ratio{font-weight:700}.hot{color:var(--red)}.warm{color:var(--amber)}.pill{display:inline-block;border:1px solid #294563;border-radius:999px;padding:2px 8px;color:#9fc8ef;font-size:11px;margin:2px}.tag{border-color:#70414f;color:#ff9bad}.concentration{display:grid;gap:13px}.concentration-row{display:grid;grid-template-columns:78px 1fr 58px;align-items:center;gap:10px;color:#aec0d3;font-size:13px}.track{height:10px;border-radius:8px;background:#1c334b;overflow:hidden}.track i{display:block;height:100%;background:linear-gradient(90deg,#348ff0,#42d4cf);border-radius:8px}.quality{display:flex;align-items:center;gap:8px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line);color:#a9bfd3;font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green)}.dot.partial{background:var(--amber)}.empty{padding:38px 15px;text-align:center;color:var(--muted)}.footer{color:#7189a2;font-size:12px;margin-top:16px;text-align:right}.error{color:#ff9bad}
+    @media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.layout{grid-template-columns:1fr}.tabs{margin-left:0}.toolbar{align-items:flex-start}.search{margin-left:auto}}
+    @media(max-width:560px){.shell{padding:18px 12px 40px}.title{font-size:22px}.top{align-items:flex-start}.grid{gap:8px}.card{padding:13px}.metric-value{font-size:20px}.tabs{width:100%}.tab{flex:1;padding:8px 5px}.search{width:100%;margin:0}.toolbar select{flex:1}.live{font-size:0}.live:after{content:"● 在线";font-size:12px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div class="brand"><div class="mark">↗</div><div><div class="eyebrow">MARKET ACTIVITY · FROZEN FACTS</div><h1 class="title">A股成交活跃度观察</h1><div class="sub">看成交集中在哪里、哪些股票相对自身历史突然放量</div></div></div>
+      <div class="live">只读 · 冻结数据</div>
+    </header>
+    <section class="toolbar">
+      <label for="date">观察日</label><select id="date" aria-label="选择观察日"><option>加载日期…</option></select>
+      <div class="tabs" role="tablist" aria-label="数据视图">
+        <button class="tab active" data-view="amount">成交额排行</button>
+        <button class="tab" data-view="volume">成交量排行</button>
+        <button class="tab" data-view="anomaly">异常放大</button>
+      </div>
+      <input class="search" id="search" placeholder="筛选股票代码" aria-label="筛选股票代码">
+    </section>
+    <div class="notice"><strong>口径说明：</strong>成交额/成交量展示的是发生了多少交易，不等于净资金流入。异常倍数以目标日前 20 个有效交易日为基准；只读取已冻结的 Market Activity（成交活跃度）与 Observation（异常观察）结果。<span id="status" class="status"></span></div>
+    <section class="grid" id="metrics"><div class="card">读取冻结快照中…</div></section>
+    <div class="layout">
+      <section class="card">
+        <div class="section-head"><div><div class="section-title" id="table-title">成交额排行</div><div class="section-desc" id="table-desc">当日成交额由高到低；市场占比按有效样本计算</div></div><div class="count" id="row-count"></div></div>
+        <div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+      </section>
+      <aside class="card">
+        <div class="section-head"><div><div class="section-title">市场成交集中度</div><div class="section-desc">成交额最高 N 只股票占有效样本总成交额的比例</div></div></div>
+        <div class="concentration" id="concentration"></div>
+        <div class="quality" id="quality"></div>
+      </aside>
+    </div>
+    <div class="footer">最多展示前 100 条，页面筛选仅作用于已返回结果；该看板不产生买卖建议。</div>
+  </main>
+  <script>
+    const $ = s => document.querySelector(s);
+    let activeView = 'amount', payload = null;
+    const fmt = (n, digits=2) => n == null || !Number.isFinite(Number(n)) ? '—' : Number(n).toLocaleString('zh-CN',{maximumFractionDigits:digits});
+    const pct = n => n == null ? '—' : `${(Number(n)*100).toFixed(2)}%`;
+    const safe = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const ratioClass = n => Number(n)>=5 ? 'hot' : Number(n)>=2 ? 'warm' : '';
+    async function request(url){const r=await fetch(url);const j=await r.json();if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j;}
+    function renderMetrics(s){
+      const status=s.quality_status||'未知';
+      const cards=[
+        ['全市场成交额',`${fmt(s.total_amount/1e8)} 亿元`,'按标准化成交额求和'],
+        ['全市场成交量',`${fmt(s.total_volume/1e8)} 亿股`,'按标准化成交量求和'],
+        [`Top ${fmt(s.top_n,0)} 成交额占比`,pct(s.top_n_amount_share),'观察成交是否集中于少数股票'],
+        ['有效股票 / 目标行数',`${fmt(s.target_row_count,0)} / ${fmt(s.input_row_count,0)}`,'异常目标行：'+fmt(s.invalid_target_row_count,0)],
+      ];
+      $('#metrics').innerHTML=cards.map(x=>`<article class="card"><div class="metric-label">${x[0]}</div><div class="metric-value">${x[1]}</div><div class="metric-hint">${x[2]}</div></article>`).join('');
+      const share=Number(s.top_n_amount_share||0)*100;
+      const shareVol=Number(s.top_n_volume_share||0)*100;
+      const concentration=[['成交额 Top '+s.top_n,share],['成交量 Top '+s.top_n,shareVol]];
+      $('#concentration').innerHTML=concentration.map(([label,value])=>`<div class="concentration-row"><span>${safe(label)}</span><div class="track" title="${value.toFixed(2)}%"><i style="width:${Math.min(100,value)}%"></i></div><b>${value.toFixed(2)}%</b></div>`).join('');
+      const partial=String(status).includes('PARTIAL');
+      $('#quality').innerHTML=`<span class="dot ${partial?'partial':''}"></span><span>快照质量：<b>${safe(status)}</b> · ${safe(s.trade_date)} · 基线 ${safe(s.data_baseline_id)}</span>`;
+      $('#status').textContent=s.observation_snapshot_id?'异常观察已冻结':'尚无对应的冻结异常观察';
+      $('#status').className='status '+(s.observation_snapshot_id?'':'error');
+    }
+    function renderTable(){
+      if(!payload)return;
+      const rows=payload.rows||[], q=$('#search').value.trim().toUpperCase();
+      const filtered=rows.filter(r=>String(r.ts_code).toUpperCase().includes(q));
+      const anomaly=activeView==='anomaly';
+      $('#table-title').textContent=activeView==='amount'?'成交额排行':activeView==='volume'?'成交量排行':'异常放大股票';
+      $('#table-desc').textContent=activeView==='anomaly'?'按成交量/成交额异常倍数排序；标签附带触发值、阈值和来源指标':'排名 1 为最高；倍数基准为之前 20 个有效交易日，不含观察日';
+      $('#row-count').textContent=`显示 ${filtered.length} / ${rows.length}${payload.truncated?'（仅前 100）':''}`;
+      $('#table-head').innerHTML=anomaly?'<tr><th>#</th><th>股票</th><th>成交额</th><th>金额倍数</th><th>成交量倍数</th><th>异常标签 / 证据</th></tr>':'<tr><th>#</th><th>股票</th><th>成交额</th><th>成交量</th><th>市场占比</th><th>相对20日均值</th></tr>';
+      if(!filtered.length){$('#table-body').innerHTML=`<tr><td colspan="6" class="empty">${anomaly&&!payload.observation_available?'该日尚无冻结异常观察结果':'没有匹配的股票'}</td></tr>`;return;}
+      $('#table-body').innerHTML=filtered.map((r,i)=>{
+        if(anomaly){
+          const tags=(r.tags||[]).map(t=>{const e=t.evidence||{};return `<span class="pill tag" title="${safe(e.source_metric)} = ${fmt(e.actual_value,3)}×；阈值 ≥ ${fmt(e.threshold,2)}×；历史样本 ${fmt(e.history_observation_count,0)} 日">${safe(t.code)} ${fmt(e.actual_value,2)}×</span>`}).join('')||'<span class="pill">异常标记</span>';
+          return `<tr><td class="rank">${i+1}</td><td class="ticker">${safe(r.ts_code)}</td><td>${fmt(r.amount/1e8)} 亿</td><td class="ratio ${ratioClass(r.activity_amount_ratio_previous)}">${fmt(r.activity_amount_ratio_previous,2)}×</td><td class="ratio ${ratioClass(r.activity_volume_ratio_previous)}">${fmt(r.activity_volume_ratio_previous,2)}×</td><td>${tags}</td></tr>`;
+        }
+        const rank=activeView==='amount'?r.amount_rank:r.volume_rank;
+        const share=activeView==='amount'?r.amount_share:r.volume_share;
+        const ratio=activeView==='amount'?r.amount_ratio_previous:r.volume_ratio_previous;
+        return `<tr><td class="rank">${fmt(rank,0)}</td><td class="ticker">${safe(r.ts_code)}</td><td>${fmt(r.amount/1e8)} 亿</td><td>${fmt(r.volume/1e8)} 亿股</td><td>${pct(share)}</td><td class="ratio ${ratioClass(ratio)}">${fmt(ratio,2)}×</td></tr>`;
+      }).join('');
+    }
+    async function loadDay(){
+      const d=$('#date').value;if(!d)return;
+      $('#status').textContent='读取冻结快照…';$('#status').className='status';
+      try{payload=await request(`/api/market-activity/day?date=${encodeURIComponent(d)}&view=${activeView}`);renderMetrics(payload.summary);renderTable();}
+      catch(e){$('#status').textContent=e.message;$('#status').className='status error';$('#metrics').innerHTML='<div class="card error">无法读取该日冻结数据</div>';$('#table-body').innerHTML='';}
+    }
+    async function init(){
+      try{const result=await request('/api/market-activity/dates');const dates=result.dates||[];const select=$('#date');select.innerHTML=dates.map(d=>`<option value="${safe(d)}">${safe(d)}</option>`).join('');if(!dates.length){$('#status').textContent='近一年内未找到冻结的成交观察数据';return;}await loadDay();}
+      catch(e){$('#status').textContent=e.message;$('#status').className='status error';}
+    }
+    $('#date').addEventListener('change',loadDay);$('#search').addEventListener('input',renderTable);
+    document.querySelectorAll('.tab').forEach(button=>button.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b===button));activeView=button.dataset.view;loadDay();}));
+    init();
+  </script>
+</body>
+</html>
