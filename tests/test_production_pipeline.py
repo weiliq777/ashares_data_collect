@@ -21,6 +21,7 @@ def test_production_pipeline_is_one_scheduled_chain_with_final_gate():
         "production_instrument_raw", "production_market_raw", "production_phase2_raw",
         "production_market_derived", "production_financial_raw",
         "production_financial_derived", "production_quality",
+        "production_market_activity",
     ]
     assert production["schedule"] == {
         "hour": 20, "minute": 0, "timezone": "Asia/Shanghai",
@@ -33,6 +34,7 @@ def test_production_pipeline_is_one_scheduled_chain_with_final_gate():
     assert tasks[6]["depends_on"] == [
         "production_market_derived", "production_financial_derived",
     ]
+    assert tasks[7]["depends_on"] == ["production_quality"]
     assert tasks[3]["kwargs"]["lookback_days"] == tasks[6]["kwargs"]["lookback_days"]
     assert "schedule" not in pipelines["tushare_daily"]
     assert "schedule" not in pipelines["tushare_financial"]
@@ -49,7 +51,9 @@ def test_versioned_example_config_contains_the_reviewed_production_dag():
     assert production["schedule"] == {
         "hour": 20, "minute": 0, "timezone": "Asia/Shanghai",
     }
-    assert [task["name"] for task in production["tasks"]][-1] == "production_quality"
+    assert [task["name"] for task in production["tasks"]][-2:] == [
+        "production_quality", "production_market_activity",
+    ]
 
 
 def test_production_pipeline_rejects_full_history_release_and_snapshot_jobs():
@@ -340,11 +344,15 @@ def test_production_daily_chain_runs_derived_builders_before_final_quality():
     config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
     tasks = config["pipelines"]["tushare_production_daily"]["tasks"]
     names = [task["name"] for task in tasks]
-    assert names[-1] == "production_quality"
-    assert tasks[-1]["job"] == "data_collect.jobs.tushare_production_quality"
-    assert set(tasks[-1]["depends_on"]) == {
+    assert names[-2:] == ["production_quality", "production_market_activity"]
+    quality = next(task for task in tasks if task["name"] == "production_quality")
+    activity = next(task for task in tasks if task["name"] == "production_market_activity")
+    assert quality["job"] == "data_collect.jobs.tushare_production_quality"
+    assert set(quality["depends_on"]) == {
         "production_market_derived", "production_financial_derived",
     }
+    assert activity["job"] == "data_collect.jobs.market_activity_production_daily"
+    assert activity["depends_on"] == ["production_quality"]
     source = (ROOT / "data_collect/jobs/tushare_derived_rebuild.py").read_text(encoding="utf-8")
     assert 'features["technical_daily_v1"]' in source
 
@@ -370,6 +378,15 @@ def test_production_pipeline_contract_is_versioned_and_fail_closed():
                     "job": "data_collect.jobs.a_share_instrument_tushare",
                 }
             ],
+        )
+
+    without_activity = [
+        task for task in config["pipelines"]["tushare_production_daily"]["tasks"]
+        if task["name"] != "production_market_activity"
+    ]
+    with pytest.raises(RuntimeError, match="missing required tasks"):
+        _validate_production_pipeline_contract(
+            "tushare_production_daily", without_activity,
         )
 
     invalid_schedules = {

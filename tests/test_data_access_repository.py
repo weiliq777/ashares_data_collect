@@ -822,6 +822,47 @@ def test_market_activity_release_gate_is_scoped_to_market_inputs():
     assert calls == ["ops.market_data_quality_gate", "std.daily_kline"]
 
 
+def test_latest_daily_gate_query_is_bounded_and_returns_one_row():
+    from types import SimpleNamespace
+    from datetime import timedelta
+    from data_collect.data_access.repository.market_coverage_repository import (
+        MarketCoverageRepository,
+    )
+
+    calls = []
+
+    class ReadProbe:
+        def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
+            calls.append((source, sql, params, scope, max_rows))
+            return [{"trade_date": date(2026, 9, 25), "status": "PASS"}]
+
+    end_date = date(2026, 9, 27)
+    repository = MarketCoverageRepository(SimpleNamespace(read=ReadProbe()))
+    result = repository.latest_daily_gate(end_date, 31, ctx())
+
+    assert result["status"] == "PASS"
+    source, sql, params, scope, max_rows = calls[0]
+    assert source == "ops.market_data_quality_gate"
+    assert "trade_date BETWEEN %s AND %s" in sql
+    assert "ORDER BY trade_date DESC, created_at DESC, gate_id DESC" in sql
+    assert "LIMIT 1" in sql
+    assert params == (end_date - timedelta(days=30), end_date)
+    assert (scope.date_from, scope.date_to) == params
+    assert max_rows == 1
+
+
+@pytest.mark.parametrize("lookback_days", [0, 32])
+def test_latest_daily_gate_rejects_unbounded_lookback(lookback_days):
+    from types import SimpleNamespace
+    from data_collect.data_access.repository.market_coverage_repository import (
+        MarketCoverageRepository,
+    )
+
+    repository = MarketCoverageRepository(SimpleNamespace(read=SimpleNamespace()))
+    with pytest.raises(ValueError, match="1..31"):
+        repository.latest_daily_gate(date(2026, 9, 27), lookback_days, ctx())
+
+
 def test_market_activity_source_manifest_hashes_exact_calculation_inputs():
     from datetime import timedelta
     from data_collect.market_activity.contracts import MarketActivityRequest

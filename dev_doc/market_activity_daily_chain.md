@@ -14,7 +14,20 @@ Observation V1（异常标签与证据）
 Dashboard / AI Research（展示与分析）
 ```
 
-## 唯一入口
+## 每日生产入口
+
+每日 Tushare 生产链在 `production_quality`（生产质量门禁）通过后，自动执行
+`data_collect.jobs.market_activity_production_daily`。它只在最近 31 个自然日内
+读取最新一条 `daily`（日线行情）质量门禁，要求状态为 `PASS`，并为该交易日
+创建或复用 `market-activity-YYYYMMDD` 的 `MARKET_ACTIVITY`（市场观察域）发布基线。
+发布通过后，仅冻结该交易日的 Market Activity（成交活跃度）和 Observation（异常观察）。
+
+同一日期的有效发布会被复用；禁止把当前发布基线回退到更早日期，也不会调用完整
+Research（研究域）发布审计、重建历史数据或触碰策略/回测数据。
+
+手动补跑/诊断时仍可使用下方单日入口，但必须提供当前有效的成交观察基线。
+
+## 手动单日入口
 
 ```powershell
 python -m data_collect.jobs.market_activity_observation_daily `

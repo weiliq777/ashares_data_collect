@@ -39,6 +39,9 @@ _STABLE_RETRY_ARGUMENTS = {
     # The price-v2 feature checkpoints must be fresh for each production run,
     # while all child-process retries of this derived task share one identity.
     "data_collect.jobs.tushare_production_market_derived": "execution_id",
+    # A daily activity release and its frozen observations must reuse the
+    # same identity if the subprocess is retried after a timeout.
+    "data_collect.jobs.market_activity_production_daily": "execution_id",
 }
 
 _RETRY_ATTEMPT_ARGUMENTS = {
@@ -88,6 +91,10 @@ _PRODUCTION_DAILY_TASK_CONTRACT = {
     "production_quality": (
         "data_collect.jobs.tushare_production_quality",
         ("production_market_derived", "production_financial_derived"),
+    ),
+    "production_market_activity": (
+        "data_collect.jobs.market_activity_production_daily",
+        ("production_quality",),
     ),
 }
 
@@ -319,7 +326,7 @@ def _validate_production_pipeline_contract(pipeline_name: str, tasks: list[Dict[
 
 
 def _validate_production_daily_tasks(tasks: list[Dict[str, Any]]) -> None:
-    """Require the full Raw → derived → final-quality production dependency chain."""
+    """Require the full Raw → derived → quality → bounded observer chain."""
     unbounded = sorted({
         str(task.get("job"))
         for task in tasks

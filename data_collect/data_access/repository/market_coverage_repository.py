@@ -1,11 +1,42 @@
 """Repository for market coverage gates and their historical evidence."""
 from __future__ import annotations
 
+from datetime import timedelta
+
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
 
 
 class MarketCoverageRepository(BaseRepository):
+    def latest_daily_gate(
+        self, end_date, lookback_days: int, context: RunContext,
+    ) -> dict | None:
+        """Find the newest daily-bar gate in a small, explicit date window."""
+        days = int(lookback_days)
+        if not 1 <= days <= 31:
+            raise ValueError("market gate lookback_days must be in 1..31")
+        start_date = end_date - timedelta(days=days - 1)
+        rows = self.kernel.read._repository_query(
+            context=context,
+            source="ops.market_data_quality_gate",
+            sql="""
+                SELECT trade_date, status, actual_rows, expected_rows,
+                       batch_id, reason, created_at
+                  FROM ops.market_data_quality_gate
+                 WHERE dataset='daily' AND trade_date BETWEEN %s AND %s
+                 ORDER BY trade_date DESC, created_at DESC, gate_id DESC
+                 LIMIT 1
+            """,
+            params=(start_date, end_date),
+            scope=WorkScope(
+                date_from=start_date,
+                date_to=end_date,
+                partition="coverage:latest-daily-gate",
+            ),
+            max_rows=1,
+        )
+        return rows[0] if rows else None
+
     def previous_counts(self, dataset: str, trade_date, baseline_days: int, context: RunContext) -> list[int]:
         rows = self.kernel.read._repository_query(
             context=context,

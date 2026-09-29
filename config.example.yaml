@@ -115,6 +115,12 @@ pipelines:
         retries: 0
         kwargs:
           lookback_days: 20
+      - name: production_market_activity
+        job: data_collect.jobs.market_activity_production_daily
+        platform: windows
+        depends_on: [production_quality]
+        timeout: 1800
+        retries: 1
 
   # 每日 15:30 主流水线
   daily:

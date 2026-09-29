@@ -68,6 +68,44 @@ class ReleaseRepository(BaseRepository):
                             "visibility_policy_version"),
         )
 
+    def get_release(self, tag: str, context: RunContext) -> dict | None:
+        """Read one release identity by its unique tag; never scan the ledger."""
+        rows = self.kernel.read._repository_query(
+            context,
+            "ops.tushare_data_release",
+            """SELECT release_tag, baseline_domain, baseline_cutoff_date,
+                      schema_version, status
+                 FROM ops.tushare_data_release
+                WHERE release_tag=%s
+                LIMIT 2""",
+            (str(tag).strip(),),
+            WorkScope(partition=f"release:{tag}"),
+            2,
+        )
+        if len(rows) > 1:
+            raise RuntimeError(f"duplicate release tag: {tag}")
+        return rows[0] if rows else None
+
+    def current_validated_release(self, baseline_domain: str, context: RunContext) -> dict | None:
+        domain = str(baseline_domain).strip().upper()
+        if domain not in {self.RESEARCH_DOMAIN, self.MARKET_ACTIVITY_DOMAIN}:
+            raise ValueError(f"unsupported release baseline domain: {domain!r}")
+        rows = self.kernel.read._repository_query(
+            context,
+            "ops.tushare_data_release",
+            """SELECT release_tag, baseline_domain, baseline_cutoff_date,
+                      schema_version, status
+                 FROM ops.tushare_data_release
+                WHERE baseline_domain=%s AND status='validated'
+                LIMIT 2""",
+            (domain,),
+            WorkScope(partition=f"release:current:{domain}"),
+            2,
+        )
+        if len(rows) > 1:
+            raise RuntimeError(f"multiple current validated releases for domain: {domain}")
+        return rows[0] if rows else None
+
     def source_manifest(self, cutoff: date, context: RunContext) -> tuple[dict, str]:
         manifest = {"schema_version": "tushare-release-source-v1", "cutoff_date": cutoff.isoformat(), "market_versions": {}, "legacy_market_raw": {}, "append_only_sources": {}}
         manifest["market_versions"] = self._market_versions_manifest(cutoff, context)
