@@ -176,9 +176,48 @@ def test_sector_denominator_is_eligible_universe_only():
 
 
 def test_outcome_keeps_future_strategy_semantics_out():
-    rows = [{"trade_date": date(2026, 8, 31), "ts_code": "000001.SZ", "adj_close_base": 100.0, "total_return_price": 100.0}]
-    rows.extend({"trade_date": date(2026, 9, 1) + timedelta(days=i), "ts_code": "000001.SZ", "adj_close_base": 100.0 + i + 1, "total_return_price": 100.0 + i + 1} for i in range(120))
-    result = compute_outcome(rows)
+    start = date(2026, 8, 31)
+    sessions = []
+    cursor = start
+    while len(sessions) <= 120:
+        if cursor.weekday() < 5:
+            sessions.append(cursor)
+        cursor += timedelta(days=1)
+    event = {
+        "observation_id": "11111111-1111-4111-8111-111111111111",
+        "snapshot_id": "22222222-2222-4222-8222-222222222222",
+        "observation_date": start,
+        "ts_code": "000001.SZ",
+        "methodology_hash": "c" * 64,
+        "data_baseline_id": "market-activity-test",
+        "input_manifest_hash": "a" * 64,
+        "observation_hash": "d" * 64,
+        "anchor_adj_close_base": 100.0,
+        "anchor_total_return_price": 100.0,
+        "anchor_benchmark_close": 200.0,
+        "anchor_quality_status": "VALID",
+        "anchor_source_asof_date": start,
+        "anchor_price_coordinate_contract_version": "market-price-coordinate-v1",
+        "anchor_source_hash": "b" * 64,
+    }
+    stock_rows = [
+        {
+            "trade_date": sessions[index], "ts_code": "000001.SZ",
+            "adj_close_base": 100.0 + index,
+            "total_return_price": 100.0 + index,
+            "quality_status": "VALID", "source_asof_date": sessions[index],
+            "price_coordinate_contract_version": "market-price-coordinate-v1",
+        }
+        for index in range(1, 121)
+    ]
+    benchmark_rows = [
+        {"trade_date": sessions[index], "ts_code": "000985.CSI", "close": 200.0}
+        for index in range(1, 121)
+    ]
+    result = compute_outcome(
+        event, calendar_dates=sessions, stock_rows=stock_rows,
+        benchmark_rows=benchmark_rows, through_date=sessions[-1],
+    )
     assert result["future_price_return_5d"] == pytest.approx(0.05)
     assert result["future_total_return_5d"] == pytest.approx(0.05)
     assert "entry_price" not in result
@@ -186,16 +225,48 @@ def test_outcome_keeps_future_strategy_semantics_out():
 
 
 def test_outcome_does_not_compress_missing_future_path():
-    rows = [
-        {"trade_date": date(2026, 8, 31), "ts_code": "000001.SZ", "adj_close_base": 100.0, "total_return_price": 100.0},
-        {"trade_date": date(2026, 9, 1), "ts_code": "000001.SZ", "adj_close_base": 101.0, "total_return_price": 101.0},
-        {"trade_date": date(2026, 9, 2), "ts_code": "000001.SZ", "adj_close_base": None, "total_return_price": None},
+    start = date(2026, 8, 31)
+    sessions = []
+    cursor = start
+    while len(sessions) <= 120:
+        if cursor.weekday() < 5:
+            sessions.append(cursor)
+        cursor += timedelta(days=1)
+    event = {
+        "observation_id": "11111111-1111-4111-8111-111111111111",
+        "snapshot_id": "22222222-2222-4222-8222-222222222222",
+        "observation_date": start,
+        "ts_code": "000001.SZ",
+        "methodology_hash": "c" * 64,
+        "data_baseline_id": "market-activity-test",
+        "input_manifest_hash": "a" * 64,
+        "observation_hash": "d" * 64,
+        "anchor_adj_close_base": 100.0,
+        "anchor_total_return_price": 100.0,
+        "anchor_benchmark_close": 200.0,
+        "anchor_quality_status": "VALID",
+        "anchor_source_asof_date": start,
+        "anchor_price_coordinate_contract_version": "market-price-coordinate-v1",
+        "anchor_source_hash": "b" * 64,
+    }
+    stock_rows = [
+        {
+            "trade_date": sessions[index], "ts_code": "000001.SZ",
+            "adj_close_base": (None if index == 2 else 100.0 + index),
+            "total_return_price": (None if index == 2 else 100.0 + index),
+            "quality_status": "VALID", "source_asof_date": sessions[index],
+            "price_coordinate_contract_version": "market-price-coordinate-v1",
+        }
+        for index in range(1, 7)
     ]
-    rows.extend(
-        {"trade_date": date(2026, 9, 3) + timedelta(days=i), "ts_code": "000001.SZ", "adj_close_base": 103.0 + i, "total_return_price": 103.0 + i}
-        for i in range(5)
+    benchmark_rows = [
+        {"trade_date": sessions[index], "ts_code": "000985.CSI", "close": 200.0}
+        for index in range(1, 7)
+    ]
+    result = compute_outcome(
+        event, calendar_dates=sessions, stock_rows=stock_rows,
+        benchmark_rows=benchmark_rows, through_date=sessions[5],
     )
-    result = compute_outcome(rows)
     assert result["future_price_return_5d"] is not None
     assert result["max_drawdown_5d"] is None
     assert "MISSING_PRICE_PATH_5D" in result["missing_reason_codes"]

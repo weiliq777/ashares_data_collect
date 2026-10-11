@@ -318,7 +318,9 @@ def build_default_registry() -> DatasetPolicyRegistry:
             DatasetPolicy(
                 name="evaluation.market_anomaly_outcome",
                 write_modes=frozenset([WriteMode.UPSERT, WriteMode.BULK_INSERT]),
-                primary_key=("observation_id", "evaluation_methodology_hash"),
+                primary_key=(
+                    "observation_id", "evaluation_methodology_hash", "outcome_revision",
+                ),
                 require_scope=True,
                 require_snapshot_id=True,
                 scan_policy=ScanPolicy.SCOPE_REQUIRED,

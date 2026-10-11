@@ -121,6 +121,19 @@ pipelines:
         depends_on: [production_quality]
         timeout: 1800
         retries: 1
+      # Optional downstream evaluator. Enable only after applying migration
+      # 113_market_anomaly_outcome_incremental.sql and reviewing every query
+      # with Repository → Kernel → EXPLAIN (FORMAT JSON), without ANALYZE.
+      # It writes at most 5 batches × 100 event rows per run and never rebuilds
+      # Raw/Standard/PIT/Feature or Research Snapshot data.
+      # - name: production_market_anomaly_outcome
+      #   job: data_collect.jobs.market_anomaly_outcome_daily
+      #   platform: windows
+      #   depends_on: [production_market_activity]
+      #   timeout: 1800
+      #   retries: 1
+      #   kwargs:
+      #     lookback_days: 31
 
   # 每日 15:30 主流水线
   daily:

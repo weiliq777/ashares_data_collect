@@ -35,12 +35,14 @@ from data_collect.data_access.repository.retention_archive_repository import Ret
 from data_collect.data_access.repository.foundation_metadata_repository import FoundationMetadataRepository
 from data_collect.data_access.repository.contract_product_repository import ContractProductRepository
 from data_collect.data_access.repository.observation_repository import (
-    MarketAnomalyOutcomeRepository,
     ObservationEventRepository,
     ScenarioEvaluationRepository,
     SectorAnomalyObservationRepository,
     StockAnomalyObservationRepository,
     StockSectorConfirmationRepository,
+)
+from data_collect.data_access.repository.market_anomaly_outcome_repository import (
+    MarketAnomalyOutcomeRepository,
 )
 
 __all__ = [

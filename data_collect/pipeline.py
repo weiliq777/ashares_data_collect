@@ -42,6 +42,8 @@ _STABLE_RETRY_ARGUMENTS = {
     # A daily activity release and its frozen observations must reuse the
     # same identity if the subprocess is retried after a timeout.
     "data_collect.jobs.market_activity_production_daily": "execution_id",
+    # Outcome retries resume from the same persisted watermark and row identity.
+    "data_collect.jobs.market_anomaly_outcome_daily": "execution_id",
 }
 
 _RETRY_ATTEMPT_ARGUMENTS = {
@@ -95,6 +97,14 @@ _PRODUCTION_DAILY_TASK_CONTRACT = {
     "production_market_activity": (
         "data_collect.jobs.market_activity_production_daily",
         ("production_quality",),
+    ),
+}
+
+_OPTIONAL_PRODUCTION_DAILY_TASK_CONTRACT = {
+    # Activate only after migration 113 and read-only EXPLAIN plan review.
+    "production_market_anomaly_outcome": (
+        "data_collect.jobs.market_anomaly_outcome_daily",
+        ("production_market_activity",),
     ),
 }
 
@@ -338,7 +348,11 @@ def _validate_production_daily_tasks(tasks: list[Dict[str, Any]]) -> None:
             f"jobs without a bounded delta contract: {unbounded}"
         )
 
-    allowed_jobs = {job for job, _dependencies in _PRODUCTION_DAILY_TASK_CONTRACT.values()}
+    reviewed_tasks = {
+        **_PRODUCTION_DAILY_TASK_CONTRACT,
+        **_OPTIONAL_PRODUCTION_DAILY_TASK_CONTRACT,
+    }
+    allowed_jobs = {job for job, _dependencies in reviewed_tasks.values()}
     unknown_jobs = sorted({
         str(task.get("job"))
         for task in tasks
@@ -352,7 +366,7 @@ def _validate_production_daily_tasks(tasks: list[Dict[str, Any]]) -> None:
 
     by_name = {task.get("name"): task for task in tasks}
     duplicate_names = len(by_name) != len(tasks)
-    extra_names = sorted(set(by_name) - set(_PRODUCTION_DAILY_TASK_CONTRACT))
+    extra_names = sorted(set(by_name) - set(reviewed_tasks))
     if duplicate_names or extra_names:
         raise RuntimeError(
             "tushare_production_daily task topology is not explicitly reviewed: "
@@ -365,7 +379,9 @@ def _validate_production_daily_tasks(tasks: list[Dict[str, Any]]) -> None:
             f"{sorted(missing)}"
         )
 
-    for name, (expected_job, expected_dependencies) in _PRODUCTION_DAILY_TASK_CONTRACT.items():
+    for name, (expected_job, expected_dependencies) in reviewed_tasks.items():
+        if name in _OPTIONAL_PRODUCTION_DAILY_TASK_CONTRACT and name not in by_name:
+            continue
         task = by_name[name]
         if task.get("job") != expected_job:
             raise RuntimeError(
@@ -376,6 +392,13 @@ def _validate_production_daily_tasks(tasks: list[Dict[str, Any]]) -> None:
                 f"tushare_production_daily task {name} dependencies must be "
                 f"{expected_dependencies}"
             )
+        if name == "production_market_anomaly_outcome":
+            lookback = int(dict(task.get("kwargs") or {}).get("lookback_days", 31))
+            if not 1 <= lookback <= 31:
+                raise RuntimeError(
+                    "tushare_production_daily production_market_anomaly_outcome."
+                    "lookback_days must be in 1..31"
+                )
 
     expected_false_flags = {
         "production_market_raw": "rebuild_derived",

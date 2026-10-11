@@ -410,6 +410,49 @@ def test_production_pipeline_contract_is_versioned_and_fail_closed():
         _validate_production_schedule_contract(missing_schedule)
 
 
+def test_outcome_is_reviewed_optional_downstream_and_disabled_in_current_dag():
+    from data_collect.pipeline import (
+        _STABLE_RETRY_ARGUMENTS,
+        _validate_production_pipeline_contract,
+    )
+
+    config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+    tasks = list(config["pipelines"]["tushare_production_daily"]["tasks"])
+    outcome = {
+        "name": "production_market_anomaly_outcome",
+        "job": "data_collect.jobs.market_anomaly_outcome_daily",
+        "depends_on": ["production_market_activity"],
+        "kwargs": {"lookback_days": 31},
+        "retries": 1,
+    }
+    tasks.append(outcome)
+    _validate_production_pipeline_contract("tushare_production_daily", tasks)
+    assert _STABLE_RETRY_ARGUMENTS[outcome["job"]] == "execution_id"
+
+    invalid = [*tasks[:-1], {**outcome, "depends_on": ["production_quality"]}]
+    with pytest.raises(RuntimeError, match="dependencies"):
+        _validate_production_pipeline_contract("tushare_production_daily", invalid)
+
+    names = [task["name"] for task in config["pipelines"]["tushare_production_daily"]["tasks"]]
+    assert "production_market_anomaly_outcome" not in names
+
+
+def test_outcome_job_dry_run_is_bounded_and_does_not_open_kernel():
+    from data_collect.jobs.market_anomaly_outcome_daily import run
+
+    report = run(run_date="20261010", dry_run=True, lookback_days=10)
+    assert report == {
+        "status": "dry_run",
+        "upper_bound": "2026-10-10",
+        "lookback_days": 10,
+        "max_events_per_batch": 100,
+        "max_batches_per_run": 5,
+    }
+
+    with pytest.raises(ValueError, match="1..31"):
+        run(run_date="20261010", dry_run=True, lookback_days=32)
+
+
 def test_split_tushare_pipeline_cannot_be_scheduled_individually(monkeypatch):
     import data_collect.config as app_config
     from run_job import start_scheduler

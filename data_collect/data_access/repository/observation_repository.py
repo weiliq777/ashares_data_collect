@@ -726,26 +726,6 @@ class ObservationEventRepository(BaseRepository):
         )
 
 
-class MarketAnomalyOutcomeRepository(BaseRepository):
-    """Persist strategy-neutral future outcomes."""
-
-    def write_rows(self, rows: Sequence[Mapping[str, Any]], context: RunContext, scope: WorkScope) -> int:
-        if not rows:
-            return 0
-        forbidden = {"entry_price", "exit_price", "fee_bps", "slippage_bps", "stop_loss", "take_profit", "hit_target_before_stop"}
-        if any(forbidden.intersection(row) for row in rows):
-            raise ValueError("market outcome cannot contain Scenario fields")
-        columns = tuple(rows[0].keys())
-        if "outcome_id" not in columns or "observation_id" not in columns or "evaluation_methodology_hash" not in columns:
-            raise ValueError("outcome requires stable identity columns")
-        return self.kernel.write.upsert(
-            context=context, scope=scope, target="evaluation.market_anomaly_outcome", rows=rows,
-            key=("observation_id", "evaluation_methodology_hash"),
-            update_columns=tuple(column for column in columns if column not in {"outcome_id", "observation_id", "evaluation_methodology_hash"}),
-            skip_noop=True,
-        )
-
-
 class ScenarioEvaluationRepository(BaseRepository):
     """Persist strategy/scenario results in their separate contract."""
 
@@ -767,5 +747,5 @@ class ScenarioEvaluationRepository(BaseRepository):
 __all__ = [
     "StockAnomalyObservationRepository", "SectorAnomalyObservationRepository",
     "StockSectorConfirmationRepository", "ObservationEventRepository",
-    "MarketAnomalyOutcomeRepository", "ScenarioEvaluationRepository",
+    "ScenarioEvaluationRepository",
 ]
