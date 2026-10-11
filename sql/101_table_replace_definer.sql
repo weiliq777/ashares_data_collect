@@ -28,9 +28,13 @@ BEGIN
         RAISE EXCEPTION 'TABLE_REPLACE staging already exists: %', p_staging;
     END IF;
 
-    -- Copy defaults/identity generation for physical keys, but not indexes:
-    -- index names would collide with the live target during the swap.
-    EXECUTE format('CREATE TABLE %s (LIKE %s INCLUDING DEFAULTS)', p_staging, p_target);
+    -- Preserve target indexes and unique/primary-key semantics in the shadow
+    -- table. PostgreSQL assigns fresh names to LIKE-copied indexes/constraints,
+    -- so they do not collide with objects still attached to the live target.
+    EXECUTE format(
+        'CREATE TABLE %s (LIKE %s INCLUDING DEFAULTS INCLUDING INDEXES)',
+        p_staging, p_target
+    );
     EXECUTE format(
         'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %s TO ashares_app',
         p_staging

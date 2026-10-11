@@ -15,6 +15,7 @@ from data_collect.data_access.repository.market_coverage_repository import (
     MarketCoverageRepository,
 )
 from data_collect.data_access.repository.release_repository import ReleaseRepository
+from data_collect.data_access.run_context import build_run_context
 from data_collect.jobs.market_activity_observation_daily import run as build_daily_observation
 
 
@@ -136,14 +137,12 @@ def run(
         raise ValueError("execution_id must not be blank")
 
     kernel = DataAccessKernel(policy_registry=build_default_registry())
+    context = build_run_context(
+        JOB_NAME,
+        pipeline_version="data-access-v1",
+        run_id=execution_id,
+    )
     try:
-        context = RunContext(
-            run_id=execution_id,
-            job_name=JOB_NAME,
-            code_version="market-activity-v1",
-            config_hash="market-activity-v1",
-            pipeline_version="data-access-v1",
-        )
         gate = MarketCoverageRepository(kernel).latest_daily_gate(
             upper_bound, lookback_days, context,
         )
@@ -169,18 +168,19 @@ def run(
         repository = ReleaseRepository(kernel)
         with kernel.lock_manager.session_exclusive("tushare-release", "market-activity"):
             release = _ensure_validated_release(repository, context, tag, trade_date)
+        kernel.release_connection()
+
+        # Keep this job's manifest open through the downstream build. The
+        # builder owns its own data operations, while this RunContext records
+        # the outcome of the complete scheduled task.
+        activity = build_daily_observation(trade_date, tag)
+        return {
+            "trade_date": trade_date.isoformat(),
+            "release": release,
+            "activity_observation": activity,
+        }
+    except BaseException as exc:
+        kernel.record_run_failure(context, exc)
+        raise
     finally:
         kernel.close()
-
-    # The builder's default run identities are deterministic by date and
-    # methodology, so rerunning a frozen date is idempotent. The scheduler's
-    # execution_id is reserved for release orchestration/retry attribution.
-    activity = build_daily_observation(
-        trade_date,
-        tag,
-    )
-    return {
-        "trade_date": trade_date.isoformat(),
-        "release": release,
-        "activity_observation": activity,
-    }

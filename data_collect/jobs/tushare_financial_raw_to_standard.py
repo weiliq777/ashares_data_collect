@@ -16,6 +16,7 @@ import pandas as pd
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.financial_standard_repository import FinancialStandardRepository
+from data_collect.data_access.run_context import build_run_context
 from data_collect.jobs.tushare_job_lock import warehouse_write_job
 
 
@@ -94,9 +95,10 @@ def transform(frame: pd.DataFrame, dataset: str) -> pd.DataFrame:
 
 def _service(label: str):
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id=f"financial-standard-{label}-{uuid4().hex}", job_name="tushare_financial_raw_to_standard",
-        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
+    context = build_run_context(
+        "tushare_financial_raw_to_standard",
+        pipeline_version="data-access-v1",
+        run_id=f"financial-standard-{label}-{uuid4().hex}",
     )
     return kernel, FinancialStandardRepository(kernel), context
 

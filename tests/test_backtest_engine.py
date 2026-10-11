@@ -279,7 +279,12 @@ def test_stop_loss_uses_previous_close_stop_and_blocks_limit_down():
         _bar(days[0]),
         _bar(days[1]),
         _bar(days[2], open_price=10.0, close=10.0),
-        _bar(days[3], open_price=8.8, close=9.0, low=8.5, can_sell=False),
+        MarketBar(
+            trade_date=days[3], ts_code="000001.SZ",
+            raw_open=8.0, raw_high=8.0, raw_low=8.0, raw_close=8.0,
+            volume=100000, amount=800000, up_limit=10.0, down_limit=8.0,
+            can_buy=False, can_sell=False, limit_status="DOWN_LIMIT",
+        ),
     ]
     obs = {day: [_observation(day)] for day in days[1:]}
     result = BacktestEngine(BacktestConfig(initial_cash=10000, reserve_cash_pct=0)).run(
@@ -559,6 +564,122 @@ def test_open_limit_decision_ignores_close_derived_limit_status():
     )
     assert BacktestEngine._limit_blocked(open_tradeable, "BUY") is False
     assert BacktestEngine._limit_blocked(locked_at_open, "BUY") is True
+
+
+def test_open_buy_can_fill_before_the_daily_bar_closes_at_upper_limit():
+    days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6)]
+
+    class BuyOnce:
+        strategy_id = "open-buy-before-limit-close"
+        strategy_version = "1"
+
+        def generate_signals(self, trade_date, observations, positions):
+            if trade_date == days[1]:
+                return [SignalIntent("000001.SZ", "BUY", 9.7, 9.7, 9.0)]
+            return []
+
+    bars = [
+        _bar(days[0], close=9.5),
+        _bar(days[1], close=9.7),
+        MarketBar(
+            trade_date=days[2], ts_code="000001.SZ",
+            raw_open=9.8, raw_high=10.0, raw_low=9.7, raw_close=10.0,
+            volume=100000, amount=1000000, up_limit=10.0, down_limit=8.0,
+            can_buy=False, can_sell=True, limit_status="UP_LIMIT",
+        ),
+    ]
+    result = BacktestEngine(
+        BacktestConfig(initial_cash=100000, reserve_cash_pct=0),
+    ).run(
+        _dataset(
+            days, bars,
+            {day: [_observation(day)] for day in days[1:]},
+        ),
+        BuyOnce(),
+    )
+
+    assert result.orders[0]["status"] == "FILLED"
+    assert result.fills[0]["direction"] == "BUY"
+    assert result.fills[0]["fill_price"] == pytest.approx(9.8)
+
+
+def test_open_sell_can_fill_before_the_daily_bar_closes_at_lower_limit():
+    days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+
+    class BuyThenSell:
+        strategy_id = "open-sell-before-limit-close"
+        strategy_version = "1"
+
+        def generate_signals(self, trade_date, observations, positions):
+            if trade_date == days[1]:
+                return [SignalIntent("000001.SZ", "BUY", 10.0, 10.0, 7.5)]
+            if trade_date == days[2] and positions:
+                return [SignalIntent("000001.SZ", "SELL", 10.0, 10.0)]
+            return []
+
+    bars = [
+        _bar(days[0]),
+        _bar(days[1]),
+        _bar(days[2]),
+        MarketBar(
+            trade_date=days[3], ts_code="000001.SZ",
+            raw_open=8.2, raw_high=8.3, raw_low=8.0, raw_close=8.0,
+            volume=100000, amount=800000, up_limit=10.0, down_limit=8.0,
+            can_buy=True, can_sell=False, limit_status="DOWN_LIMIT",
+        ),
+    ]
+    result = BacktestEngine(
+        BacktestConfig(initial_cash=100000, reserve_cash_pct=0),
+    ).run(
+        _dataset(
+            days, bars,
+            {day: [_observation(day)] for day in days[1:]},
+        ),
+        BuyThenSell(),
+    )
+
+    assert [fill["direction"] for fill in result.fills] == ["BUY", "SELL"]
+    assert result.fills[-1]["fill_price"] == pytest.approx(8.2)
+
+
+def test_stop_can_execute_before_a_later_lower_limit_close():
+    days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+
+    class BuyOnce:
+        strategy_id = "stop-before-limit-close"
+        strategy_version = "1"
+
+        def generate_signals(self, trade_date, observations, positions):
+            if trade_date == days[1]:
+                return [SignalIntent("000001.SZ", "BUY", 10.0, 10.0, 9.0)]
+            return []
+
+    bars = [
+        _bar(days[0]),
+        _bar(days[1]),
+        _bar(days[2]),
+        MarketBar(
+            trade_date=days[3], ts_code="000001.SZ",
+            raw_open=8.8, raw_high=9.0, raw_low=8.0, raw_close=8.0,
+            volume=100000, amount=800000, up_limit=10.0, down_limit=8.0,
+            can_buy=False, can_sell=False, limit_status="DOWN_LIMIT",
+        ),
+    ]
+    result = BacktestEngine(
+        BacktestConfig(initial_cash=100000, reserve_cash_pct=0),
+    ).run(
+        _dataset(
+            days, bars,
+            {day: [_observation(day)] for day in days[1:]},
+        ),
+        BuyOnce(),
+    )
+
+    stop_orders = [order for order in result.orders if order.get("kind") == "STOP"]
+    assert len(stop_orders) == 1
+    assert stop_orders[0]["status"] == "FILLED"
+    assert result.fills[-1]["fill_date"] == days[3]
+    assert result.fills[-1]["fill_price"] == pytest.approx(8.8)
 
 
 def test_frozen_dataset_requires_explicit_market_rules():

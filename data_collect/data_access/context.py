@@ -1,6 +1,6 @@
 """核心数据对象：WorkScope / RunContext / SqlPlan / Operation / RebuildMode。
 
-严格对应《data_access_kernel.md》§3。这些对象是"操作意图"的载体：
+这些对象描述数据访问的操作意图；具体约束由本包的实现、SQL 迁移和契约扫描共同落实：
 Repository 调 Kernel 时只传意图（读什么、写什么、哪个范围、哪种操作），
 不传 Connection/Cursor/裸 SQL 执行权。
 """

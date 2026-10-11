@@ -14,6 +14,7 @@ import pandas as pd
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.financial_vip_repository import FinancialVipRepository
+from data_collect.data_access.run_context import build_run_context
 from data_collect.jobs.tushare_financial_raw_to_standard import _run_unlocked as standard_run
 from data_collect.jobs.tushare_foundation_features import rebuild_company_financial_v2
 from data_collect.jobs.tushare_job_lock import warehouse_write_job
@@ -98,7 +99,11 @@ class _QueueLeaseHeartbeat:
 
 def _service(token: str):
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(token, "tushare-financial-vip", "unknown", "unknown", "v1")
+    context = build_run_context(
+        "tushare-financial-vip",
+        pipeline_version="v1",
+        run_id=token,
+    )
     return kernel, FinancialVipRepository(kernel), context
 
 
@@ -481,6 +486,9 @@ def run(end_date=None, run_date=None, lookback_days=30, report_periods_back=4,
                 claim_owner_id=claim_owner_id, takeover=attempt > 1,
             )
         return f"financial VIP incremental completed batch_id={batch_id} periods={len(periods)}"
+    except BaseException as exc:
+        kernel.record_run_failure(context, exc)
+        raise
     finally:
         kernel.close()
 

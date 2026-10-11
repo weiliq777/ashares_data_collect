@@ -12,10 +12,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.history_repository import HistoryRepository
 from data_collect.data_access.repository.market_repository import MarketRepository
+from data_collect.data_access.run_context import build_run_context
 from data_collect.jobs.tushare_job_lock import warehouse_write_job
 from data_collect.normalize.tushare_daily import normalize_daily, normalize_daily_basic
 from data_collect.providers.tushare_client import call_api
@@ -23,7 +24,11 @@ from data_collect.providers.tushare_client import call_api
 
 def _service(token: str):
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(token, "tushare-daily-incremental", "unknown", "unknown", "v1")
+    context = build_run_context(
+        "tushare-daily-incremental",
+        pipeline_version="v1",
+        run_id=token,
+    )
     return kernel, HistoryRepository(kernel), MarketRepository(kernel), context
 
 

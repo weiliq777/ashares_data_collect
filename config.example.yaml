@@ -20,8 +20,8 @@ tick_storage:
   compression: "zstd"
 
 qmt:
-  # QMT 安装目录；清理任务清空 {install_dir}\userdata_mini\datadir（本地行情缓存）
-  install_dir: "D:\\国金QMT交易端模拟"
+  # 仅供行情缓存清理任务定位本地 datadir；本项目不会连接交易接口或发送订单
+  install_dir: "D:\\QMT"
 
 # 新闻系统（见 docs/superpowers/specs/2026-07-02-news-opensearch-plan.md）
 opensearch:
@@ -135,12 +135,8 @@ pipelines:
       #   kwargs:
       #     lookback_days: 31
 
-  # 每日 15:30 主流水线
+  # 手动兼容入口（QMT 日线）。定时生产统一由 tushare_production_daily 负责。
   daily:
-    schedule:
-      hour: 15
-      minute: 30
-      timezone: "Asia/Shanghai"
     # timeout（秒）+ retries：xtquant 挂死时硬杀子进程并重试 N 次，仍失败发钉钉
     tasks:
       - name: a_share_daily
@@ -237,7 +233,7 @@ pipelines:
         timeout: 3600
         retries: 1
 
-  # 周日 8:00 — daily/minute K线查漏补缺最近 10 个交易日
+  # 周日 8:00 — minute/ETF K线查漏补缺最近 10 个交易日
   weekly_kline_verify:
     schedule:
       day_of_week: sun
@@ -245,13 +241,6 @@ pipelines:
       minute: 0
       timezone: "Asia/Shanghai"
     tasks:
-      - name: a_share_daily
-        job: data_collect.jobs.a_share_daily
-        platform: windows
-        fn: run_verify
-        days_back: 10
-        timeout: 1800
-        retries: 1
       - name: a_share_minute
         job: data_collect.jobs.a_share_minute
         platform: windows

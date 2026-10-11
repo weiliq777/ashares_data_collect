@@ -54,7 +54,7 @@ class BacktestConfig:
     reserve_cash_pct: float = 0.10
     market_rule: MarketRule = field(default_factory=MarketRule)
     fee_rule: FeeRule = field(default_factory=FeeRule)
-    execution_model_version: str = "daily-next-open-v2"
+    execution_model_version: str = "daily-next-open-v3"
     random_seed: int = 42
     force_liquidate_at_end: bool = False
     max_portfolio_risk_pct: float | None = None
@@ -368,7 +368,13 @@ class FundamentalValueGrowthTrendStrategy:
 
 
 class BacktestEngine:
-    """日线、只做多、T 收盘出信号/T+1 开盘执行的确定性撮合器。"""
+    """日线、只做多、T 收盘出信号/T+1 开盘执行的确定性撮合器。
+
+    开盘模型假设：未停牌且开盘价没有封死对应涨跌停时，以日线开盘价为撮合基准价，
+    再应用配置的滑点。
+    日线不含集合竞价排队和盘口深度，因此这个假设不保证真实订单一定能成交。
+    收盘派生的 ``can_buy``/``can_sell`` 仅表示日终状态，不参与盘中成交门禁。
+    """
 
     def __init__(self, config: BacktestConfig | None = None):
         self.config = config or BacktestConfig()
@@ -1075,7 +1081,7 @@ class BacktestEngine:
                 if len(self._positions_view()) >= self.config.max_positions:
                     self._reject_order(order, "执行时已达到最大持仓数")
                     continue
-                if not bar.can_buy or self._limit_blocked(bar, "BUY"):
+                if self._limit_blocked(bar, "BUY"):
                     self._reject_order(order, "当日不可买入或涨停")
                     continue
                 fill_price = self._apply_slippage(
@@ -1189,7 +1195,7 @@ class BacktestEngine:
                 self._set_signal_status(order, "FILLED")
             else:
                 market_rule, fee_rule = self._rules_for(day, order["ts_code"], dataset)
-                if not bar.can_sell or self._limit_blocked(bar, "SELL"):
+                if self._limit_blocked(bar, "SELL"):
                     if order.get("retryable_sell"):
                         self._defer_sell_order(order, day, dataset, "当日不可卖出或跌停")
                     else:
@@ -1469,7 +1475,7 @@ class BacktestEngine:
             ]
             if not triggering:
                 continue
-            if not bar.can_sell or bar.is_suspended or self._limit_blocked(
+            if bar.is_suspended or self._limit_blocked(
                 bar, "SELL", intraday=True
             ):
                 self._warnings.append(f"{day}: {code} 止损触发但无法卖出，保留持仓")

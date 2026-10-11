@@ -109,6 +109,7 @@ _OPTIONAL_PRODUCTION_DAILY_TASK_CONTRACT = {
 }
 
 _PRODUCTION_SPLIT_PIPELINES = ("tushare_daily", "tushare_financial")
+_LEGACY_QMT_DAILY_JOB = "data_collect.jobs.a_share_daily"
 _UNBOUNDED_DAILY_PIPELINE_JOBS = frozenset({
     # These entry points can run full-history release/snapshot/dataset audits.
     # They must never be attached to the daily production DAG until a separate
@@ -460,6 +461,17 @@ def _validate_production_schedule_contract(pipelines: Dict[str, Any]) -> None:
                 f"{name} is a manual/diagnostic pipeline and must not have a schedule; "
                 "use tushare_production_daily to avoid split or duplicate production runs"
             )
+    for name, candidate in pipelines.items():
+        if name == "tushare_production_daily" or not candidate.get("schedule"):
+            continue
+        for task in candidate.get("tasks") or []:
+            if task.get("job") == _LEGACY_QMT_DAILY_JOB:
+                task_name = task.get("name") or task.get("job")
+                raise RuntimeError(
+                    f"{name}.{task_name} schedules the legacy QMT daily-bar writer "
+                    "for std.daily_kline; Tushare production owns the scheduled "
+                    "daily-bar chain"
+                )
     _validate_production_pipeline_contract(
         "tushare_production_daily", production.get("tasks") or [],
     )

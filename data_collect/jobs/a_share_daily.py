@@ -16,9 +16,10 @@ import sys
 from tqdm import tqdm
 
 from data_collect.utils.date_utils import is_market_day, date_range
-from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.market_repository import MarketRepository
+from data_collect.data_access.run_context import build_run_context
 from data_collect.utils.df_utils import normalize_trade_date
 from data_collect.utils.notify import send_dingtalk
 from data_collect.utils.xtquant_utils import require_xtdata, get_a_share_codes, download_history_with_retry
@@ -83,10 +84,7 @@ def _download_and_save_batch(batch: List[str], trade_date: str) -> tuple[int, in
         return 0, 0
     merged = pd.concat(chunks, ignore_index=True)
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id=f"a-share-daily-{trade_date}", job_name="a_share_daily",
-        code_version="unknown", config_hash="unknown", pipeline_version="v1",
-    )
+    context = build_run_context("a_share_daily", pipeline_version="v1")
     try:
         written = MarketRepository(kernel).upsert_daily_bars(
             TABLE_NAME, merged.to_dict("records"), "stock_code", context,
@@ -100,10 +98,7 @@ def _download_and_save_batch(batch: List[str], trade_date: str) -> tuple[int, in
 def _get_missing_codes(trade_date: str, codes: list) -> list:
     """查 DB 找出当天缺失数据的股票代码。"""
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id=f"a-share-daily-missing-{trade_date}", job_name="a_share_daily",
-        code_version="unknown", config_hash="unknown", pipeline_version="v1",
-    )
+    context = build_run_context("a_share_daily", pipeline_version="v1")
     try:
         existing_set = MarketRepository(kernel).existing_codes(
             TABLE_NAME, "stock_code", pd.to_datetime(trade_date).date(), context
@@ -239,10 +234,7 @@ def run_evaluate(start_date: str, end_date: str, **kwargs) -> str:
 
     # 查询实际有数据的 (date, code) 组合
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id="a-share-daily-evaluate", job_name="a_share_daily",
-        code_version="unknown", config_hash="unknown", pipeline_version="v1",
-    )
+    context = build_run_context("a_share_daily", pipeline_version="v1")
     try:
         existing_set = MarketRepository(kernel).existing_keys(
             TABLE_NAME, "trade_date", "stock_code",

@@ -6,7 +6,6 @@ import uuid
 from datetime import date
 from typing import Any, Mapping, Sequence
 
-from data_collect.backtest.risk import FeeRule
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
 

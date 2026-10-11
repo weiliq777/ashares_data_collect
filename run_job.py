@@ -75,6 +75,7 @@ def start_scheduler(
     hour/minute 仅在恰好指定一个 pipeline 时生效（覆盖配置）。
     """
     from data_collect.pipeline import (
+        _LEGACY_QMT_DAILY_JOB,
         _PRODUCTION_SPLIT_PIPELINES,
         _validate_production_schedule_contract,
         run_pipeline,
@@ -107,7 +108,16 @@ def start_scheduler(
     unscheduled = sorted(name for name, cfg in targets.items() if not cfg.get("schedule"))
     if unscheduled:
         raise ValueError(f"不能调度未配置 schedule 的 pipeline: {unscheduled}")
-    if pipeline_name is None or "tushare_production_daily" in targets:
+    selected_legacy_qmt_daily = any(
+        task.get("job") == _LEGACY_QMT_DAILY_JOB
+        for config in targets.values()
+        for task in config.get("tasks") or []
+    )
+    if (
+        pipeline_name is None
+        or "tushare_production_daily" in targets
+        or selected_legacy_qmt_daily
+    ):
         _validate_production_schedule_contract(pipelines)
 
     timezone = next(iter(targets.values())).get("schedule", {}).get("timezone", "Asia/Shanghai")

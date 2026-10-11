@@ -18,9 +18,9 @@ def test_trading_calendar_pilot_hashes_source_and_target():
 
 
 def test_pilot_record_keeps_cutover_as_a_separate_gate():
-    doc = Path("dev_doc/data_foundation_stage3_pilot_20260818.md").read_text(encoding="utf-8")
-    assert "CUTOVER" in doc
-    assert "读取路径 | 已切换到 `std.trading_calendar`" in doc
+    source = Path("data_collect/jobs/migrate_trading_calendar.py").read_text(encoding="utf-8")
+    assert '== "VALIDATED"' in source
+    assert 'repository.cutover(context, MIGRATION_ID, "automated-validation")' in source
 
 
 def test_calendar_writers_use_the_canonical_standard_target_only():

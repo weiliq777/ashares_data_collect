@@ -224,6 +224,7 @@ tempdata/
 runtime_audit/
 news_spool/
 logs/
+archives/code/
 code_archive_*.zip
 *.sqlite
 *.sqlite3

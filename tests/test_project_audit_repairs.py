@@ -194,7 +194,7 @@ def test_same_day_revision_keeps_announcement_availability():
 def test_formal_versions_change_when_execution_semantics_change():
     assert BACKTEST_DATASET_SCHEMA_VERSION == "backtest-dataset-v2"
     assert ADAPTER_VERSION == "research-to-backtest-v2"
-    assert BacktestConfig().execution_model_version == "daily-next-open-v2"
+    assert BacktestConfig().execution_model_version == "daily-next-open-v3"
     signature = inspect.signature(create_dataset)
     assert signature.parameters["market_rule_version"].default == "cn-a-share-v2"
     assert (
@@ -225,3 +225,9 @@ def test_open_time_audit_contract_is_versioned_and_database_bound():
         "'liquidity_reference_date', NEW.liquidity_reference_date::text",
     ):
         assert token in sql
+
+
+def test_open_fill_model_v3_keeps_liquidity_audit_for_v2_and_v3():
+    sql = Path("sql/114_backtest_open_execution_model_v3.sql").read_text(encoding="utf-8")
+    assert "execution_version IN ('daily-next-open-v2', 'daily-next-open-v3')" in sql
+    assert "NEW.liquidity_reference_date >= NEW.order_date" in sql

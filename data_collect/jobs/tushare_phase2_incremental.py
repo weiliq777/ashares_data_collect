@@ -24,10 +24,11 @@ from data_collect.jobs.tushare_phase2_raw_init import (
 )
 from data_collect.providers.tushare_client import call_api, get_pro
 from data_collect.jobs.tushare_job_lock import warehouse_write_job
-from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.history_repository import HistoryRepository
 from data_collect.data_access.repository.phase2_raw_repository import Phase2RawRepository
+from data_collect.data_access.run_context import build_run_context
 
 
 logger = logging.getLogger("tushare_phase2_incremental")
@@ -59,9 +60,10 @@ INDEX_CODES = ("000300.SH", "000905.SH", "000852.SH", "000016.SH")
 
 def _service(label: str):
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id=f"phase2-incremental-{label}-{uuid4().hex}", job_name="tushare_phase2_incremental",
-        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
+    context = build_run_context(
+        "tushare_phase2_incremental",
+        pipeline_version="data-access-v1",
+        run_id=f"phase2-incremental-{label}-{uuid4().hex}",
     )
     return kernel, Phase2RawRepository(kernel), HistoryRepository(kernel), context
 

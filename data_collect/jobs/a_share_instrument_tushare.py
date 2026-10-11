@@ -7,12 +7,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.industry_membership_repository import (
     IndustryMembershipRepository,
 )
 from data_collect.data_access.repository.instrument_repository import InstrumentRepository
+from data_collect.data_access.run_context import build_run_context
 
 
 logger = logging.getLogger(__name__)
@@ -36,12 +37,10 @@ def run(run_date: str | None = None, dry_run: bool = False, **kwargs) -> str:
     capture_day = run_date or fetched_at.strftime("%Y%m%d")
     batch_id = f"stock-basic-{capture_day}-{uuid.uuid4().hex}"
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id=f"stock-basic-{capture_day}",
-        job_name="a_share_instrument_tushare",
-        code_version="unknown",
-        config_hash="unknown",
+    context = build_run_context(
+        "a_share_instrument_tushare",
         pipeline_version="data-access-v1",
+        run_id=batch_id,
     )
     try:
         InstrumentRepository(kernel).persist_stock_basic(raw_rows, batch_id, context)
@@ -57,6 +56,9 @@ def run(run_date: str | None = None, dry_run: bool = False, **kwargs) -> str:
                 industry_result.status,
                 industry_result.reason,
             )
+    except BaseException as exc:
+        kernel.record_run_failure(context, exc)
+        raise
     finally:
         kernel.close()
     return (

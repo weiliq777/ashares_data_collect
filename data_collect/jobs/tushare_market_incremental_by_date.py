@@ -24,9 +24,10 @@ from data_collect.ops.market_coverage import (
     persist_market_coverage_gate,
 )
 from data_collect.providers.tushare_client import call_api, get_pro
-from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.market_repository import MarketRepository
+from data_collect.data_access.run_context import build_run_context
 
 
 logger = logging.getLogger("tushare_market_incremental_by_date")
@@ -65,9 +66,9 @@ def _research_baseline_cutoff(explicit: str | None = None):
     if explicit:
         return market_shared._date(explicit)
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
-        run_id="market-incremental-baseline", job_name="tushare_market_incremental_by_date",
-        code_version="unknown", config_hash="unknown", pipeline_version="v1",
+    context = build_run_context(
+        "tushare_market_incremental_baseline",
+        pipeline_version="v1",
     )
     try:
         return MarketRepository(kernel).baseline_cutoff(context)

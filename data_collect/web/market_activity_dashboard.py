@@ -40,6 +40,14 @@ def _day_payload(trade_date: date, view: str) -> dict[str, Any]:
         kernel.close()
 
 
+def _stock_detail_payload(activity_snapshot_id: str, trade_date: date, ts_code: str) -> dict[str, Any]:
+    kernel, repository, context = _service("stock-detail")
+    try:
+        return repository.stock_detail(activity_snapshot_id, trade_date, ts_code, context)
+    finally:
+        kernel.close()
+
+
 def _dates_payload() -> dict[str, Any]:
     today = date.today()
     kernel, repository, context = _service("dates")
@@ -85,14 +93,24 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 if not raw_date:
                     raise ValueError("必须指定 date=YYYY-MM-DD")
                 self._json(200, _day_payload(date.fromisoformat(raw_date), view))
+            elif path == "/api/market-activity/stock-detail":
+                query = parse_qs(parsed.query)
+                snapshot_id = (query.get("activity_snapshot_id") or [""])[0]
+                raw_date = (query.get("trade_date") or [""])[0]
+                ts_code = (query.get("ts_code") or [""])[0]
+                if not snapshot_id or not raw_date or not ts_code:
+                    raise ValueError("activity_snapshot_id、trade_date、ts_code 均为必填")
+                self._json(200, _stock_detail_payload(
+                    snapshot_id, date.fromisoformat(raw_date), ts_code,
+                ))
             else:
                 self._json(404, {"error": "not found"})
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
         except LookupError as exc:
             self._json(404, {"error": str(exc)})
-        except Exception as exc:  # keep local API errors JSON-shaped
-            self._json(500, {"error": str(exc)})
+        except Exception:  # do not expose SQL/connection details to the browser
+            self._json(500, {"error": "internal server error"})
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[market-activity-dashboard] {self.address_string()} - {format % args}")

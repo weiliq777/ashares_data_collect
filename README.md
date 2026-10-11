@@ -24,7 +24,7 @@ Parquet 冷存。目标是做一个**领域无关**的自动化数据中枢 —�
 - ⏰ **多 pipeline 多 cron**：每日主流水线 + 盘后扩展采集 + 周末校验 + 月度财务，一次注册全部（当前 12 条）
 - 🖥️ **跨平台**：Windows / Linux 双平台（xtquant 任务限 Windows，平台不匹配自动跳过）
 - 📣 **可观测**：关键节点钉钉通知（含失败任务错误首行）
-- 📚 **附带 QMT 知识库**：`./skills/qmt-xtquant` 内置 xtdata/xttrader API 参考
+- 📚 **附带 QMT 知识库**：`./skills/qmt-xtquant` 内置 xtdata 行情采集参考；本项目不接入 xttrader 交易 API
 
 ## 🗂️ 数据覆盖
 
@@ -243,7 +243,8 @@ tests/                     # pytest测试
 tools/                     # 一次性脚本（如 tick 每股→按日打包迁移）
 notebooks/                 # 读测试/探索 notebook
 output/                    # 运维脚本与日志（backfill_*.ps1 长跑回补 runbook）
-./skills/            # qmt-xtquant / tick-microstructure / news-opensearch 知识库
+.agents/skills/      # Agent 自动发现入口；业务技能的规范入口
+./skills/            # ashares-decision-audit / qmt-xtquant / tick-microstructure / news-opensearch 技能源文件
 ```
 
 ## 数据库表

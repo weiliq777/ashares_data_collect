@@ -117,6 +117,22 @@ class DataAccessKernel:
         self._finalize_run_manifests()
         self.transaction_manager.close()
 
+    def release_connection(self) -> None:
+        """Release the database connection without finalizing active run manifests.
+
+        Jobs that keep a RunContext alive across non-database work can release
+        the idle connection and let ``close()`` finalize the run at the real
+        job boundary.
+        """
+        self.transaction_manager.close()
+
+    def record_run_failure(self, context: RunContext, error: BaseException) -> None:
+        """Include a job-level failure in the manifest finalized by ``close()``."""
+        if not self._manifest_enabled or context.run_id not in self._manifest_started:
+            return
+        message = str(error).strip() or type(error).__name__
+        self._manifest_failures[context.run_id] = message[:4000]
+
     def _install_manifest_hooks(self) -> None:
         """Instrument typed Gateway entry points without adding a seventh Gateway.
 

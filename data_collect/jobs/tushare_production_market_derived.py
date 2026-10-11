@@ -4,9 +4,10 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 
-from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.phase2_raw_repository import Phase2RawRepository
+from data_collect.data_access.run_context import build_run_context
 from data_collect.jobs.tushare_derived_rebuild import rebuild_after_market
 from data_collect.jobs.tushare_job_lock import warehouse_write_job
 
@@ -42,22 +43,31 @@ def run(
         }
     start_date = end_date - timedelta(days=max(lookback_days * 3, 10))
     kernel = DataAccessKernel(policy_registry=build_default_registry())
-    context = RunContext(
+    context = build_run_context(
+        "tushare_production_market_derived",
+        pipeline_version="data-access-v1",
         run_id=f"production-market-derived-{uuid4().hex}",
-        job_name="tushare_production_market_derived",
-        code_version="unknown", config_hash="unknown", pipeline_version="data-access-v1",
     )
     try:
         repository = Phase2RawRepository(kernel)
         trade_days = repository.trade_dates(start_date, end_date, context, lookback_days)
+        kernel.release_connection()
+        if not trade_days:
+            return {"status": "no_trading_days", "start_date": None, "end_date": None}
+        first = datetime.strptime(trade_days[0], "%Y%m%d").date()
+        last = datetime.strptime(trade_days[-1], "%Y%m%d").date()
+        result = rebuild_after_market(first, last, execution_id=execution_id)
+        return {
+            "status": "rebuilt",
+            "start_date": first.isoformat(),
+            "end_date": last.isoformat(),
+            **result,
+        }
+    except BaseException as exc:
+        kernel.record_run_failure(context, exc)
+        raise
     finally:
         kernel.close()
-    if not trade_days:
-        return {"status": "no_trading_days", "start_date": None, "end_date": None}
-    first = datetime.strptime(trade_days[0], "%Y%m%d").date()
-    last = datetime.strptime(trade_days[-1], "%Y%m%d").date()
-    result = rebuild_after_market(first, last, execution_id=execution_id)
-    return {"status": "rebuilt", "start_date": first.isoformat(), "end_date": last.isoformat(), **result}
 
 
 if __name__ == "__main__":

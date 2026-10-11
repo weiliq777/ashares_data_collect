@@ -7,13 +7,13 @@ description: |
   download_*→get_* 核心范式、全部函数签名、各类数据字段 schema，以及关键坑（get_market_data 与
   get_market_data_ex 返回结构不同、单股订阅 ≤50、tick 时间戳为 UTC 毫秒需 +8h、静态信息无需频繁下载）。
   当处理 xtquant / xtdata / MiniQMT / QMT 相关的行情数据接口、字段含义或下载逻辑时使用；
-  亦含 xttrader 交易模块（报单/撤单/查询/回调）与分品种数据字典（stock/index/future）参考。
+  亦含分品种数据字典（stock/index/future）参考。本项目禁止接入 xttrader 交易接口。
 ---
 
 # QMT xtquant 数据采集知识库
 
-`xtquant` 是迅投 MiniQMT 衍生的 Python 量化库。`xtdata` 模块提供行情（历史/实时 K 线和分笔）、
-财务、合约基础信息、板块/行业分类、指数权重等数据。本知识库以**数据采集**为主；交易模块 `xttrader` 另有精简参考备查。
+`xtquant` 是迅投 MiniQMT 衍生的 Python 量化库。本项目仅使用 `xtdata` 模块采集行情（历史/实时 K 线和分笔）、
+财务、合约基础信息、板块/行业分类、指数权重等数据。本知识库只覆盖行情数据采集；交易模块 `xttrader` 不属于本项目能力范围。
 
 官方文档：https://dict.thinktrader.net/nativeApi/start_now.html
 
@@ -92,4 +92,3 @@ data = xtdata.get_market_data_ex([], stock_list, period="1d",
 - **可复制代码范式**（下载+读取、复权算法、板块、财务、tick、时间/代码转换、VIP 连接） → [references/recipes.md](references/recipes.md)
 - **连接与排障**（返回 -1、端口冲突、session、C 盘权限、版本变更） → [references/troubleshooting.md](references/troubleshooting.md)
 - **分品种数据字典**（stock/index/future 字段释义、合约信息哨兵值与坑） → [references/data-dictionary.md](references/data-dictionary.md)
-- **xttrader 交易模块（精简）**（报单/撤单/查询/回调/常量，为将来交易预留） → [references/xttrader-api.md](references/xttrader-api.md)

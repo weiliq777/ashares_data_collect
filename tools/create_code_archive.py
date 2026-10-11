@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -64,10 +65,21 @@ def create_archive(root: Path, output: Path) -> tuple[int, str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".")
-    parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--output",
+        help="archive path (default: <root>/archives/code/code_archive_<UTC timestamp>.zip)",
+    )
     args = parser.parse_args()
-    output = Path(args.output)
-    count, digest = create_archive(Path(args.root), output)
+    root = Path(args.root).resolve()
+    output = (
+        Path(args.output)
+        if args.output
+        else root
+        / "archives"
+        / "code"
+        / f"code_archive_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}.zip"
+    )
+    count, digest = create_archive(root, output)
     print(f"ARCHIVE_PATH={output.resolve()}", flush=True)
     print(f"ARCHIVE_FILES={count}", flush=True)
     print(f"ARCHIVE_SHA256={digest}", flush=True)
