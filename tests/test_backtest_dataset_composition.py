@@ -188,6 +188,17 @@ class _FakeKernel:
         self.read = _FakeReadGateway()
 
 
+def test_materialized_dataset_skips_component_manifest_lookup():
+    kernel = _FakeKernel()
+    repository = DatasetRepository(kernel)
+
+    repository.manifest("physical-id", object())
+    assert repository.composition_components("physical-id", object()) == []
+    assert not any(
+        call[0] == "backtest.dataset_component" for call in kernel.read.calls
+    )
+
+
 def test_composite_single_day_bar_read_routes_directly_to_physical_dataset():
     kernel = _FakeKernel()
     repository = DatasetRepository(kernel)

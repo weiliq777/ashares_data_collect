@@ -124,50 +124,6 @@ def main() -> None:
     finally:
         kernel.close()
 
-    # A validated Dataset may only be rebuilt through an explicit operator
-    # request.  This is needed when the build/validation code identity changed
-    # after validation (for example, after fixing manifest projection), while
-    # preserving the lifecycle audit trail and the FROZEN immutability rule.
-    if args.force_rebuild and manifest["status"] == "VALIDATED":
-        kernel, repository, context = _service("reopen-forced-rebuild")
-        try:
-            changed = repository.transition_manifest(
-                context,
-                dataset_id,
-                ("VALIDATED",),
-                "FAILED",
-                {
-                    "failure_reason": "explicit force rebuild requested after validation",
-                    "failed_at": None,
-                    "validated_at": None,
-                    "quality_report": None,
-                    "quality_report_hash": None,
-                    "calendar_hash": None,
-                    "rules_hash": None,
-                    "execution_hash": None,
-                    "corporate_action_hash": None,
-                    "benchmark_hash": None,
-                    "input_manifest_hash": None,
-                    "code_version": None,
-                    "git_commit": None,
-                    # dataset_manifest.git_dirty is NOT NULL; FALSE is the
-                    # explicit cleared sentinel before the next build writes
-                    # the actual current-worktree identity.
-                    "git_dirty": False,
-                    "diff_hash": None,
-                    "code_archive_path": None,
-                    "code_archive_sha256": None,
-                    "code_archive_size_bytes": None,
-                },
-            )
-            if changed != 1:
-                raise RuntimeError(
-                    f"failed to reopen validated Dataset for explicit rebuild: {dataset_id}"
-                )
-            manifest["status"] = "FAILED"
-        finally:
-            kernel.close()
-
     if manifest["status"] == "FROZEN":
         kernel, repository, context = _service("frozen")
         freeze_checkpoint = repository.checkpoint(dataset_id, "FREEZE", context)
@@ -202,14 +158,9 @@ def main() -> None:
                     "--validate-only requires materialized Dataset hashes; "
                     "use the normal handoff to rebuild the Dataset"
                 )
-            kernel, repository, context = _service("validate-only-resume")
-            try:
-                repository.resume_failed(dataset_id, context)
-            finally:
-                kernel.close()
             _set_checkpoint(dataset_id, "VALIDATE", "RUNNING", details={"mode": "validate_only"})
             try:
-                validate_result = validate_dataset(dataset_id)
+                validate_result = validate_dataset(dataset_id, resume_failed=True)
                 _set_checkpoint(
                     dataset_id,
                     "VALIDATE",
@@ -256,7 +207,7 @@ def main() -> None:
         and build_checkpoint["status"] == "COMPLETED"
     )
 
-    if manifest["status"] == "VALIDATED":
+    if manifest["status"] == "VALIDATED" and not args.force_rebuild:
         print("BUILD=SKIPPED; VALIDATE=SKIPPED (manifest already validated)", flush=True)
         _set_checkpoint(
             dataset_id,
@@ -276,12 +227,6 @@ def main() -> None:
 
     if can_resume_validate:
         print("BUILD=SKIPPED (checkpoint completed; resume validation)", flush=True)
-        if manifest["status"] == "FAILED":
-            kernel, repository, context = _service("resume")
-            try:
-                repository.resume_failed(dataset_id, context)
-            finally:
-                kernel.close()
     else:
         _set_checkpoint(
             dataset_id,
@@ -311,7 +256,9 @@ def main() -> None:
 
     _set_checkpoint(dataset_id, "VALIDATE", "RUNNING", details={"mode": "full_materialized_gate"})
     try:
-        validate_result = validate_dataset(dataset_id)
+        validate_result = validate_dataset(
+            dataset_id, resume_failed=manifest["status"] == "FAILED" and can_resume_validate,
+        )
         _set_checkpoint(
             dataset_id,
             "VALIDATE",

@@ -113,7 +113,7 @@ def main() -> None:
         verify_source_manifest=False,
     )
     quality_cutoff = (
-        baseline[1]
+        baseline.baseline_cutoff_date
         if is_foundation_schema(args.schema_version)
         else max(row[1] for row in rows)
     )

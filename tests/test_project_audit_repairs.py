@@ -115,10 +115,14 @@ def test_candidate_packet_exposes_evidence_authority_level():
 def test_research_snapshot_build_locks_quality_and_materialization_inputs():
     source = Path("data_collect/data_access/repository/research_snapshot_repository.py").read_text(encoding="utf-8")
     build_section = source.split("def build_snapshot", 1)[1].split("def validate_snapshot", 1)[0]
-    assert "session_exclusive" in build_section
+    lock_section = source.split("def lifecycle_locks", 1)[1].split(
+        "def _snapshot_build_locks", 1
+    )[0]
+    assert "session_exclusive_many" in lock_section
+    assert "_snapshot_build_locks" in build_section
     assert "transition_snapshot_manifest" in build_section
     assert "_precompute_input_manifest" in build_section
-    assert build_section.index("_precompute_input_manifest") < build_section.index("session_exclusive")
+    assert build_section.index("_precompute_input_manifest") < build_section.index("_snapshot_build_locks")
     assert build_section.count("input_stats(") == 0
 
 
@@ -194,7 +198,7 @@ def test_same_day_revision_keeps_announcement_availability():
 def test_formal_versions_change_when_execution_semantics_change():
     assert BACKTEST_DATASET_SCHEMA_VERSION == "backtest-dataset-v2"
     assert ADAPTER_VERSION == "research-to-backtest-v2"
-    assert BacktestConfig().execution_model_version == "daily-next-open-v3"
+    assert BacktestConfig().execution_model_version == "daily-next-open-v4"
     signature = inspect.signature(create_dataset)
     assert signature.parameters["market_rule_version"].default == "cn-a-share-v2"
     assert (
@@ -230,4 +234,14 @@ def test_open_time_audit_contract_is_versioned_and_database_bound():
 def test_open_fill_model_v3_keeps_liquidity_audit_for_v2_and_v3():
     sql = Path("sql/114_backtest_open_execution_model_v3.sql").read_text(encoding="utf-8")
     assert "execution_version IN ('daily-next-open-v2', 'daily-next-open-v3')" in sql
+    assert "NEW.liquidity_reference_date >= NEW.order_date" in sql
+
+
+def test_open_fill_model_v4_keeps_liquidity_audit_for_prior_versions():
+    sql = Path("sql/115_backtest_open_execution_model_v4.sql").read_text(encoding="utf-8")
+    normalized_sql = " ".join(sql.split())
+    assert (
+        "execution_version IN ( 'daily-next-open-v2', 'daily-next-open-v3', "
+        "'daily-next-open-v4' )"
+    ) in normalized_sql
     assert "NEW.liquidity_reference_date >= NEW.order_date" in sql

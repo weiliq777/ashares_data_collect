@@ -20,11 +20,20 @@ class DatasetRepository(BaseRepository):
         self._component_cache: dict[str, list[dict[str, Any]]] = {}
         self._dataset_kind_cache: dict[str, str] = {}
 
+    def lifecycle_lock(self, dataset_id: str):
+        """Serialize materialization, validation, repair, and freeze per Dataset."""
+        return self.kernel.lock_manager.session_exclusive(
+            "backtest.dataset.lifecycle", str(dataset_id), wait=True,
+        )
+
     def composition_components(
         self, dataset_id: str, context: RunContext, *, allow_empty: bool = False,
     ) -> list[dict[str, Any]]:
         key = str(dataset_id)
         if key not in self._component_cache:
+            if self._dataset_kind_cache.get(key) == "MATERIALIZED":
+                self._component_cache[key] = []
+                return []
             rows = self.kernel.read._repository_query(
                 context, "backtest.dataset_component",
                 """SELECT ordinal, component_dataset_id, effective_from, effective_to,

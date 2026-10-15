@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,10 @@ from data_collect.jobs.research_snapshot import (
     _inputs_for_schema,
     _stock_snapshot_sql,
 )
-from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchBaseline,
+    ResearchSnapshotRepository,
+)
 from data_collect.jobs.research_snapshot import freeze_snapshots_batch
 
 
@@ -245,9 +249,46 @@ def test_snapshot_batch_marks_building_manifest_for_recovery_before_cleanup():
         ResearchSnapshotRepository.build_snapshots_batch
     )
     building_transition = source.index('("DRAFT", "FAILED"), "BUILDING"')
-    recovery_registration = source.index("started.append(item)")
+    recovery_registration = source.index(
+        'started.append((snapshot_id, manifest["cutoff"]))'
+    )
     cleanup = source.index("lineage_target,", recovery_registration)
     assert building_transition < recovery_registration < cleanup
+
+
+def test_snapshot_build_failure_is_marked_before_releasing_lifecycle_lock():
+    events = []
+
+    @contextmanager
+    def lifecycle_locks(snapshot_ids):
+        events.append(("lock", tuple(snapshot_ids)))
+        try:
+            yield
+        finally:
+            events.append(("unlock", tuple(snapshot_ids)))
+
+    def transition(*args):
+        events.append(("failed", args[3], args[4], args[5]["failure_reason"]))
+        return 1
+
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    repository.lifecycle_locks = lifecycle_locks
+    repository.kernel = SimpleNamespace(
+        write=SimpleNamespace(transition_snapshot_manifest=transition),
+    )
+
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        with repository._snapshot_build_locks(("snapshot-1",), object()) as started:
+            started.append(("snapshot-1", date(2026, 8, 20)))
+            events.append(("build",))
+            raise RuntimeError("materialization failed")
+
+    assert events == [
+        ("lock", ("snapshot-1",)),
+        ("build",),
+        ("failed", ("BUILDING",), "FAILED", "materialization failed"),
+        ("unlock", ("snapshot-1",)),
+    ]
 
 
 def test_snapshot_validation_reuses_persisted_input_evidence():
@@ -262,7 +303,7 @@ def test_snapshot_validation_reuses_persisted_input_evidence():
 
 
 def test_foundation_snapshot_rejects_legacy_release_contract():
-    baseline = (
+    baseline = ResearchBaseline(
         "legacy", date(2026, 8, 6), "validated", "quality", "source",
         {}, "feature-contract-v1.0",
     )
@@ -282,7 +323,7 @@ def test_series_quality_evidence_keeps_its_real_coverage_cutoff():
 
 
 def test_foundation_historical_snapshot_uses_release_quality_boundary():
-    baseline = (
+    baseline = ResearchBaseline(
         "foundation", date(2026, 8, 6), "validated", "quality", "source",
         {}, research_snapshot.FOUNDATION_FEATURE_CONTRACT,
     )

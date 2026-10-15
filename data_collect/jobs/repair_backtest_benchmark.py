@@ -27,7 +27,8 @@ def _service():
 def repair(dataset_id: str) -> dict:
     kernel, repository, context = _service()
     try:
-        result = repository.bind_benchmark_source_repair(dataset_id, context)
+        with repository.lifecycle_lock(dataset_id):
+            result = repository.bind_benchmark_source_repair(dataset_id, context)
         if result is None:
             return {"dataset_id": dataset_id, "status": "NO_REPAIR_REQUIRED"}
         return {

@@ -23,7 +23,6 @@ def _parse_date(value: date | str | None) -> date:
     return datetime.strptime(str(value).replace("-", ""), "%Y%m%d").date()
 
 
-@warehouse_write_job
 def run(
     run_date=None, lookback_days: int = 5, dry_run: bool = False,
     execution_id=None, **_kwargs,
@@ -41,6 +40,11 @@ def run(
             "end_date": end_date.isoformat(),
             "lookback_days": lookback_days,
         }
+    return _run_locked(end_date, lookback_days, execution_id)
+
+
+@warehouse_write_job
+def _run_locked(end_date: date, lookback_days: int, execution_id=None) -> dict:
     start_date = end_date - timedelta(days=max(lookback_days * 3, 10))
     kernel = DataAccessKernel(policy_registry=build_default_registry())
     context = build_run_context(

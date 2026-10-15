@@ -18,6 +18,10 @@ from data_collect.data_access.repository.security_repository import SecurityRepo
 from data_collect.data_access.repository.pit_repository import PitRepository
 from data_collect.data_access.repository.market_repository import MarketRepository
 from data_collect.data_access.repository.release_repository import ReleaseRepository
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchBaseline,
+    ResearchSnapshotRepository,
+)
 from tests._fake_db import FakeConnection
 
 
@@ -46,6 +50,41 @@ def make_kernel_and_repo():
 )
 def test_release_schema_maps_to_an_isolated_baseline_domain(schema_version, expected_domain):
     assert ReleaseRepository._baseline_domain(schema_version) == expected_domain
+
+
+def test_research_snapshot_baseline_exposes_named_fields_and_keeps_tuple_access(monkeypatch):
+    cutoff = date(2026, 8, 6)
+    row = {
+        "release_tag": "release-1",
+        "baseline_domain": "RESEARCH",
+        "baseline_cutoff_date": cutoff,
+        "status": "validated",
+        "quality_report_hash": "quality-hash",
+        "source_manifest_hash": "source-hash",
+        "source_manifest": {"append_only_sources": {}},
+        "schema_version": "feature-contract-v2.0",
+        "quality_report": {"failures": {}},
+    }
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=FakeConnection,
+    )
+    repository = ResearchSnapshotRepository(kernel)
+    monkeypatch.setattr(
+        kernel.read, "_repository_query", lambda *args, **kwargs: [row],
+    )
+
+    baseline = repository.baseline(cutoff, "release-1", ctx(), verify_source_manifest=False)
+
+    assert isinstance(baseline, ResearchBaseline)
+    assert baseline.release_tag == "release-1"
+    assert baseline.baseline_cutoff_date == cutoff
+    assert baseline.quality_report_hash == "quality-hash"
+    assert baseline.source_manifest_hash == "source-hash"
+    assert baseline.source_manifest == {"append_only_sources": {}}
+    assert baseline.quality_report == {"failures": {}}
+    assert baseline[3] == baseline.quality_report_hash
+
+    kernel.close()
 
 
 def test_research_release_gate_blocks_implemented_dividends_without_ex_date(monkeypatch):

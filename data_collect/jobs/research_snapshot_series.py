@@ -26,6 +26,10 @@ from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
 from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.snapshot_lifecycle import (
+    MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
+    snapshot_id_batches,
+)
 
 
 def _service(label: str):
@@ -130,10 +134,13 @@ def reset_building_snapshots(snapshot_ids: Iterable[str], reason: str) -> None:
     ids = tuple(str(value) for value in snapshot_ids)
     if not ids:
         return
+    if len(ids) != len(set(ids)):
+        raise ValueError("snapshot reset requires unique ids")
     kernel, repository, context = _service("reset")
     try:
-        with kernel.lock_manager.session_exclusive("research-snapshot", "batch"):
-            changed_rows = repository.reset_building(ids, reason, context)
+        changed_rows = 0
+        for batch in snapshot_id_batches(ids):
+            changed_rows += repository.reset_building(batch, reason, context)
     finally:
         kernel.close()
     if changed_rows != len(ids):
@@ -172,8 +179,11 @@ def create_snapshot_series(
                 f"本次请求 {len(dates)} 个 Snapshot，超过安全上限 {max_snapshots}；"
                 "请先做容量评估，确认后显式提高上限"
             )
-    if batch_size <= 0:
-        raise ValueError("batch_size 必须为正数")
+    if batch_size < 1 or batch_size > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+        raise ValueError(
+            "batch_size 必须在 1 到 "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE} 之间"
+        )
     if validate and not build:
         raise ValueError("validate=True 必须同时 build=True")
     if freeze and not validate:
@@ -273,7 +283,7 @@ def create_snapshot_series(
                 flush=True,
             )
         quality_cutoff = (
-            batch_baseline[1]
+            batch_baseline.baseline_cutoff_date
             if is_foundation_schema(schema_version)
             else max(dates)
         )
@@ -329,7 +339,7 @@ def create_snapshot_series(
             )
         if base_report is None:
             quality_cutoff = (
-                batch_baseline[1]
+                batch_baseline.baseline_cutoff_date
                 if is_foundation_schema(schema_version)
                 else max(dates)
             )

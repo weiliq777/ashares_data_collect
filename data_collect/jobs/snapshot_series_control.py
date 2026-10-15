@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
+from data_collect.data_access.snapshot_lifecycle import MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE
+
 
 KNOWN_STATUSES = frozenset({"DRAFT", "FAILED", "BUILDING", "VALIDATED", "FROZEN"})
 PUBLISHABLE_STATUSES = frozenset({"VALIDATED", "FROZEN"})
@@ -403,7 +405,15 @@ class SnapshotSeriesMonitor:
         return report
 
 
-def bounded_batches(values: Iterable[Any], batch_size: int, *, maximum: int = 20) -> tuple[tuple[Any, ...], ...]:
+def bounded_batches(
+    values: Iterable[Any], batch_size: int, *,
+    maximum: int = MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
+) -> tuple[tuple[Any, ...], ...]:
+    if maximum < 1 or maximum > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+        raise ValueError(
+            "maximum must be between 1 and "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+        )
     if batch_size < 1 or batch_size > maximum:
         raise ValueError(f"batch_size must be between 1 and {maximum}")
     items = tuple(values)

@@ -37,8 +37,9 @@ from data_collect.data_access.dataset_policy import (
 from data_collect.data_access.query_guard import QueryGuard
 from data_collect.data_access.retry_policy import RetryPolicy
 from data_collect.data_access.kernel import DataAccessKernel
+from data_collect.data_access.errors import LockNotAcquired
 from data_collect.data_access.transaction_manager import TransactionConfig, TransactionManager
-from tests._fake_db import FakeConnection
+from tests._fake_db import FakeConnection, FakeCursor
 
 
 # ---- 构造辅助 ----
@@ -833,3 +834,65 @@ def test_projection_staging_does_not_inherit_unprovided_not_null_columns():
         "SELECT migration_id, status FROM ops.foundation_table_migration WITH NO DATA"
         in cursor.sql
     )
+
+
+def test_session_exclusive_many_preserves_first_lock_failure():
+    class BusyCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "pg_try_advisory_lock" in sql:
+                self._fetch_rows = [(False,)]
+
+    class BusyConnection(FakeConnection):
+        def cursor(self, name=None, withhold=False):
+            self.cursor_names.append(name)
+            return BusyCursor(self, name, withhold)
+
+    conn = BusyConnection()
+    kernel = DataAccessKernel(
+        policy_registry=registry(), connection_factory=lambda: conn,
+    )
+    try:
+        with pytest.raises(LockNotAcquired):
+            with kernel.lock_manager.session_exclusive_many("snapshot", ("id-1",)):
+                pytest.fail("the body must not run without the requested lock")
+    finally:
+        kernel.close()
+
+    assert not any("pg_advisory_unlock" in entry["sql"] for entry in conn.executed)
+
+
+@pytest.mark.parametrize("lock_many", [False, True], ids=["single", "multiple"])
+def test_session_unlock_failure_closes_connection_to_release_session_lock(
+    lock_many, caplog,
+):
+    class UnlockFailureCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "pg_advisory_unlock" in sql:
+                raise OSError("simulated connection failure during unlock")
+
+    class UnlockFailureConnection(FakeConnection):
+        def cursor(self, name=None, withhold=False):
+            self.cursor_names.append(name)
+            return UnlockFailureCursor(self, name, withhold)
+
+    conn = UnlockFailureConnection()
+    kernel = DataAccessKernel(
+        policy_registry=registry(), connection_factory=lambda: conn,
+    )
+    try:
+        with caplog.at_level("WARNING", logger="data_collect.data_access.lock_manager"):
+            lock = (
+                kernel.lock_manager.session_exclusive_many("snapshot", ("id-1",))
+                if lock_many
+                else kernel.lock_manager.session_exclusive("snapshot", "id-1")
+            )
+            with lock:
+                pass
+
+        assert conn.closed
+        assert kernel.transaction_manager._conn is None
+        assert "failed to release session advisory lock" in caplog.text
+    finally:
+        kernel.close()

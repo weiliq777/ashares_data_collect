@@ -1,5 +1,6 @@
-from pathlib import Path
+from contextlib import nullcontext
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -7,12 +8,39 @@ import pytest
 from data_collect.data_access.context import RunContext, WorkScope
 
 from data_collect.jobs import tushare_financial_vip_incremental as vip
+from data_collect.jobs import tushare_job_lock
 
 
-def test_recent_report_periods_never_selects_an_open_future_quarter():
+def test_recent_report_periods_wait_for_a_conservative_disclosure_grace():
     assert vip._recent_report_periods(date(2026, 8, 14), 3) == [
-        "20260630", "20260331", "20251231"
+        "20260331", "20251231", "20250930"
     ]
+    assert vip._recent_report_periods(date(2026, 10, 28), 1) == ["20260630"]
+    assert vip._as_yyyymmdd(20260831) == "20260831"
+    assert vip._as_yyyymmdd(pd.Series([20260831]).to_numpy()[0]) == "20260831"
+    assert vip._as_yyyymmdd(20260831.5) is None
+
+
+def test_report_period_discovery_uses_actual_disclosure_not_schedule(monkeypatch):
+    frame = pd.DataFrame(
+        {
+            "end_date": ["20260630", "20260930", "20251231"],
+            "actual_date": ["20260831", None, "20261013"],
+            "pre_date": ["20260831", "20261025", "20261013"],
+        }
+    )
+
+    class Provider:
+        def disclosure_date(self, **kwargs):
+            return frame
+
+    monkeypatch.setattr(vip, "call_api", lambda fn, **kwargs: fn(**kwargs))
+    periods = vip.discover_report_periods(
+        Provider(), date(2026, 10, 12), 1, 1, "batch-discovery",
+        record_anomalies=False,
+    )
+
+    assert periods == ["20260331", "20260630"]
 
 
 def test_indicator_vip_keeps_only_current_update_flag_and_has_safe_identity(monkeypatch):
@@ -211,6 +239,11 @@ def test_financial_queue_consumer_drains_multiple_bounded_batches(monkeypatch):
     monkeypatch.setattr(vip, "standard_run", lambda *args: calls.append(("standard", args[2])))
     monkeypatch.setattr(indicator, "_rebuild_standard_unlocked", lambda *args: calls.append(("indicator", args[1])))
     monkeypatch.setattr(features, "rebuild_company_financial_v2", lambda *args, **kwargs: calls.append(("feature", tuple(kwargs["requested_codes"]))) or {"rows": 1})
+    def inspect_quality(repository, context, codes, start, end):
+        calls.append(("quality", tuple(codes)))
+        return {"checks": {}, "failures": {}, "passed": True}
+
+    monkeypatch.setattr(vip, "_inspect_incremental_company_quality", inspect_quality)
 
     summary = vip._consume_pending_changes(Repository(), vip.RunContext("run-1", "job", "code", "cfg", "v1"), date(2026, 9, 5))
     assert summary["processed_batches"] == 2
@@ -222,6 +255,10 @@ def test_financial_queue_consumer_drains_multiple_bounded_batches(monkeypatch):
     ]
     assert all(item[2] == vip.QUEUE_LEASE_SECONDS for item in calls if item[0] == "renew")
     assert limits == [vip.QUEUE_CLAIM_LIMIT] * 3
+    assert summary["last_quality_report"]["passed"] is True
+    assert [entry[0] for entry in calls if entry[0] in {"quality", "finish"}] == [
+        "quality", "finish", "quality", "finish",
+    ]
 
 
 def test_financial_consumer_rebuilds_only_typed_changed_datasets(monkeypatch):
@@ -254,11 +291,68 @@ def test_financial_consumer_rebuilds_only_typed_changed_datasets(monkeypatch):
     monkeypatch.setattr(vip, "standard_run", lambda *args: calls.append(("standard", args[0], args[1])))
     monkeypatch.setattr(indicator, "_rebuild_standard_unlocked", lambda *args: calls.append(("indicator", args[0], args[1])))
     monkeypatch.setattr(features, "rebuild_company_financial_v2", lambda *args, **kwargs: {"rows": 1})
+    monkeypatch.setattr(
+        vip, "_inspect_incremental_company_quality",
+        lambda repository, context, codes, start, end: {
+            "checks": {}, "failures": {}, "passed": True,
+        },
+    )
 
     vip._consume_pending_changes(
         Repository(), vip.RunContext("run-1", "job", "code", "cfg", "v1"), date(2026, 9, 5),
     )
     assert calls == [("standard", "cashflow", vip.DERIVATION_PAGE_SIZE)]
+
+
+def test_financial_consumer_marks_queue_failed_when_incremental_quality_fails(monkeypatch):
+    finished = []
+    batches = [([1], ["000001.SZ"]), ([], [])]
+
+    class Repository:
+        def claimed_queue_datasets(self, queue_ids, context, claim_owner_id):
+            return {"income"}
+
+        def finish_queue(self, queue_ids, status, *args, **kwargs):
+            finished.append((tuple(queue_ids), status))
+            return len(queue_ids)
+
+        def finish_legacy(self, *args, **kwargs):
+            return 0
+
+    class Heartbeat:
+        def __init__(self, *args):
+            pass
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(vip, "_QueueLeaseHeartbeat", Heartbeat)
+    monkeypatch.setattr(vip, "_pending_queue_codes", lambda *args, **kwargs: batches.pop(0))
+    monkeypatch.setattr(vip, "_legacy_pending_codes", lambda *args, **kwargs: [])
+    monkeypatch.setattr(vip, "standard_run", lambda *args: None)
+    monkeypatch.setattr(
+        vip, "_inspect_incremental_company_quality",
+        lambda *args: {"checks": {}, "failures": {"invalid_complete_ttm": 1}, "passed": False},
+    )
+    from data_collect.jobs import tushare_fina_indicator_version as indicator
+    from data_collect.jobs import tushare_foundation_features as features
+
+    monkeypatch.setattr(indicator, "_rebuild_standard_unlocked", lambda *args: None)
+    monkeypatch.setattr(features, "rebuild_company_financial_v2", lambda *args, **kwargs: {"rows": 1})
+
+    with pytest.raises(RuntimeError, match="incremental financial quality gate failed"):
+        vip._consume_pending_changes(
+            Repository(), vip.RunContext("run-quality", "job", "code", "cfg", "v1"),
+            date(2026, 9, 5),
+        )
+
+    assert finished == [((1,), "FAILED")]
 
 
 def test_financial_consumer_has_a_small_stock_budget_and_aggregate_deadline():
@@ -393,3 +487,201 @@ def test_quarantine_partial_transition_raises_inside_chunk_transaction():
 
     assert kernel.rolled_back
     assert not kernel.committed
+
+
+def test_financial_incremental_e2e_uses_simulated_provider_and_reaches_quality_gate(monkeypatch):
+    events = []
+    report_period = "20260331"
+    stock_code = "000001.SZ"
+    disclosure = pd.DataFrame([{
+        "ts_code": stock_code,
+        "ann_date": "20260430",
+        "end_date": report_period,
+        "pre_date": "20260430",
+        "actual_date": "20260430",
+    }])
+    responses = {
+        "income_vip": pd.DataFrame([{
+            "ts_code": stock_code, "ann_date": "20260430", "f_ann_date": "20260430",
+            "end_date": report_period, "report_type": "1", "comp_type": "1",
+            "end_type": "1", "update_flag": "1", "n_income": 100,
+            "n_income_attr_p": 90,
+        }]),
+        "balancesheet_vip": pd.DataFrame([{
+            "ts_code": stock_code, "ann_date": "20260430", "f_ann_date": "20260430",
+            "end_date": report_period, "report_type": "1", "comp_type": "1",
+            "end_type": "1", "update_flag": "1", "total_assets": 1000,
+        }]),
+        "cashflow_vip": pd.DataFrame([{
+            "ts_code": stock_code, "ann_date": "20260430", "f_ann_date": "20260430",
+            "end_date": report_period, "report_type": "1", "comp_type": "1",
+            "end_type": "1", "update_flag": "1", "n_cashflow_act": 80,
+        }]),
+        "fina_indicator_vip": pd.DataFrame([{
+            "ts_code": stock_code, "ann_date": "20260430", "end_date": report_period,
+            "update_flag": "1", "roe": 0.12,
+        }]),
+    }
+
+    class Provider:
+        def disclosure_date(self, **_kwargs):
+            return disclosure
+
+        def __getattr__(self, name):
+            if name not in responses:
+                raise AttributeError(name)
+            return lambda **_kwargs: responses[name]
+
+    class QualityRead:
+        def _repository_query(self, context, source, sql, params=(), scope=None, max_rows=None):
+            events.append(("quality_query", source))
+            assert scope.codes == (stock_code,)
+            assert "report_date BETWEEN %s AND %s" in sql
+            if source == "feature.company_financial_v2":
+                return [{
+                    "company_rows": 4,
+                    "company_contract_mismatch": 0,
+                    "invalid_complete_ttm": 0,
+                    "invalid_quality_status": 0,
+                    "invalid_ocf_ratio": 0,
+                    "invalid_comp_type_cashflow": 0,
+                    "missing_pit_evidence": 0,
+                    "company_future_rows": 0,
+                }]
+            return [{"value": 0}]
+
+    class Kernel:
+        read = QualityRead()
+        failures = []
+        closed = False
+
+        def record_run_failure(self, context, exc):
+            self.failures.append(exc)
+
+        def close(self):
+            self.closed = True
+
+    class Repository:
+        def __init__(self, kernel):
+            self.kernel = kernel
+            self.checkpoints = {}
+            self.raw = {}
+            self.queue = []
+
+        def record_anomaly(self, *args):
+            events.append(("anomaly", args))
+
+        def checkpoint_status(self, dataset, key, context):
+            return self.checkpoints.get((dataset, key))
+
+        def save_checkpoint(self, dataset, key, status, rows, context, error=None):
+            self.checkpoints[(dataset, key)] = (status, rows)
+
+        def write_versions_and_queue(self, dataset, records, batch_id, context):
+            events.append(("raw", dataset))
+            self.raw.setdefault(dataset, []).extend(records)
+            for record in records:
+                self.queue.append({
+                    "id": len(self.queue) + 1,
+                    "dataset": dataset,
+                    "code": record["ts_code"],
+                    "status": "PENDING",
+                })
+            return len(records)
+
+        def pending_queue(
+            self, context, *, limit, claim_owner_id, takeover, through_date,
+        ):
+            pending = [row for row in self.queue if row["status"] == "PENDING"][:limit]
+            for row in pending:
+                row["status"] = "RUNNING"
+            return [row["id"] for row in pending], sorted({row["code"] for row in pending})
+
+        def pending_legacy_codes(self, context, *, limit):
+            return []
+
+        def claimed_queue_datasets(self, queue_ids, context, claim_owner_id):
+            return {
+                row["dataset"] for row in self.queue if row["id"] in queue_ids
+            }
+
+        def finish_queue(
+            self, queue_ids, status, error, context, claim_owner_id, *,
+            processed_through=None,
+        ):
+            for row in self.queue:
+                if row["id"] in queue_ids:
+                    row["status"] = status
+            events.append(("queue_finished", status))
+            return len(queue_ids)
+
+        def finish_legacy(self, codes, status, error, context):
+            return len(codes)
+
+        def queue_status_counts(self, context, through_date):
+            counts = {}
+            for row in self.queue:
+                counts[row["status"]] = counts.get(row["status"], 0) + 1
+            return counts
+
+    class Heartbeat:
+        def __init__(self, *args):
+            pass
+
+        def start(self):
+            pass
+
+        def raise_if_failed(self):
+            pass
+
+        def stop(self):
+            pass
+
+    kernel = Kernel()
+    repository = Repository(kernel)
+    context = RunContext("simulated-financial-run", "financial-vip-test", "test", "test", "v1")
+    monkeypatch.setattr(vip, "_service", lambda token: (kernel, repository, context))
+    monkeypatch.setattr(vip, "get_pro", Provider)
+    monkeypatch.setattr(vip, "call_api", lambda fn, **kwargs: fn(**kwargs))
+    monkeypatch.setattr(vip, "_QueueLeaseHeartbeat", Heartbeat)
+    monkeypatch.setattr(tushare_job_lock, "warehouse_write_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        vip, "standard_run",
+        lambda dataset, *args: events.append(("standard", dataset)),
+    )
+    from data_collect.jobs import tushare_fina_indicator_version as indicator
+    from data_collect.jobs import tushare_foundation_features as features
+
+    monkeypatch.setattr(
+        indicator, "_rebuild_standard_unlocked",
+        lambda *args: events.append(("indicator_standard",)),
+    )
+    monkeypatch.setattr(
+        features, "rebuild_company_financial_v2",
+        lambda *args, **kwargs: events.append(("feature", tuple(kwargs["requested_codes"])))
+        or {"rows": 4},
+    )
+
+    result = vip.run(
+        run_date="20261012", lookback_days=1, report_periods_back=1,
+        rebuild_derived=True, batch_id="simulated-financial-batch",
+    )
+
+    assert result.endswith("periods=1")
+    assert set(repository.raw) == {"income", "balancesheet", "cashflow", "fina_indicator"}
+    assert all(rows[0]["ts_code"] == stock_code for rows in repository.raw.values())
+    assert len(repository.checkpoints) == 4
+    assert {row["status"] for row in repository.queue} == {"DONE"}
+    assert {item[1] for item in events if item[0] == "standard"} == {
+        "income", "balancesheet", "cashflow",
+    }
+    assert ("indicator_standard",) in events
+    assert ("feature", (stock_code,)) in events
+    assert [item[1] for item in events if item[0] == "quality_query"] == [
+        "feature.company_financial_v2", "std.financial_income_standard",
+    ]
+    assert events.index(("feature", (stock_code,))) < events.index(
+        ("quality_query", "feature.company_financial_v2")
+    ) < events.index(("queue_finished", "DONE"))
+    assert kernel.failures == []
+    assert kernel.closed

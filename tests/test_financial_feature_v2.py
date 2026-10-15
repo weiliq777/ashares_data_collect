@@ -365,6 +365,90 @@ def test_foundation_quality_batches_same_table_metrics_without_losing_rules():
     assert report["passed"] is True
 
 
+def test_incremental_company_quality_is_bounded_to_changed_codes_and_report_dates():
+    from data_collect.data_access.repository.foundation_quality_repository import (
+        FoundationQualityRepository,
+    )
+
+    calls = []
+
+    class ReadProbe:
+        def _repository_query(
+            self, context, source, sql, params=(), scope=None, max_rows=None,
+        ):
+            calls.append((source, sql, params, scope, max_rows))
+            if source == "feature.company_financial_v2":
+                return [{
+                    "company_rows": 8,
+                    "company_contract_mismatch": 0,
+                    "invalid_complete_ttm": 0,
+                    "invalid_quality_status": 0,
+                    "invalid_ocf_ratio": 0,
+                    "invalid_comp_type_cashflow": 0,
+                    "missing_pit_evidence": 0,
+                    "company_future_rows": 1,
+                }]
+            return [{"value": 0}]
+
+    class KernelProbe:
+        read = ReadProbe()
+
+    codes = ["000002.SZ", "000001.SZ", "000001.SZ"]
+    report = FoundationQualityRepository(KernelProbe()).inspect_incremental_company_v2(
+        date(2021, 8, 2), date(2026, 10, 12), codes, context=None,
+    )
+
+    assert report["passed"] is True
+    assert report["scope"]["codes"] == ["000001.SZ", "000002.SZ"]
+    assert report["informational"]["company_future_rows"] == 1
+    assert len(calls) == 2
+    for _, sql, params, scope, max_rows in calls:
+        assert "report_date BETWEEN %s AND %s" in sql
+        assert "ts_code=ANY(%s)" in sql or "stock_code=ANY(%s)" in sql
+        assert scope.codes == ("000001.SZ", "000002.SZ")
+        assert max_rows == 2
+    assert calls[1][0] == "std.financial_income_standard"
+    assert "NOT EXISTS" in calls[1][1]
+    with pytest.raises(ValueError, match="limited to 100"):
+        FoundationQualityRepository(KernelProbe()).inspect_incremental_company_v2(
+            date(2021, 8, 2), date(2026, 10, 12),
+            [f"{index:06d}.SZ" for index in range(101)], context=None,
+        )
+
+
+def test_incremental_company_quality_fails_when_materialized_report_period_is_missing():
+    from data_collect.data_access.repository.foundation_quality_repository import (
+        FoundationQualityRepository,
+    )
+
+    class ReadProbe:
+        def _repository_query(
+            self, context, source, sql, params=(), scope=None, max_rows=None,
+        ):
+            if source == "feature.company_financial_v2":
+                return [{
+                    "company_rows": 1,
+                    "company_contract_mismatch": 0,
+                    "invalid_complete_ttm": 0,
+                    "invalid_quality_status": 0,
+                    "invalid_ocf_ratio": 0,
+                    "invalid_comp_type_cashflow": 0,
+                    "missing_pit_evidence": 0,
+                    "company_future_rows": 0,
+                }]
+            return [{"value": 1}]
+
+    class KernelProbe:
+        read = ReadProbe()
+
+    report = FoundationQualityRepository(KernelProbe()).inspect_incremental_company_v2(
+        date(2021, 8, 2), date(2026, 10, 12), ["000001.SZ"], context=None,
+    )
+
+    assert report["passed"] is False
+    assert report["failures"] == {"company_missing_report_periods": 1}
+
+
 def test_valuation_availability_gate_rejects_both_early_and_next_day_values():
     source = Path("data_collect/data_access/repository/foundation_quality_repository.py").read_text(
         encoding="utf-8"

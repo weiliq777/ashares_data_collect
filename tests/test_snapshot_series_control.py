@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta
 import inspect
 from pathlib import Path
@@ -14,7 +15,10 @@ from data_collect.jobs.research_snapshot import (
     freeze_snapshots_batch,
     inspect_snapshots_batch,
 )
-from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchBaseline,
+    ResearchSnapshotRepository,
+)
 from data_collect.jobs.snapshot_series_control import (
     MonitorMode,
     SeriesSelector,
@@ -226,10 +230,28 @@ def test_inspection_helper_contains_no_lifecycle_write_calls():
 
 def test_batch_validation_does_not_mark_failed_on_infrastructure_error(monkeypatch):
     service_calls = []
+    lifecycle_events = []
+
+    @contextmanager
+    def lifecycle_lock(ids):
+        lifecycle_events.append(("entered", tuple(ids)))
+        try:
+            yield
+        finally:
+            lifecycle_events.append(("released", tuple(ids)))
+
+    monkeypatch.setattr(
+        research_snapshot_job, "_snapshot_lifecycle_lock", lifecycle_lock,
+    )
+
+    def fail_inspection(*_args, **_kwargs):
+        assert lifecycle_events[-1][0] == "entered"
+        raise TimeoutError("database timeout")
+
     monkeypatch.setattr(
         research_snapshot_job,
         "inspect_snapshots_batch",
-        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("database timeout")),
+        fail_inspection,
     )
     monkeypatch.setattr(
         research_snapshot_job,
@@ -239,6 +261,10 @@ def test_batch_validation_does_not_mark_failed_on_infrastructure_error(monkeypat
     with pytest.raises(TimeoutError, match="database timeout"):
         research_snapshot_job.validate_snapshots_batch([_row(1, "BUILDING")["snapshot_id"]])
     assert service_calls == []
+    assert lifecycle_events == [
+        ("entered", (_row(1, "BUILDING")["snapshot_id"],)),
+        ("released", (_row(1, "BUILDING")["snapshot_id"],)),
+    ]
 
 
 def test_batch_validation_marks_only_snapshots_with_deterministic_issues(monkeypatch):
@@ -280,6 +306,9 @@ def test_batch_validation_marks_only_snapshots_with_deterministic_issues(monkeyp
         lambda *args, **kwargs: {first: [{"lineage": "missing"}]},
     )
     monkeypatch.setattr(
+        research_snapshot_job, "_snapshot_lifecycle_lock", lambda _ids: nullcontext(),
+    )
+    monkeypatch.setattr(
         research_snapshot_job,
         "_service",
         lambda label: (Kernel(), repository, object()),
@@ -287,7 +316,10 @@ def test_batch_validation_marks_only_snapshots_with_deterministic_issues(monkeyp
     with pytest.raises(RuntimeError, match="批量校验失败"):
         research_snapshot_job.validate_snapshots_batch(
             [first, second],
-            baseline=("baseline",),
+            baseline=ResearchBaseline(
+                "baseline", DATES[0], "validated", "b" * 64, "s" * 64,
+                {}, "feature-contract-v2.0",
+            ),
             quality_reports={
                 first: ({"failures": {}}, "quality"),
                 second: ({"failures": {}}, "quality"),

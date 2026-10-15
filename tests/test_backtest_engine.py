@@ -34,6 +34,8 @@ def _bar(day, open_price=10.0, close=10.0, low=9.8, can_buy=True, can_sell=True)
         raw_close=close,
         volume=100000,
         amount=1000000,
+        up_limit=max(open_price, close, low) + 1.0,
+        down_limit=max(0.01, min(open_price, close, low) - 1.0),
         can_buy=can_buy,
         can_sell=can_sell,
     )
@@ -194,7 +196,7 @@ def test_same_day_buy_orders_use_score_descending_before_code_tiebreaker():
         for code in ("000001.SZ", "000002.SZ"):
             bars[(day, code)] = MarketBar(
                 day, code, 10.0, 10.2, 9.8, 10.0,
-                volume=1000, amount=10000,
+                volume=1000, amount=10000, up_limit=11.0, down_limit=9.0,
             )
     result = BacktestEngine(
         BacktestConfig(initial_cash=10000, max_positions=1, reserve_cash_pct=0)
@@ -642,6 +644,74 @@ def test_open_sell_can_fill_before_the_daily_bar_closes_at_lower_limit():
     assert result.fills[-1]["fill_price"] == pytest.approx(8.2)
 
 
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+@pytest.mark.parametrize(
+    "unknown_limit", [None, 100000.0, float("nan")],
+    ids=["missing", "sentinel", "nan"],
+)
+def test_open_order_is_rejected_when_directional_limit_is_unknown(direction, unknown_limit):
+    days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+
+    class TradeOnce:
+        strategy_id = f"unknown-{direction.lower()}-limit"
+        strategy_version = "1"
+
+        def generate_signals(self, trade_date, observations, positions):
+            if trade_date == days[1]:
+                return [SignalIntent("000001.SZ", "BUY", 10.0, 10.0, 9.0)]
+            if direction == "SELL" and trade_date == days[2] and positions:
+                return [SignalIntent("000001.SZ", "SELL", 10.0, 10.0)]
+            return []
+
+    bars = [_bar(day) for day in days]
+    unknown_limit_index = 2 if direction == "BUY" else 3
+    bars[unknown_limit_index] = MarketBar(
+        trade_date=days[unknown_limit_index],
+        ts_code="000001.SZ",
+        raw_open=10.0,
+        raw_high=10.2,
+        raw_low=9.8,
+        raw_close=10.0,
+        volume=100000,
+        amount=1000000,
+        up_limit=unknown_limit if direction == "BUY" else 11.0,
+        down_limit=9.0 if direction == "BUY" else unknown_limit,
+        can_buy=False,
+        can_sell=False,
+    )
+    result = BacktestEngine(
+        BacktestConfig(initial_cash=100000, reserve_cash_pct=0),
+    ).run(
+        _dataset(
+            days,
+            bars,
+            {day: [_observation(day)] for day in days[1:]},
+        ),
+        TradeOnce(),
+    )
+
+    order = next(order for order in result.orders if order["direction"] == direction)
+    assert order["status"] == "REJECTED"
+    assert order["actual_shares"] == 0
+    assert not [fill for fill in result.fills if fill["direction"] == direction]
+
+
+def test_open_execution_fails_closed_when_either_limit_is_unknown():
+    bar = MarketBar(
+        trade_date=date(2026, 1, 5),
+        ts_code="000001.SZ",
+        raw_open=10.0,
+        raw_high=10.2,
+        raw_low=9.8,
+        raw_close=10.0,
+        up_limit=None,
+        down_limit=9.0,
+    )
+
+    assert BacktestEngine._limit_blocked(bar, "BUY") is True
+    assert BacktestEngine._limit_blocked(bar, "SELL") is True
+
+
 def test_stop_can_execute_before_a_later_lower_limit_close():
     days = [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
 
@@ -756,6 +826,8 @@ def test_liquidity_rejection_keeps_actual_shares_zero():
         raw_close=10.0,
         volume=1,
         amount=10,
+        up_limit=11.0,
+        down_limit=9.0,
         can_buy=True,
         can_sell=True,
     )
@@ -814,7 +886,7 @@ def test_stop_loss_closes_the_triggering_lot_instead_of_fifo_lot():
     days = [date(2026, 1, 2), date(2026, 1, 5)]
     current = MarketBar(
         days[1], "000001.SZ", 10.0, 10.2, 9.0, 9.4,
-        volume=100000, amount=950000,
+        volume=100000, amount=950000, up_limit=11.0, down_limit=8.0,
     )
     dataset = _dataset(days, [_bar(days[0]), current], {day: () for day in days})
     engine = BacktestEngine(BacktestConfig(initial_cash=10000, reserve_cash_pct=0))

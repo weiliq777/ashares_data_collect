@@ -19,13 +19,17 @@ from data_collect.data_access.repository.research_snapshot_repository import (
     ResearchSnapshotRepository,
 )
 from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.snapshot_lifecycle import MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE
 
 
 def audit_dataset(dataset_id: str, *, batch_size: int = 10) -> dict:
     if not str(dataset_id).strip():
         raise ValueError("dataset_id must not be blank")
-    if batch_size <= 0 or batch_size > 20:
-        raise ValueError("batch_size must be between 1 and 20")
+    if batch_size < 1 or batch_size > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+        raise ValueError(
+            "batch_size must be between 1 and "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+        )
 
     kernel = DataAccessKernel(policy_registry=build_default_registry())
     context = RunContext(

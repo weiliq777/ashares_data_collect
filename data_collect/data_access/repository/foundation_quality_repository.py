@@ -110,6 +110,139 @@ class FoundationQualityRepository(BaseRepository):
             )[0]["value"] or 0)
         return missing, extra
 
+    def inspect_incremental_company_v2(
+        self,
+        start_date: date,
+        end_date: date,
+        codes: list[str],
+        context: RunContext,
+    ) -> dict:
+        """Check only changed securities and their published report-date range.
+
+        The consumer limits each batch to 100 codes. Both reads carry a report
+        date range and that code set; the existing (ts_code, report_date)
+        indexes bound the feature and source lookups. This intentionally omits
+        market valuation checks, which are unrelated to financial queue work.
+        """
+        normalized_codes = tuple(sorted({str(code).strip() for code in codes if str(code).strip()}))
+        if not normalized_codes:
+            raise ValueError("incremental financial quality requires at least one stock code")
+        if len(normalized_codes) > 100:
+            raise ValueError("incremental financial quality is limited to 100 stock codes")
+        if end_date < start_date:
+            raise ValueError("incremental financial quality end_date precedes start_date")
+
+        scope = WorkScope(
+            date_from=start_date, date_to=end_date, codes=normalized_codes,
+            partition="incremental-company-financial-v2-quality",
+        )
+        cutoff_end = "(%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'"
+        company = self.kernel.read._repository_query(
+            context,
+            "feature.company_financial_v2",
+            f"""SELECT
+                COUNT(*) AS company_rows,
+                COUNT(*) FILTER (WHERE feature_contract_version IS DISTINCT FROM
+                    'feature-contract-v2.0') AS company_contract_mismatch,
+                COUNT(*) FILTER (WHERE ttm_complete AND (
+                    ttm_component_count<>ttm_required_component_count
+                    OR net_profit_consolidated_ttm IS NULL
+                    OR net_profit_parent_ttm IS NULL
+                    OR operating_cashflow_ttm IS NULL)) AS invalid_complete_ttm,
+                COUNT(*) FILTER (WHERE quality_status IS NULL OR
+                    quality_status NOT IN ('VALID','INCOMPLETE_TTM')) AS invalid_quality_status,
+                COUNT(*) FILTER (WHERE comp_type='1' AND (
+                    (net_profit_consolidated_ttm<=0 AND
+                        ocf_to_net_profit_consolidated_ttm IS NOT NULL)
+                    OR (net_profit_consolidated_ttm>0
+                        AND operating_cashflow_ttm IS NOT NULL
+                        AND ocf_to_net_profit_consolidated_ttm IS DISTINCT FROM
+                            operating_cashflow_ttm/net_profit_consolidated_ttm)))
+                    AS invalid_ocf_ratio,
+                COUNT(*) FILTER (WHERE
+                    (comp_type IS NULL AND (
+                        cashflow_quality_status<>'UNKNOWN_COMP_TYPE'
+                        OR ocf_to_net_profit_consolidated_ttm IS NOT NULL))
+                    OR (comp_type IS NOT NULL AND comp_type<>'1' AND (
+                        cashflow_quality_status<>'NOT_APPLICABLE'
+                        OR ocf_to_net_profit_consolidated_ttm IS NOT NULL)))
+                    AS invalid_comp_type_cashflow,
+                COUNT(*) FILTER (WHERE
+                    COALESCE(pit_evidence_level,'UNKNOWN')='UNKNOWN')
+                    AS missing_pit_evidence,
+                COUNT(*) FILTER (WHERE data_available_timestamp >= {cutoff_end})
+                    AS company_future_rows
+              FROM feature.company_financial_v2
+             WHERE report_date BETWEEN %s AND %s AND ts_code=ANY(%s)""",
+            params=[end_date, start_date, end_date, list(normalized_codes)],
+            scope=scope,
+            max_rows=2,
+        )[0]
+
+        missing_rows = self.kernel.read._repository_query(
+            context,
+            "std.financial_income_standard",
+            f"""SELECT COUNT(*) AS value
+              FROM (
+                SELECT DISTINCT i.stock_code, i.report_date
+                  FROM std.financial_income_standard i
+                 WHERE i.report_date BETWEEN %s AND %s
+                   AND i.stock_code=ANY(%s)
+                   AND COALESCE(i.report_type,'1')='1'
+                   AND ((i.end_type='1' AND EXTRACT(MONTH FROM i.report_date)=3
+                                           AND EXTRACT(DAY FROM i.report_date)=31)
+                     OR (i.end_type='2' AND EXTRACT(MONTH FROM i.report_date)=6
+                                           AND EXTRACT(DAY FROM i.report_date)=30)
+                     OR (i.end_type='3' AND EXTRACT(MONTH FROM i.report_date)=9
+                                           AND EXTRACT(DAY FROM i.report_date)=30)
+                     OR (i.end_type='4' AND EXTRACT(MONTH FROM i.report_date)=12
+                                           AND EXTRACT(DAY FROM i.report_date)=31))
+                   AND i.data_available_timestamp IS NOT NULL
+                   AND i.data_available_timestamp < {cutoff_end}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM feature.company_financial_v2 c
+                        WHERE c.ts_code=i.stock_code
+                          AND c.report_date=i.report_date
+                          AND c.data_available_timestamp < {cutoff_end})
+              ) missing""",
+            params=[start_date, end_date, list(normalized_codes), end_date, end_date],
+            scope=scope,
+            max_rows=2,
+        )[0]
+
+        checks = {
+            name: int(company[name] or 0)
+            for name in (
+                "company_rows", "company_contract_mismatch", "invalid_complete_ttm",
+                "invalid_quality_status", "invalid_ocf_ratio",
+                "invalid_comp_type_cashflow", "missing_pit_evidence",
+            )
+        }
+        checks["company_future_rows"] = int(company["company_future_rows"] or 0)
+        checks["company_missing_report_periods"] = int(missing_rows["value"] or 0)
+        required_zero = (
+            "company_contract_mismatch", "invalid_complete_ttm",
+            "invalid_quality_status", "invalid_ocf_ratio",
+            "invalid_comp_type_cashflow", "missing_pit_evidence",
+            "company_missing_report_periods",
+        )
+        failures = {
+            name: checks[name] for name in required_zero if checks[name] != 0
+        }
+        return {
+            "scope": {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "codes": list(normalized_codes),
+            },
+            "checks": checks,
+            "failures": failures,
+            "informational": {
+                "company_future_rows": checks["company_future_rows"],
+            },
+            "passed": not failures,
+        }
+
     def inspect_foundation_v2(
         self,
         start_date: date,

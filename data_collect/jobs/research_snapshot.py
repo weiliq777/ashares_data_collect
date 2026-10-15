@@ -12,6 +12,7 @@ import json
 import math
 import subprocess
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -22,7 +23,10 @@ from data_collect.ops.market_coverage import (
 )
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.policy_catalog import build_default_registry
-from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchBaseline,
+    ResearchSnapshotRepository,
+)
 from data_collect.data_access.repository.pit_validation_repository import PitValidationRepository
 from data_collect.data_access.research_contract import (
     FOUNDATION_SCHEMA_VERSION,
@@ -30,6 +34,9 @@ from data_collect.data_access.research_contract import (
     STRATEGY_NEUTRAL_SCHEMA_VERSION,
     assert_strategy_neutral_inputs,
     is_foundation_schema,
+)
+from data_collect.data_access.snapshot_lifecycle import (
+    require_snapshot_batch,
 )
 
 
@@ -50,6 +57,20 @@ def _service(label: str):
         config_hash="unknown", pipeline_version="data-access-v1",
     )
     return kernel, ResearchSnapshotRepository(kernel), context
+
+
+@contextmanager
+def _snapshot_lifecycle_lock(snapshot_ids):
+    """Hold ordered per-Snapshot locks across lifecycle reads and writes."""
+    ids = require_snapshot_batch(
+        snapshot_ids, "snapshot lifecycle operation", allow_empty=False,
+    )
+    kernel, repository, _ = _service("lifecycle-lock")
+    try:
+        with repository.lifecycle_locks(ids):
+            yield
+    finally:
+        kernel.close()
 
 
 # 这些表名和字段均为代码内固定定义，不接受命令行直接拼接，避免把哈希范围变成隐式变化。
@@ -234,15 +255,15 @@ def _sha256_file(path: str | Path) -> tuple[str, int]:
 def _quality_report(
     cutoff: date | None = None,
     schema_version: str = SCHEMA_VERSION,
-    baseline=None,
+    baseline: ResearchBaseline | None = None,
 ) -> tuple[dict, str]:
     # A validated release already contains quality evidence for its
     # immutable baseline. Reuse it instead of rescanning large legacy tables
     # once per Snapshot; build/validate still perform cutoff-specific checks.
     if is_foundation_schema(schema_version) and baseline is not None:
-        stored = baseline[7] if len(baseline) > 7 else None
+        stored = baseline.quality_report
         if isinstance(stored, dict) and stored.get("failures") == {}:
-            return dict(stored), baseline[3]
+            return dict(stored), baseline.quality_report_hash
     from data_collect.jobs.tushare_release import _quality_gate
 
     report = _quality_gate(
@@ -273,22 +294,26 @@ def _current_quality_for_manifest(manifest: dict) -> tuple[dict, str]:
     )
 
 
-def _assert_baseline_schema(baseline, snapshot_schema_version: str) -> None:
+def _assert_baseline_schema(
+    baseline: ResearchBaseline, snapshot_schema_version: str,
+) -> None:
     if (
         is_foundation_schema(snapshot_schema_version)
-        and baseline[6] != FOUNDATION_FEATURE_CONTRACT
+        and baseline.schema_version != FOUNDATION_FEATURE_CONTRACT
     ):
         raise RuntimeError(
             "Foundation research snapshots require a feature-contract-v2.0 validated release; "
-            f"actual release schema={baseline[6]!r}"
+            f"actual release schema={baseline.schema_version!r}"
         )
 
 
 def _quality_evidence_cutoff(
-    baseline, snapshot_cutoff: date, snapshot_schema_version: str
+    baseline: ResearchBaseline,
+    snapshot_cutoff: date,
+    snapshot_schema_version: str,
 ) -> date:
     if is_foundation_schema(snapshot_schema_version):
-        return baseline[1]
+        return baseline.baseline_cutoff_date
     return snapshot_cutoff
 
 
@@ -313,7 +338,9 @@ def _assert_price_vintage_for_dates(cutoffs: list[date], snapshot_ids: list[str]
     finally:
         kernel.close()
 
-def _baseline(cutoff: date, tag: str, *, verify_source_manifest: bool = True):
+def _baseline(
+    cutoff: date, tag: str, *, verify_source_manifest: bool = True,
+) -> ResearchBaseline:
     kernel, repository, context = _service("baseline")
     try:
         return repository.baseline(cutoff, tag, context, verify_source_manifest)
@@ -337,7 +364,8 @@ def create(cutoff: str, baseline_tag: str, schema_version: str = SCHEMA_VERSION,
     try:
         repository.create_manifest(
             snapshot_id, cutoff_date, baseline_tag, schema_version, metadata,
-            quality_hash, baseline[3], baseline[4], quality_report, notes, context,
+            quality_hash, baseline.quality_report_hash, baseline.source_manifest_hash,
+            quality_report, notes, context,
         )
     finally:
         kernel.close()
@@ -407,7 +435,8 @@ def create_snapshots_batch(
                 "snapshot_id": snapshot_id, "research_cutoff_date": cutoff,
                 "data_baseline_tag": baseline_tag, "schema_version": schema_version,
                 "metadata": metadata, "quality_report_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-                "baseline_quality_report_hash": baseline[3], "baseline_source_manifest_hash": baseline[4],
+                "baseline_quality_report_hash": baseline.quality_report_hash,
+                "baseline_source_manifest_hash": baseline.source_manifest_hash,
                 "quality_report": report, "notes": (f"{notes_prefix} cutoff={cutoff.isoformat()}").strip(),
             })
             result[cutoff.isoformat()] = snapshot_id
@@ -420,11 +449,11 @@ def create_snapshots_batch(
 def build_snapshots_batch(
     snapshot_ids: list[str],
     *,
-    baseline=None,
+    baseline: ResearchBaseline | None = None,
     quality_reports: dict[str, tuple[dict, str]] | None = None,
 ) -> None:
     """Build several snapshots through one typed Repository path per snapshot."""
-    ids = tuple(str(value) for value in snapshot_ids)
+    ids = require_snapshot_batch(snapshot_ids, "snapshot build batch")
     if not ids:
         return
     metadata = _git_metadata()
@@ -442,7 +471,10 @@ def build_snapshots_batch(
         for manifest in manifests:
             if manifest["status"] not in {"DRAFT", "FAILED"}:
                 raise RuntimeError(f"批量构建只允许 DRAFT/FAILED Snapshot: {manifest['snapshot_id']}")
-            if baseline_value[3] != manifest["baseline_quality_hash"] or baseline_value[4] != manifest["baseline_source_manifest_hash"]:
+            if (
+                baseline_value.quality_report_hash != manifest["baseline_quality_hash"]
+                or baseline_value.source_manifest_hash != manifest["baseline_source_manifest_hash"]
+            ):
                 raise RuntimeError("数据基线 Manifest 已变化，拒绝批量构建")
             report, quality_hash = quality_reports[str(manifest["snapshot_id"])] if quality_reports else _quality_report(manifest["cutoff"], schema_version)
             if report["failures"]:
@@ -476,7 +508,10 @@ def build(snapshot_id: str) -> None:
     if quality_report["failures"]:
         raise RuntimeError(f"质量门禁未通过，不能构建快照: {quality_report['failures']}")
     baseline = _baseline(manifest["cutoff"], manifest["baseline"])
-    if baseline[3] != manifest["baseline_quality_hash"] or baseline[4] != manifest["baseline_source_manifest_hash"]:
+    if (
+        baseline.quality_report_hash != manifest["baseline_quality_hash"]
+        or baseline.source_manifest_hash != manifest["baseline_source_manifest_hash"]
+    ):
         raise RuntimeError("数据基线 Manifest 已变化，拒绝使用旧 Manifest 构建")
     kernel, repository, context = _service("build")
     try:
@@ -491,7 +526,7 @@ def build(snapshot_id: str) -> None:
 def inspect_snapshots_batch(
     snapshot_ids: list[str],
     *,
-    baseline=None,
+    baseline: ResearchBaseline | None = None,
     quality_reports: dict[str, tuple[dict, str]] | None = None,
     allowed_statuses: tuple[str, ...] = ("BUILDING", "VALIDATED", "FROZEN"),
     verify_source_manifest: bool = False,
@@ -504,11 +539,9 @@ def inspect_snapshots_batch(
     intentionally does not join or aggregate the whole historical series in a
     single statement.
     """
-    ids = tuple(str(value) for value in snapshot_ids)
+    ids = require_snapshot_batch(snapshot_ids, "snapshot inspection batch")
     if not ids:
         return {}
-    if len(ids) > 100:
-        raise ValueError("snapshot inspection batches are limited to 100")
     allowed = frozenset(str(value) for value in allowed_statuses)
     if not allowed:
         raise ValueError("allowed_statuses must not be empty")
@@ -547,7 +580,7 @@ def inspect_snapshots_batch(
 
         batch_snapshot_issues = repository.check_snapshots_batch(
             manifests,
-            baseline_value[5],
+            baseline_value.source_manifest,
             _inputs_for_schema(schema_version),
             _manifest_hash,
             len(REQUIRED_LINEAGE_GROUPS),
@@ -564,8 +597,8 @@ def inspect_snapshots_batch(
                     }
                 })
             if (
-                baseline_value[3] != manifest["baseline_quality_hash"]
-                or baseline_value[4] != manifest["baseline_source_manifest_hash"]
+                baseline_value.quality_report_hash != manifest["baseline_quality_hash"]
+                or baseline_value.source_manifest_hash != manifest["baseline_source_manifest_hash"]
             ):
                 issues.append({"baseline_hash_changed": True})
             report, quality_hash = (
@@ -592,7 +625,22 @@ def inspect_snapshots_batch(
 def validate_snapshots_batch(
     snapshot_ids: list[str],
     *,
-    baseline=None,
+    baseline: ResearchBaseline | None = None,
+    quality_reports: dict[str, tuple[dict, str]] | None = None,
+) -> None:
+    ids = require_snapshot_batch(snapshot_ids, "snapshot validation batch")
+    if not ids:
+        return
+    with _snapshot_lifecycle_lock(ids):
+        _validate_snapshots_batch_locked(
+            ids, baseline=baseline, quality_reports=quality_reports,
+        )
+
+
+def _validate_snapshots_batch_locked(
+    snapshot_ids: list[str] | tuple[str, ...],
+    *,
+    baseline: ResearchBaseline | None = None,
     quality_reports: dict[str, tuple[dict, str]] | None = None,
 ) -> None:
     """Inspect, then promote a bounded BUILDING batch to VALIDATED.
@@ -602,7 +650,7 @@ def validate_snapshots_batch(
     converted to FAILED, so a transient database problem cannot turn an
     otherwise valid historical batch into rebuild work.
     """
-    ids = tuple(str(value) for value in snapshot_ids)
+    ids = require_snapshot_batch(snapshot_ids, "snapshot validation batch")
     if not ids:
         return
     issues = inspect_snapshots_batch(
@@ -676,17 +724,25 @@ def _check_snapshot(manifest: dict, source_manifest: dict) -> list[dict]:
         kernel.close()
 
 def validate(snapshot_id: str) -> None:
+    with _snapshot_lifecycle_lock((snapshot_id,)):
+        _validate_snapshot_locked(snapshot_id)
+
+
+def _validate_snapshot_locked(snapshot_id: str) -> None:
     manifest = _manifest(snapshot_id)
     _assert_price_vintage_for_schema(manifest["cutoff"], manifest["schema_version"])
     if manifest["status"] != "BUILDING":
         raise RuntimeError(f"只有 BUILDING 快照可校验: {snapshot_id} ({manifest['status']})")
     quality_report, quality_hash = _quality_report(manifest["cutoff"], manifest["schema_version"])
     baseline = _baseline(manifest["cutoff"], manifest["baseline"])
-    if baseline[3] != manifest["baseline_quality_hash"] or baseline[4] != manifest["baseline_source_manifest_hash"]:
+    if (
+        baseline.quality_report_hash != manifest["baseline_quality_hash"]
+        or baseline.source_manifest_hash != manifest["baseline_source_manifest_hash"]
+    ):
         raise RuntimeError("数据基线质量哈希已变化，必须重新创建快照")
     if quality_report["failures"] or quality_hash != manifest["quality_hash"]:
         raise RuntimeError("质量报告已变化或门禁失败，必须重新 build 快照")
-    issues = _check_snapshot(manifest, baseline[5])
+    issues = _check_snapshot(manifest, baseline.source_manifest)
     pit_report = _pit_report(manifest["cutoff"], snapshot_id)
     if not pit_report["passed"]:
         issues.append({"pit_cutoff": pit_report})
@@ -701,6 +757,13 @@ def validate(snapshot_id: str) -> None:
 
 
 def freeze(snapshot_id: str, code_archive_path: str | None = None) -> None:
+    with _snapshot_lifecycle_lock((snapshot_id,)):
+        _freeze_snapshot_locked(snapshot_id, code_archive_path)
+
+
+def _freeze_snapshot_locked(
+    snapshot_id: str, code_archive_path: str | None = None,
+) -> None:
     metadata = _git_metadata()
     if metadata["dirty"] and not code_archive_path:
         raise RuntimeError(
@@ -720,7 +783,10 @@ def freeze(snapshot_id: str, code_archive_path: str | None = None) -> None:
     if manifest["status"] != "VALIDATED":
         raise RuntimeError(f"只有 VALIDATED 快照可冻结: {snapshot_id} ({manifest['status']})")
     baseline = _baseline(manifest["cutoff"], manifest["baseline"])
-    if baseline[3] != manifest["baseline_quality_hash"] or baseline[4] != manifest["baseline_source_manifest_hash"]:
+    if (
+        baseline.quality_report_hash != manifest["baseline_quality_hash"]
+        or baseline.source_manifest_hash != manifest["baseline_source_manifest_hash"]
+    ):
         raise RuntimeError("数据基线哈希已变化，拒绝冻结")
     quality_report, quality_hash = _quality_report(manifest["cutoff"], manifest["schema_version"])
     if quality_report["failures"] or quality_hash != manifest["quality_hash"]:
@@ -770,7 +836,34 @@ def freeze_snapshots_batch(
     snapshot_ids: list[str],
     code_archive_path: str | None = None,
     *,
-    baseline=None,
+    baseline: ResearchBaseline | None = None,
+    quality_report: dict | None = None,
+    verify_source_manifest: bool = True,
+    verify_global_checks: bool = True,
+    metadata: dict | None = None,
+    code_archive_evidence: tuple[str, int] | None = None,
+) -> None:
+    ids = require_snapshot_batch(snapshot_ids, "snapshot freeze batch")
+    if not ids:
+        return
+    with _snapshot_lifecycle_lock(ids):
+        _freeze_snapshots_batch_locked(
+            ids,
+            code_archive_path,
+            baseline=baseline,
+            quality_report=quality_report,
+            verify_source_manifest=verify_source_manifest,
+            verify_global_checks=verify_global_checks,
+            metadata=metadata,
+            code_archive_evidence=code_archive_evidence,
+        )
+
+
+def _freeze_snapshots_batch_locked(
+    snapshot_ids: list[str] | tuple[str, ...],
+    code_archive_path: str | None = None,
+    *,
+    baseline: ResearchBaseline | None = None,
     quality_report: dict | None = None,
     verify_source_manifest: bool = True,
     verify_global_checks: bool = True,
@@ -783,7 +876,7 @@ def freeze_snapshots_batch(
     per-snapshot immutable rows and audit metadata, while avoiding one full
     Raw-manifest/quality scan for every cutoff date.
     """
-    ids = tuple(str(value) for value in snapshot_ids)
+    ids = require_snapshot_batch(snapshot_ids, "snapshot freeze batch")
     if not ids:
         return
     freeze_metadata = metadata or _git_metadata()
@@ -818,7 +911,10 @@ def freeze_snapshots_batch(
             verify_source_manifest=verify_source_manifest,
         )
         for manifest in manifests:
-            if baseline_value[3] != manifest["baseline_quality_hash"] or baseline_value[4] != manifest["baseline_source_manifest_hash"]:
+            if (
+                baseline_value.quality_report_hash != manifest["baseline_quality_hash"]
+                or baseline_value.source_manifest_hash != manifest["baseline_source_manifest_hash"]
+            ):
                 raise RuntimeError("Snapshot 绑定的基线哈希已变化，拒绝冻结")
             if not manifest["quality_hash"] or not manifest["input_hash"]:
                 raise RuntimeError("Snapshot 缺少质量哈希或输入哈希")

@@ -44,6 +44,7 @@ def run(
             "batches": summary["processed_batches"],
             "queue_rows": summary["processed_queue_rows"],
             "result": summary["last_result"],
+            "quality": summary["last_quality_report"],
         }
     except BaseException as exc:
         kernel.record_run_failure(context, exc)

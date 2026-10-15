@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
+import math
 import threading
 import time
 import uuid
 from datetime import date, timedelta
+from numbers import Real
 
 import pandas as pd
 
@@ -35,6 +37,10 @@ QUEUE_HEARTBEAT_SECONDS = 5 * 60
 # Individual SQL statements have a TransactionManager deadline. This second
 # circuit breaker bounds the aggregate work held by one queue claim.
 QUEUE_BATCH_DEADLINE_SECONDS = 30 * 60
+# A just-ended quarter is not an expected complete VIP period until this
+# conservative grace window has elapsed. Periods with confirmed actual
+# disclosure dates are still fetched immediately.
+REPORT_PERIOD_DISCLOSURE_GRACE_DAYS = 120
 # A financial queue batch is deliberately smaller than the API page size.
 # This bounds the temporary pandas object frame used by Raw -> Standard.
 DERIVATION_PAGE_SIZE = 500
@@ -110,6 +116,18 @@ def _service(token: str):
 def _as_yyyymmdd(value) -> str | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
+    if isinstance(value, Real) and not isinstance(value, bool):
+        numeric = float(value)
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            return None
+        text = str(int(numeric))
+        if len(text) != 8:
+            return None
+        try:
+            parsed = date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+            return parsed.strftime("%Y%m%d")
+        except ValueError:
+            return None
     parsed = pd.to_datetime(value, errors="coerce")
     return None if pd.isna(parsed) else parsed.strftime("%Y%m%d")
 
@@ -131,8 +149,10 @@ def _recent_report_periods(end_dt: date, count: int) -> list[str]:
     else:
         cursor = date(end_dt.year, 9, 30)
     periods = []
-    for _ in range(max(1, int(count))):
-        periods.append(cursor.strftime("%Y%m%d"))
+    target_count = max(1, int(count))
+    while len(periods) < target_count:
+        if (end_dt - cursor).days >= REPORT_PERIOD_DISCLOSURE_GRACE_DAYS:
+            periods.append(cursor.strftime("%Y%m%d"))
         if cursor.month == 12:
             cursor = date(cursor.year, 9, 30)
         elif cursor.month == 9:
@@ -246,7 +266,17 @@ def discover_report_periods(pro, end_dt, lookback_days, report_periods_back, bat
             continue
         if len(frame) >= 6000 and record_anomalies:
             _record_anomaly("disclosure_date", "disclosure_date", None, batch_id, "DISCOVERY_COVERAGE_LIMIT", "WARNING", {"rows": len(frame), "ann_date": current.strftime("%Y%m%d")}, repository, context)
-        periods.update(value for value in frame.get("end_date", pd.Series(dtype=object)).map(_as_yyyymmdd).dropna() if value <= end_dt.strftime("%Y%m%d"))
+        if not {"end_date", "actual_date"}.issubset(frame.columns):
+            continue
+        actual_dates = frame["actual_date"].map(_as_yyyymmdd)
+        confirmed = frame[
+            actual_dates.notna()
+            & (actual_dates <= end_dt.strftime("%Y%m%d"))
+        ]
+        periods.update(
+            value for value in confirmed["end_date"].map(_as_yyyymmdd).dropna()
+            if value <= end_dt.strftime("%Y%m%d")
+        )
     return sorted(periods)
 
 
@@ -320,6 +350,16 @@ def _legacy_pending_codes(repository=None, context=None, *, limit=QUEUE_CLAIM_LI
             kernel.close()
 
 
+def _inspect_incremental_company_quality(repository, context, codes, start_date, end_date):
+    from data_collect.data_access.repository.foundation_quality_repository import (
+        FoundationQualityRepository,
+    )
+
+    return FoundationQualityRepository(repository.kernel).inspect_incremental_company_v2(
+        start_date, end_date, codes, context,
+    )
+
+
 def _consume_pending_changes(
     repository, context, output_end, *, claim_owner_id=None, takeover=False,
 ):
@@ -338,6 +378,7 @@ def _consume_pending_changes(
     processed_queue_rows = 0
     processed_stocks = 0
     last_result = None
+    last_quality_report = None
     claim_owner_id = context.run_id if claim_owner_id is None else claim_owner_id
     while True:
         queue_ids, queue_codes = _pending_queue_codes(
@@ -417,6 +458,18 @@ def _consume_pending_changes(
             if heartbeat:
                 heartbeat.raise_if_failed()
             check_batch_deadline("after_feature")
+            quality_report = _inspect_incremental_company_quality(
+                repository, context, codes, OUTPUT_START, output_end,
+            )
+            if heartbeat:
+                heartbeat.raise_if_failed()
+            check_batch_deadline("after_quality")
+            if quality_report["failures"]:
+                raise RuntimeError(
+                    "incremental financial quality gate failed: "
+                    f"{quality_report['failures']}"
+                )
+            last_quality_report = quality_report
             if queue_ids:
                 repository.finish_queue(
                     queue_ids, "DONE", None, context, claim_owner_id,
@@ -451,6 +504,7 @@ def _consume_pending_changes(
         "processed_stocks": processed_stocks,
         "queue_status": queue_status,
         "last_result": last_result,
+        "last_quality_report": last_quality_report,
     }
 
 

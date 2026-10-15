@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import date
 from types import SimpleNamespace
 
@@ -63,19 +64,31 @@ def test_snapshot_series_detects_partial_build_before_validation():
     assert calls[0][2] == (
         ["partial-id", "complete-id"], ["partial-id", "complete-id"], 10
     )
-    assert calls[0][3] == 2
+    assert calls[0][3] == 3
 
 
 def test_snapshot_series_reopen_requires_explicit_reason_and_updates_validated():
     calls = []
+    lock_events = []
     repository = SnapshotSeriesRepository.__new__(SnapshotSeriesRepository)
+
+    class LockManager:
+        @contextmanager
+        def session_exclusive_many(self, target, scope_keys, *, wait=False):
+            lock_events.append(("acquired", target, tuple(scope_keys), wait))
+            try:
+                yield
+            finally:
+                lock_events.append(("released", target, tuple(scope_keys)))
 
     def fake_transition(**kwargs):
         calls.append(kwargs)
+        lock_events.append(("write",))
         return len(kwargs["rows"])
 
     repository.kernel = SimpleNamespace(
         write=SimpleNamespace(transition_snapshot_manifests=fake_transition),
+        lock_manager=LockManager(),
     )
     with pytest.raises(ValueError, match="reason"):
         repository.reopen_validated_snapshots(["snapshot-id"], " ", "context")
@@ -86,3 +99,8 @@ def test_snapshot_series_reopen_requires_explicit_reason_and_updates_validated()
     assert calls[0]["from_statuses"] == ("VALIDATED",)
     assert calls[0]["to_status"] == "FAILED"
     assert calls[0]["rows"][0]["failure_reason"].startswith("PRE_FREEZE_REPAIR:")
+    assert lock_events == [
+        ("acquired", "research.snapshot", ("snapshot-id",), True),
+        ("write",),
+        ("released", "research.snapshot", ("snapshot-id",)),
+    ]

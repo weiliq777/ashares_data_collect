@@ -10,6 +10,10 @@ from data_collect.data_access.checkpoint import Checkpoint, PostgresCheckpointSt
 from data_collect.data_access.policy_catalog import build_default_registry
 from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
 from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.snapshot_lifecycle import (
+    MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
+    snapshot_id_batches,
+)
 from data_collect.jobs.research_snapshot import (
     _baseline,
     _git_metadata,
@@ -72,7 +76,7 @@ def _shared_evidence(selector: SeriesSelector):
     )
     if is_foundation_schema(selector.schema_version):
         quality_report, quality_hash = _quality_report(
-            baseline[1], selector.schema_version, baseline,
+            baseline.baseline_cutoff_date, selector.schema_version, baseline,
         )
         if quality_report["failures"]:
             raise RuntimeError(f"baseline quality gate failed: {quality_report['failures']}")
@@ -127,6 +131,13 @@ def main(argv=None) -> int:
     selector = _selector(args)
     if args.command != "resume" and getattr(args, "rebuild_dirty", False):
         build_parser().error("--rebuild-dirty 只能用于 resume")
+    if args.command in {"resume", "finalize"} and not (
+        1 <= args.batch_size <= MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE
+    ):
+        build_parser().error(
+            "--batch-size must be between 1 and "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+        )
     kernel, monitor = _runtime(args.command)
     try:
         if args.command == "monitor":
@@ -164,11 +175,12 @@ def main(argv=None) -> int:
                         and not record.code_archive_path
                     ]
                     if dirty_ids:
-                        monitor.repository.reopen_validated_snapshots(
-                            dirty_ids,
-                            "原快照由 dirty 工作区构建且缺少对应代码归档，执行一次性清洁代码重建",
-                            monitor.context,
-                        )
+                        for batch in snapshot_id_batches(dirty_ids):
+                            monitor.repository.reopen_validated_snapshots(
+                                batch,
+                                "原快照由 dirty 工作区构建且缺少对应代码归档，执行一次性清洁代码重建",
+                                monitor.context,
+                            )
                 runner = SnapshotSeriesResume(
                     monitor,
                     checkpoint,

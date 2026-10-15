@@ -24,6 +24,7 @@ from data_collect.backtest.models import (
     DividendEvent,
     MarketBar,
     Observation,
+    normalize_execution_limit,
 )
 from data_collect.backtest.risk import FeeRule, MarketRule
 from data_collect.backtest.dataset_composition import (
@@ -80,7 +81,7 @@ _CONTRACT_SOURCE_ASSERTIONS += " _manifest(conn, dataset_id, for_update=True) CO
 # ORDER BY d.trade_date effective_announce_date > m.research_date corporate_action_hash_for_day
 # m.corporate_action_hash RESEARCH_SCHEMA_VERSION DISTINCT ON (event_key)
 # status='FAILED', failed_at=CURRENT_TIMESTAMP
-# "baseline_quality_report" 鏁版嵁鍩虹嚎 quality_report_hash 宸插彉鍖? Dataset 杈圭晫蹇呴』鏄惧紑甯傛棩
+# "baseline_quality_report" 保存数据基线 quality_report_hash；Dataset 边界必须是 SSE 开市日
 # Dataset 成员包含交易日历范围外日期
 # expected_role =
 
@@ -293,19 +294,9 @@ def _execution_limit_safety(
     当真实价格，也不能在限制价未知时允许回测成交；价格仍可用于持仓估值。
     返回规范化上下限、可买、可卖和是否触发 WARNING。
     """
-    def normalize(value):
-        if value is None:
-            return None
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return None
-        # NaN/Inf、非正值和 Tushare 的 100000 哨兵都不是可撮合的限制价。
-        # 这里只改变 Dataset 物化结果，不改写 Raw/Standard 源数据。
-        return None if not math.isfinite(numeric) or numeric <= 0 or numeric >= 99999 else numeric
-
-    up = normalize(up_limit)
-    down = normalize(down_limit)
+    # 这里只改变 Dataset 物化结果，不改写 Raw/Standard 源数据。
+    up = normalize_execution_limit(up_limit)
+    down = normalize_execution_limit(down_limit)
     buy = bool(can_buy)
     sell = bool(can_sell)
     unknown = (
@@ -622,19 +613,20 @@ def create_dataset(
             "selected_columns": _json_param(SELECTED_COLUMNS), "hash_algorithm": HASH_ALGORITHM,
             "availability_rules": _json_param(availability_rules),
         }
-        repository.create_manifest(manifest, context)
-        members = []
-        for row in sorted(rows, key=lambda item: item["research_cutoff_date"]):
-            day = row["research_cutoff_date"]
-            if day < warmup_start or day > evaluation_end:
-                raise ValueError(f"Snapshot 日期 {day} 超出 Dataset 范围")
-            members.append({
-                "dataset_id": dataset_id, "research_snapshot_id": row["snapshot_id"],
-                "research_date": day,
-                "member_role": "EVALUATION" if evaluation_start <= day <= evaluation_end else "WARMUP",
-                "snapshot_input_hash": row["input_manifest_hash"],
-            })
-        repository.create_members(members, context)
+        with repository.lifecycle_lock(dataset_id):
+            repository.create_manifest(manifest, context)
+            members = []
+            for row in sorted(rows, key=lambda item: item["research_cutoff_date"]):
+                day = row["research_cutoff_date"]
+                if day < warmup_start or day > evaluation_end:
+                    raise ValueError(f"Snapshot 日期 {day} 超出 Dataset 范围")
+                members.append({
+                    "dataset_id": dataset_id, "research_snapshot_id": row["snapshot_id"],
+                    "research_date": day,
+                    "member_role": "EVALUATION" if evaluation_start <= day <= evaluation_end else "WARMUP",
+                    "snapshot_input_hash": row["input_manifest_hash"],
+                })
+            repository.create_members(members, context)
         return dataset_id
     finally:
         kernel.close()
@@ -901,6 +893,23 @@ def create_composite_dataset(
             "diff_hash": metadata["diff_hash"],
             "notes": "Metadata-only composition; all source components remain independently FROZEN.",
         }
+        _persist_composite_manifest(
+            dataset_id, root, components, repository, context,
+        )
+        return dataset_id
+    finally:
+        kernel.close()
+
+
+def _persist_composite_manifest(
+    dataset_id: str,
+    root: dict[str, Any],
+    components: Sequence[DatasetComponent],
+    repository: DatasetRepository,
+    context: RunContext,
+) -> None:
+    """Persist the composite root and its components under one lifecycle lock."""
+    with repository.lifecycle_lock(dataset_id):
         try:
             existing = repository.manifest(dataset_id, context)
         except ValueError:
@@ -910,9 +919,8 @@ def create_composite_dataset(
         else:
             _assert_resumable_composite_manifest(existing, root)
 
-        component_rows = []
-        for ordinal, component in enumerate(components):
-            component_rows.append({
+        component_rows = [
+            {
                 "ordinal": ordinal,
                 "component_dataset_id": component.dataset_id,
                 "effective_from": component.effective_from,
@@ -920,8 +928,12 @@ def create_composite_dataset(
                 "component_input_manifest_hash": component.input_manifest_hash,
                 "component_manifest_hash": component.manifest_hash,
                 "component_baseline_tag": component.baseline_tag,
-                "component_baseline_quality_report_hash": component.baseline_quality_report_hash,
-            })
+                "component_baseline_quality_report_hash": (
+                    component.baseline_quality_report_hash
+                ),
+            }
+            for ordinal, component in enumerate(components)
+        ]
         assert_resumable_component_prefix(
             repository.composition_components(
                 dataset_id, context, allow_empty=True,
@@ -929,9 +941,6 @@ def create_composite_dataset(
             component_rows,
         )
         repository.create_composition_components(dataset_id, component_rows, context)
-        return dataset_id
-    finally:
-        kernel.close()
 
 
 def _validate_composite_dataset_impl(
@@ -1295,7 +1304,7 @@ def _materialized_hashes(dataset_id: str) -> dict[str, Any]:
     }
 
 
-def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
+def _validate_dataset_unlocked(dataset_id: str) -> dict[str, Any]:
     kernel, repository, context = _read_service("validate")
     try:
         manifest = repository.manifest(dataset_id, context)
@@ -1418,6 +1427,29 @@ def _validate_dataset_impl(dataset_id: str) -> dict[str, Any]:
         kernel.close()
 
 
+def _validate_dataset_impl(
+    dataset_id: str, *, resume_failed: bool = False,
+) -> dict[str, Any]:
+    lock_kernel, repository, _context = _read_service("validate-lifecycle-lock")
+    try:
+        with repository.lifecycle_lock(dataset_id):
+            try:
+                if resume_failed:
+                    changed = repository.resume_failed(
+                        dataset_id, _context,
+                    )
+                    if changed != 1:
+                        raise RuntimeError(
+                            f"只能在 FAILED Dataset 上恢复校验: {dataset_id}"
+                        )
+                return _validate_dataset_unlocked(dataset_id)
+            except Exception as exc:
+                _mark_dataset_validation_failed(dataset_id, exc)
+                raise
+    finally:
+        lock_kernel.close()
+
+
 def _mark_dataset_validation_failed(dataset_id: str, exc: Exception) -> None:
     kernel, repository, context = _read_service("validate-failed")
     try:
@@ -1431,12 +1463,10 @@ def _mark_dataset_validation_failed(dataset_id: str, exc: Exception) -> None:
         kernel.close()
 
 
-def validate_dataset(dataset_id: str) -> dict[str, Any]:
-    try:
-        return _validate_dataset_impl(dataset_id)
-    except Exception as exc:
-        _mark_dataset_validation_failed(dataset_id, exc)
-        raise
+def validate_dataset(
+    dataset_id: str, *, resume_failed: bool = False,
+) -> dict[str, Any]:
+    return _validate_dataset_impl(dataset_id, resume_failed=resume_failed)
 
 
 def freeze_dataset(
@@ -1455,31 +1485,32 @@ def freeze_dataset(
         archive_hash, archive_size = _sha256_file(code_archive_path)
     kernel, repository, context = _read_service("freeze")
     try:
-        manifest = repository.manifest(dataset_id, context)
-        if manifest["status"] != "VALIDATED":
-            raise RuntimeError(f"只有 VALIDATED Dataset 可冻结: {manifest['status']}")
-        contract_rows = repository.research_snapshot_contracts(dataset_id, context)
-        contract_schemas = {
-            str(row["research_schema_version"]) for row in contract_rows
-        }
-        if contract_rows and all(is_foundation_schema(schema) for schema in contract_schemas):
-            if not _foundation_contract_audit_is_present(manifest):
-                raise RuntimeError(
-                    "Foundation V2 Dataset 缺少通过财务来源身份门禁的验收记录，"
-                    "必须重新 validate 后才能冻结"
-                )
-        _check_baseline(manifest["baseline"], manifest["evaluation_end"], expected_quality_report_hash=manifest.get("baseline_quality_report_hash"), expected_source_manifest_hash=manifest.get("baseline_source_manifest_hash"))
-        _assert_build_code_current(
-            manifest,
-            metadata,
-            allow_validation_only=allow_validation_only,
-        )
-        changed = repository.transition_manifest(
-            context, dataset_id, ("VALIDATED",), "FROZEN",
-            {"code_archive_path": code_archive_path, "code_archive_sha256": archive_hash, "code_archive_size_bytes": archive_size, "code_version": metadata["code_version"], "git_commit": metadata["commit"], "git_dirty": metadata["dirty"], "diff_hash": metadata["diff_hash"]},
-        )
-        if changed != 1:
-            raise RuntimeError("Backtest Dataset 状态在冻结期间发生变化，拒绝并发冻结")
+        with repository.lifecycle_lock(dataset_id):
+            manifest = repository.manifest(dataset_id, context)
+            if manifest["status"] != "VALIDATED":
+                raise RuntimeError(f"只有 VALIDATED Dataset 可冻结: {manifest['status']}")
+            contract_rows = repository.research_snapshot_contracts(dataset_id, context)
+            contract_schemas = {
+                str(row["research_schema_version"]) for row in contract_rows
+            }
+            if contract_rows and all(is_foundation_schema(schema) for schema in contract_schemas):
+                if not _foundation_contract_audit_is_present(manifest):
+                    raise RuntimeError(
+                        "Foundation V2 Dataset 缺少通过财务来源身份门禁的验收记录，"
+                        "必须重新 validate 后才能冻结"
+                    )
+            _check_baseline(manifest["baseline"], manifest["evaluation_end"], expected_quality_report_hash=manifest.get("baseline_quality_report_hash"), expected_source_manifest_hash=manifest.get("baseline_source_manifest_hash"))
+            _assert_build_code_current(
+                manifest,
+                metadata,
+                allow_validation_only=allow_validation_only,
+            )
+            changed = repository.transition_manifest(
+                context, dataset_id, ("VALIDATED",), "FROZEN",
+                {"code_archive_path": code_archive_path, "code_archive_sha256": archive_hash, "code_archive_size_bytes": archive_size, "code_version": metadata["code_version"], "git_commit": metadata["commit"], "git_dirty": metadata["dirty"], "diff_hash": metadata["diff_hash"]},
+            )
+            if changed != 1:
+                raise RuntimeError("Backtest Dataset 状态在冻结期间发生变化，拒绝并发冻结")
     finally:
         kernel.close()
 

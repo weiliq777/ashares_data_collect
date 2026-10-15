@@ -7,6 +7,11 @@ from typing import Iterable
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
 from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.snapshot_lifecycle import (
+    MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
+    require_snapshot_batch,
+    snapshot_id_batches,
+)
 
 
 class SnapshotSeriesRepository(BaseRepository):
@@ -104,20 +109,28 @@ class SnapshotSeriesRepository(BaseRepository):
         )[0]["value"] or 0)
 
     def existing_snapshots(self, dates: Iterable[date], baseline_tag: str, schema_version: str, context: RunContext) -> dict[date, tuple[str, str]]:
-        dates = tuple(dates)
-        if not dates:
-            return {}
-        rows = self.kernel.read._repository_query(
-            context, "research.snapshot_manifest",
-            """SELECT research_cutoff_date, snapshot_id, status
-                 FROM research.snapshot_manifest
-                WHERE data_baseline_tag=%s AND schema_version=%s
-                  AND research_cutoff_date=ANY(%s::date[])""",
-            params=(baseline_tag, schema_version, list(dates)),
-            scope=WorkScope(date_from=min(dates), date_to=max(dates), partition="snapshot:series"),
-            max_rows=len(dates),
-        )
-        return {row["research_cutoff_date"]: (str(row["snapshot_id"]), row["status"]) for row in rows}
+        unique_dates = tuple(dict.fromkeys(dates))
+        result = {}
+        for offset in range(0, len(unique_dates), MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE):
+            batch = unique_dates[offset:offset + MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE]
+            rows = self.kernel.read._repository_query(
+                context, "research.snapshot_manifest",
+                """SELECT research_cutoff_date, snapshot_id, status
+                     FROM research.snapshot_manifest
+                    WHERE data_baseline_tag=%s AND schema_version=%s
+                      AND research_cutoff_date=ANY(%s::date[])""",
+                params=(baseline_tag, schema_version, list(batch)),
+                scope=WorkScope(
+                    date_from=min(batch), date_to=max(batch),
+                    partition="snapshot:series",
+                ),
+                max_rows=len(batch) + 1,
+            )
+            result.update({
+                row["research_cutoff_date"]: (str(row["snapshot_id"]), row["status"])
+                for row in rows
+            })
+        return result
 
     def incomplete_building_snapshots(
         self,
@@ -132,45 +145,51 @@ class SnapshotSeriesRepository(BaseRepository):
         to validation.  The check is scoped to the target ids and reads the
         small snapshot_input index rather than joining the large child tables.
         """
-        ids = tuple(str(value) for value in snapshot_ids)
-        if not ids:
+        batches = snapshot_id_batches(snapshot_ids)
+        if not batches:
             return ()
         if expected_input_count <= 0:
             raise ValueError("expected_input_count must be positive")
-        rows = self.kernel.read._repository_query(
-            context,
-            "research.snapshot_manifest",
-            """SELECT m.snapshot_id
-                 FROM research.snapshot_manifest m
-                 LEFT JOIN (
-                    SELECT snapshot_id, COUNT(*) AS input_count
-                      FROM research.snapshot_input
-                     WHERE snapshot_id=ANY(%s::uuid[])
-                     GROUP BY snapshot_id
-                 ) i ON i.snapshot_id=m.snapshot_id
-                WHERE m.snapshot_id=ANY(%s::uuid[])
-                  AND m.status='BUILDING'
-                  AND COALESCE(i.input_count,0)<>%s""",
-            (list(ids), list(ids), expected_input_count),
-            WorkScope(partition="snapshot:incomplete-builds"),
-            max_rows=len(ids),
-        )
-        return tuple(str(row["snapshot_id"]) for row in rows)
+        incomplete = []
+        for ids in batches:
+            rows = self.kernel.read._repository_query(
+                context,
+                "research.snapshot_manifest",
+                """SELECT m.snapshot_id
+                     FROM research.snapshot_manifest m
+                     LEFT JOIN (
+                        SELECT snapshot_id, COUNT(*) AS input_count
+                          FROM research.snapshot_input
+                         WHERE snapshot_id=ANY(%s::uuid[])
+                         GROUP BY snapshot_id
+                     ) i ON i.snapshot_id=m.snapshot_id
+                    WHERE m.snapshot_id=ANY(%s::uuid[])
+                      AND m.status='BUILDING'
+                      AND COALESCE(i.input_count,0)<>%s""",
+                (list(ids), list(ids), expected_input_count),
+                WorkScope(partition="snapshot:incomplete-builds"),
+                max_rows=len(ids) + 1,
+            )
+            incomplete.extend(str(row["snapshot_id"]) for row in rows)
+        return tuple(incomplete)
 
     def reset_building(self, snapshot_ids: Iterable[str], reason: str, context: RunContext) -> int:
-        ids = tuple(str(value) for value in snapshot_ids)
+        ids = require_snapshot_batch(snapshot_ids, "snapshot reset")
         if not ids:
             return 0
         scope = WorkScope(partition="snapshot:series-reset", dimensions={"snapshot_ids": ids})
-        return self.kernel.write.fail_building_snapshots(
-            context=context, scope=scope, snapshot_ids=ids, reason=reason,
-        )
+        with self.kernel.lock_manager.session_exclusive_many(
+            "research.snapshot", ids, wait=True,
+        ):
+            return self.kernel.write.fail_building_snapshots(
+                context=context, scope=scope, snapshot_ids=ids, reason=reason,
+            )
 
     def reopen_validated_snapshots(
         self, snapshot_ids: Iterable[str], reason: str, context: RunContext,
     ) -> int:
         """Reopen explicitly selected, not-yet-frozen snapshots for repair."""
-        ids = tuple(str(value) for value in snapshot_ids)
+        ids = require_snapshot_batch(snapshot_ids, "snapshot reopen")
         if not ids:
             return 0
         if not reason.strip():
@@ -179,19 +198,22 @@ class SnapshotSeriesRepository(BaseRepository):
             partition="snapshot:series-reopen",
             dimensions={"snapshot_ids": ids},
         )
-        changed = self.kernel.write.transition_snapshot_manifests(
-            context=context,
-            scope=scope,
-            rows=[
-                {
-                    "snapshot_id": snapshot_id,
-                    "failure_reason": f"PRE_FREEZE_REPAIR: {reason[:1980]}",
-                }
-                for snapshot_id in ids
-            ],
-            from_statuses=("VALIDATED",),
-            to_status="FAILED",
-        )
+        with self.kernel.lock_manager.session_exclusive_many(
+            "research.snapshot", ids, wait=True,
+        ):
+            changed = self.kernel.write.transition_snapshot_manifests(
+                context=context,
+                scope=scope,
+                rows=[
+                    {
+                        "snapshot_id": snapshot_id,
+                        "failure_reason": f"PRE_FREEZE_REPAIR: {reason[:1980]}",
+                    }
+                    for snapshot_id in ids
+                ],
+                from_statuses=("VALIDATED",),
+                to_status="FAILED",
+            )
         if changed != len(ids):
             raise RuntimeError(
                 f"reopen VALIDATED snapshot count mismatch: expected {len(ids)}, got {changed}"
@@ -207,7 +229,7 @@ class SnapshotSeriesRepository(BaseRepository):
         same transaction, so a crash cannot leave a manifest claiming v2
         while its children still belong to the legacy representation.
         """
-        ids = tuple(str(value) for value in snapshot_ids)
+        ids = require_snapshot_batch(snapshot_ids, "lineage v2 rebuild preparation")
         if not ids:
             return 0
         if not reason.strip():
@@ -216,6 +238,9 @@ class SnapshotSeriesRepository(BaseRepository):
             partition="snapshot:lineage-v2-rebuild",
             dimensions={"snapshot_ids": ids},
         )
-        return self.kernel.write.prepare_snapshot_lineage_v2_rebuild(
-            context=context, scope=scope, snapshot_ids=ids, reason=reason,
-        )
+        with self.kernel.lock_manager.session_exclusive_many(
+            "research.snapshot", ids, wait=True,
+        ):
+            return self.kernel.write.prepare_snapshot_lineage_v2_rebuild(
+                context=context, scope=scope, snapshot_ids=ids, reason=reason,
+            )

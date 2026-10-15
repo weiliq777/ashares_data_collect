@@ -191,6 +191,9 @@ def test_production_quality_empty_calendar_is_fail_closed(monkeypatch):
         def close(self):
             pass
 
+        def record_run_failure(self, context, exc):
+            pass
+
     monkeypatch.setattr(quality, "DataAccessKernel", lambda **kwargs: FakeKernel())
     monkeypatch.setattr(quality, "Phase2RawRepository", lambda kernel: EmptyCalendar())
     with pytest.raises(RuntimeError, match="no trading days"):

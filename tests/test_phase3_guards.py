@@ -222,7 +222,7 @@ def test_monte_carlo_records_method_input_hash_and_parameters():
 def _simple_bar(day):
     return MarketBar(
         day, "000001.SZ", 10.0, 10.2, 9.8, 10.0,
-        volume=1000, amount=10000,
+        volume=1000, amount=10000, up_limit=11.0, down_limit=9.0,
     )
 
 

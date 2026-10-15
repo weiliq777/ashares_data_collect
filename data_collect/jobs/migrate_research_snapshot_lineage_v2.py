@@ -19,9 +19,16 @@ from uuid import uuid4
 from data_collect.data_access import DataAccessKernel, RunContext
 from data_collect.data_access.checkpoint import Checkpoint, PostgresCheckpointStore
 from data_collect.data_access.policy_catalog import build_default_registry
-from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
+from data_collect.data_access.repository.research_snapshot_repository import (
+    ResearchBaseline,
+    ResearchSnapshotRepository,
+)
 from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
 from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.snapshot_lifecycle import (
+    MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
+    snapshot_id_batches,
+)
 from data_collect.jobs.research_snapshot import (
     _baseline,
     _quality_report,
@@ -42,7 +49,20 @@ JOB_NAME = "migrate_research_snapshot_lineage_v2"
 def _validate_legacy_lineage_v2_batch(
     snapshot_repository: ResearchSnapshotRepository,
     snapshot_ids: list[str],
-    baseline: tuple,
+    baseline: ResearchBaseline,
+    quality_hash: str,
+    context: RunContext,
+) -> None:
+    with snapshot_repository.lifecycle_locks(snapshot_ids):
+        _validate_legacy_lineage_v2_batch_locked(
+            snapshot_repository, snapshot_ids, baseline, quality_hash, context,
+        )
+
+
+def _validate_legacy_lineage_v2_batch_locked(
+    snapshot_repository: ResearchSnapshotRepository,
+    snapshot_ids: list[str],
+    baseline: ResearchBaseline,
     quality_hash: str,
     context: RunContext,
 ) -> None:
@@ -79,7 +99,7 @@ def _validate_legacy_lineage_v2_batch(
 def _build_migration_batch(
     snapshot_repository: ResearchSnapshotRepository,
     snapshot_ids: list[str],
-    baseline: tuple,
+    baseline: ResearchBaseline,
     quality_report: dict,
     quality_hash: str,
     context: RunContext,
@@ -126,7 +146,7 @@ def _build_migration_batch(
 def _validate_migration_batch(
     snapshot_repository: ResearchSnapshotRepository,
     snapshot_ids: list[str],
-    baseline: tuple,
+    baseline: ResearchBaseline,
     quality_report: dict,
     quality_hash: str,
     context: RunContext,
@@ -180,8 +200,11 @@ def run(
         expected_snapshots=expected_snapshots,
         exchange=exchange,
     )
-    if batch_size < 1 or batch_size > 20:
-        raise ValueError("batch_size must be between 1 and 20")
+    if batch_size < 1 or batch_size > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+        raise ValueError(
+            "batch_size must be between 1 and "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+        )
 
     kernel = DataAccessKernel(policy_registry=build_default_registry())
     context = RunContext(
@@ -199,7 +222,7 @@ def run(
             selector.end, selector.baseline_tag, verify_source_manifest=False,
         )
         quality_report, quality_hash = _quality_report(
-            baseline[1], selector.schema_version, baseline,
+            baseline.baseline_cutoff_date, selector.schema_version, baseline,
         )
         if quality_report["failures"]:
             raise RuntimeError(
@@ -231,15 +254,24 @@ def run(
                 if record.lineage_storage_version == "v1"
             ]
             if v1_ids:
-                changed = repository.prepare_lineage_v2_rebuild(
-                    v1_ids,
-                    "compact partitioned lineage rebuild; Raw/Standard/PIT/Feature remain read-only",
-                    context,
-                )
-                if changed != len(v1_ids):
-                    raise RuntimeError(
-                        f"lineage v2 metadata switch mismatch: expected {len(v1_ids)}, got {changed}"
+                metadata_switched = 0
+                for batch in snapshot_id_batches(v1_ids, batch_size):
+                    changed = repository.prepare_lineage_v2_rebuild(
+                        batch,
+                        (
+                            "compact partitioned lineage rebuild; "
+                            "Raw/Standard/PIT/Feature remain read-only"
+                        ),
+                        context,
                     )
+                    if changed != len(batch):
+                        raise RuntimeError(
+                            "lineage v2 metadata switch mismatch: "
+                            f"expected {len(batch)}, got {changed}"
+                        )
+                    metadata_switched += changed
+            else:
+                metadata_switched = 0
 
             checkpoint = Checkpoint(PostgresCheckpointStore())
             runner = SnapshotSeriesResume(
@@ -269,7 +301,7 @@ def run(
             )
             result = final_report.to_dict()
             result["lineage_storage_version"] = "v2"
-            result["metadata_switched"] = len(v1_ids)
+            result["metadata_switched"] = metadata_switched
             result["raw_standard_pit_feature_rebuilt"] = False
             print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
             return result

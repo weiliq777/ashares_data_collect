@@ -177,18 +177,20 @@ def create_replacement_dataset(
     # was already bound to the source Dataset.
     kernel, repository, context = _service("benchmark-repair")
     try:
-        changed = repository.transition_manifest(
-            context,
-            created_id,
-            ("DRAFT",),
-            "BUILDING",
-            {"failure_reason": None, "failed_at": None},
-        )
-        if changed != 1:
-            raise RuntimeError(
-                f"new replacement Dataset lifecycle changed before benchmark repair: {created_id}"
+        with repository.lifecycle_lock(created_id):
+            changed = repository.transition_manifest(
+                context,
+                created_id,
+                ("DRAFT",),
+                "BUILDING",
+                {"failure_reason": None, "failed_at": None},
             )
-        repository.bind_benchmark_source_repair(created_id, context)
+            if changed != 1:
+                raise RuntimeError(
+                    "new replacement Dataset lifecycle changed before benchmark repair: "
+                    f"{created_id}"
+                )
+            repository.bind_benchmark_source_repair(created_id, context)
     finally:
         kernel.close()
     return created_id

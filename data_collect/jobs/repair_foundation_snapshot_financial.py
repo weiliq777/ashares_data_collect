@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import date
+from itertools import groupby
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +23,9 @@ from data_collect.data_access.repository.research_snapshot_repository import (
 from data_collect.data_access.research_contract import (
     STRATEGY_NEUTRAL_SCHEMA_VERSION,
     is_foundation_schema,
+)
+from data_collect.data_access.snapshot_lifecycle import (
+    MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
 )
 from data_collect.jobs.research_snapshot import (
     _baseline,
@@ -127,6 +131,11 @@ def repair_dataset(
     code_archive_path: str | None = None,
     output_path: str | Path | None = None,
 ) -> dict:
+    if batch_size < 1 or batch_size > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+        raise ValueError(
+            "batch_size must be between 1 and "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+        )
     plan = prepare_repair(dataset_id, audit_path)
     target_schema = plan["target_schema_version"]
     if target_schema != "research-v2.1":
@@ -173,105 +182,121 @@ def repair_dataset(
     source_by_date = {row["research_date"]: row["snapshot_id"] for row in issue_rows}
     statuses = {}
     quality_reports: dict[str, tuple[dict, str]] = {}
+    pending_build = []
     try:
-        target_ids = [item["snapshot_id"] for item in created]
-        target_manifests = repository.snapshot_manifests(target_ids, context)
-        if len(target_manifests) != len(target_ids):
-            missing = [item for item in target_ids if item not in target_manifests]
-            raise RuntimeError(
-                f"replacement Snapshot manifest missing: {missing[:5]}"
-            )
-
-        # Check all existing targets and immutable sources in bounded batches.
-        # The old implementation performed three reads per target, which made
-        # a restart spend hours in preflight before any useful work resumed.
-        integrity_pairs = []
-        for row in issue_rows:
-            target_id = replacements_by_date[row["research_date"]]
-            target_manifest = target_manifests[target_id]
-            if target_manifest["status"] in {"BUILDING", "FAILED"}:
-                integrity_pairs.extend([
-                    (row["snapshot_id"], target_manifest["cutoff"]),
-                    (target_id, target_manifest["cutoff"]),
-                ])
-        materialization = {}
-        for offset in range(
-            0, len(integrity_pairs),
-            repository.REPLACEMENT_INTEGRITY_BATCH_SIZE,
+        # Each recovery query supplies source and target pairs, so preflight
+        # locks at most half the lifecycle limit per batch. Grouping by month
+        # also keeps the partition-pruned count query inside one bundle month.
+        preflight_batch_size = min(
+            batch_size, repository.REPLACEMENT_INTEGRITY_BATCH_SIZE // 2,
+        )
+        ordered_issue_rows = sorted(issue_rows, key=lambda row: row["research_date"])
+        for _month, month_rows_iter in groupby(
+            ordered_issue_rows, key=lambda row: row["research_date"][:7],
         ):
-            materialization.update(
-                repository.snapshot_materialization_counts_batch(
-                    integrity_pairs[
-                        offset:offset + repository.REPLACEMENT_INTEGRITY_BATCH_SIZE
-                    ],
-                    context,
-                )
-            )
+            month_rows = list(month_rows_iter)
+            for offset in range(0, len(month_rows), preflight_batch_size):
+                issue_batch = month_rows[offset:offset + preflight_batch_size]
+                target_ids = [
+                    replacements_by_date[row["research_date"]]
+                    for row in issue_batch
+                ]
+                with repository.lifecycle_locks(target_ids):
+                    target_manifests = repository.snapshot_manifests(target_ids, context)
+                    if len(target_manifests) != len(target_ids):
+                        missing = [item for item in target_ids if item not in target_manifests]
+                        raise RuntimeError(
+                            f"replacement Snapshot manifest missing: {missing[:5]}"
+                        )
 
-        pending_build = []
-        for row in issue_rows:
-            target_id = replacements_by_date[row["research_date"]]
-            source_id = source_by_date[row["research_date"]]
-            target_manifest = target_manifests[target_id]
-            statuses[target_id] = target_manifest["status"]
-            if not target_manifest.get("quality_report") or not target_manifest.get("quality_hash"):
-                raise RuntimeError(
-                    f"replacement Snapshot lacks its immutable quality evidence: {target_id}"
-                )
-            quality_reports[target_id] = (
-                target_manifest["quality_report"],
-                target_manifest["quality_hash"],
-            )
-            if target_manifest["status"] in {"BUILDING", "FAILED"}:
-                # A previous run can commit all children and then stop before
-                # lifecycle validation.  Conversely, it can stop halfway
-                # through the first child table.  Distinguish those states by
-                # bounded child counts so resume never rebuilds a complete
-                # replacement and never validates a partial one.
-                source_counts = materialization.get(source_id, {
-                    "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
-                })
-                target_counts = materialization.get(target_id, {
-                    "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
-                })
-                complete = (
-                    source_counts["stock_rows"] > 0
-                    and target_counts["stock_rows"] == source_counts["stock_rows"]
-                    and target_counts["bundle_rows"] == source_counts["stock_rows"]
-                    and target_counts["input_rows"] == source_counts["input_rows"]
-                )
-                if complete and target_manifest["status"] == "FAILED":
-                    changed = kernel.write.transition_snapshot_manifest(
-                        context,
-                        repository._snapshot_scope(target_id, target_manifest["cutoff"]),
-                        target_id,
-                        ("FAILED",),
-                        "BUILDING",
-                        {"failure_reason": None},
-                    )
-                    if changed != 1:
-                        raise RuntimeError(
-                            f"replacement lifecycle changed while resuming: {target_id}"
+                    integrity_pairs = []
+                    for row in issue_batch:
+                        target_id = replacements_by_date[row["research_date"]]
+                        target_manifest = target_manifests[target_id]
+                        if target_manifest["status"] in {"BUILDING", "FAILED"}:
+                            integrity_pairs.extend([
+                                (row["snapshot_id"], target_manifest["cutoff"]),
+                                (target_id, target_manifest["cutoff"]),
+                            ])
+                    materialization = repository.snapshot_materialization_counts_batch(
+                        integrity_pairs, context,
+                    ) if integrity_pairs else {}
+
+                    for row in issue_batch:
+                        target_id = replacements_by_date[row["research_date"]]
+                        source_id = source_by_date[row["research_date"]]
+                        target_manifest = target_manifests[target_id]
+                        statuses[target_id] = target_manifest["status"]
+                        if (
+                            not target_manifest.get("quality_report")
+                            or not target_manifest.get("quality_hash")
+                        ):
+                            raise RuntimeError(
+                                "replacement Snapshot lacks its immutable quality evidence: "
+                                f"{target_id}"
+                            )
+                        quality_reports[target_id] = (
+                            target_manifest["quality_report"],
+                            target_manifest["quality_hash"],
                         )
-                    statuses[target_id] = "BUILDING"
-                elif not complete and target_manifest["status"] == "BUILDING":
-                    changed = kernel.write.transition_snapshot_manifest(
-                        context,
-                        repository._snapshot_scope(target_id, target_manifest["cutoff"]),
-                        target_id,
-                        ("BUILDING",),
-                        "FAILED",
-                        {"failure_reason": "replacement materialization incomplete; rebuild required"},
-                    )
-                    if changed != 1:
-                        raise RuntimeError(
-                            f"replacement lifecycle changed while resetting: {target_id}"
-                        )
-                    statuses[target_id] = "FAILED"
-                if not complete:
-                    pending_build.append((target_id, source_id))
-            elif target_manifest["status"] == "DRAFT":
-                pending_build.append((target_id, source_id))
+                        if target_manifest["status"] in {"BUILDING", "FAILED"}:
+                            # Reuse a complete prior build; rebuild a partial one.
+                            source_counts = materialization.get(source_id, {
+                                "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
+                            })
+                            target_counts = materialization.get(target_id, {
+                                "stock_rows": 0, "bundle_rows": 0, "input_rows": 0,
+                            })
+                            complete = (
+                                source_counts["stock_rows"] > 0
+                                and target_counts["stock_rows"] == source_counts["stock_rows"]
+                                and target_counts["bundle_rows"] == source_counts["stock_rows"]
+                                and target_counts["input_rows"] == source_counts["input_rows"]
+                            )
+                            if complete and target_manifest["status"] == "FAILED":
+                                changed = kernel.write.transition_snapshot_manifest(
+                                    context,
+                                    repository._snapshot_scope(
+                                        target_id, target_manifest["cutoff"],
+                                    ),
+                                    target_id,
+                                    ("FAILED",),
+                                    "BUILDING",
+                                    {"failure_reason": None},
+                                )
+                                if changed != 1:
+                                    raise RuntimeError(
+                                        "replacement lifecycle changed while resuming: "
+                                        f"{target_id}"
+                                    )
+                                statuses[target_id] = "BUILDING"
+                            elif not complete and target_manifest["status"] == "BUILDING":
+                                changed = kernel.write.transition_snapshot_manifest(
+                                    context,
+                                    repository._snapshot_scope(
+                                        target_id, target_manifest["cutoff"],
+                                    ),
+                                    target_id,
+                                    ("BUILDING",),
+                                    "FAILED",
+                                    {
+                                        "failure_reason": (
+                                            "replacement materialization incomplete; "
+                                            "rebuild required"
+                                        )
+                                    },
+                                )
+                                if changed != 1:
+                                    raise RuntimeError(
+                                        "replacement lifecycle changed while resetting: "
+                                        f"{target_id}"
+                                    )
+                                statuses[target_id] = "FAILED"
+                            if not complete:
+                                pending_build.append((target_id, source_id))
+                        elif target_manifest["status"] == "DRAFT":
+                            pending_build.append((target_id, source_id))
+
         for offset in range(0, len(pending_build), batch_size):
             batch = pending_build[offset:offset + batch_size]
             for target_id, source_id in batch:
@@ -372,8 +397,11 @@ def main(argv=None) -> int:
     parser.add_argument("--code-archive-path")
     parser.add_argument("--output")
     args = parser.parse_args(argv)
-    if args.batch_size <= 0 or args.batch_size > 20:
-        parser.error("--batch-size must be between 1 and 20")
+    if not 1 <= args.batch_size <= MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+        parser.error(
+            "--batch-size must be between 1 and "
+            f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+        )
     result = repair_dataset(
         args.dataset_id,
         args.audit,

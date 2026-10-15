@@ -19,6 +19,7 @@ from .models import (
     Observation,
     PositionLotState,
     SignalIntent,
+    normalize_execution_limit,
 )
 from .risk import (
     FeeRule,
@@ -54,7 +55,7 @@ class BacktestConfig:
     reserve_cash_pct: float = 0.10
     market_rule: MarketRule = field(default_factory=MarketRule)
     fee_rule: FeeRule = field(default_factory=FeeRule)
-    execution_model_version: str = "daily-next-open-v3"
+    execution_model_version: str = "daily-next-open-v4"
     random_seed: int = 42
     force_liquidate_at_end: bool = False
     max_portfolio_risk_pct: float | None = None
@@ -370,8 +371,9 @@ class FundamentalValueGrowthTrendStrategy:
 class BacktestEngine:
     """日线、只做多、T 收盘出信号/T+1 开盘执行的确定性撮合器。
 
-    开盘模型假设：未停牌且开盘价没有封死对应涨跌停时，以日线开盘价为撮合基准价，
-    再应用配置的滑点。
+    开盘模型假设：未停牌、涨跌停价均已知且开盘价没有封死对应方向的涨跌停时，
+    以日线开盘价为撮合基准价，再应用配置的滑点。涨跌停价对缺失或任一价格无效时
+    按不可撮合处理。
     日线不含集合竞价排队和盘口深度，因此这个假设不保证真实订单一定能成交。
     收盘派生的 ``can_buy``/``can_sell`` 仅表示日终状态，不参与盘中成交门禁。
     """
@@ -1330,27 +1332,28 @@ class BacktestEngine:
         # limit_status is normally derived from the closing price.  Using it to
         # decide an opening fill would leak information from later in the day.
         # Opening orders therefore compare only raw_open with the numeric limit.
+        # A missing/invalid directional limit is unknown, not proof of tradability.
         # For an intraday stop, daily bars can prove non-executability only for a
         # one-price locked limit day; merely touching/closing at the limit is not
         # enough to retroactively reject an earlier stop.
+        upper_limit = normalize_execution_limit(bar.up_limit)
+        lower_limit = normalize_execution_limit(bar.down_limit)
+        if upper_limit is None or lower_limit is None or bar.raw_open is None:
+            return True
         if direction == "BUY":
-            if bar.up_limit is None or bar.raw_open is None:
-                return False
             if not intraday:
-                return bar.raw_open >= bar.up_limit - 1e-9
+                return bar.raw_open >= upper_limit - 1e-9
             return (
-                bar.raw_open >= bar.up_limit - 1e-9
+                bar.raw_open >= upper_limit - 1e-9
                 and bar.raw_low is not None
-                and bar.raw_low >= bar.up_limit - 1e-9
+                and bar.raw_low >= upper_limit - 1e-9
             )
-        if bar.down_limit is None or bar.raw_open is None:
-            return False
         if not intraday:
-            return bar.raw_open <= bar.down_limit + 1e-9
+            return bar.raw_open <= lower_limit + 1e-9
         return (
-            bar.raw_open <= bar.down_limit + 1e-9
+            bar.raw_open <= lower_limit + 1e-9
             and bar.raw_high is not None
-            and bar.raw_high <= bar.down_limit + 1e-9
+            and bar.raw_high <= lower_limit + 1e-9
         )
 
     def _make_fill(self, order: dict[str, Any], day: date, price: float, shares: int,

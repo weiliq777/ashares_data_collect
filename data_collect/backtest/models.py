@@ -19,6 +19,31 @@ def _as_date(value: date | datetime | str) -> date:
     return date.fromisoformat(str(value))
 
 
+_INVALID_EXECUTION_LIMIT_THRESHOLD = 99999.0
+
+
+def normalize_execution_limit(value: Any) -> float | None:
+    """Return a usable price limit, or ``None`` when the limit is unknown.
+
+    Tushare uses large sentinel values for instruments/dates without a usable
+    limit. The Dataset materializer and execution engine share this rule so an
+    unknown limit cannot silently become permission to trade.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(numeric)
+        or numeric <= 0
+        or numeric >= _INVALID_EXECUTION_LIMIT_THRESHOLD
+    ):
+        return None
+    return numeric
+
+
 @dataclass(frozen=True, slots=True)
 class MarketBar:
     trade_date: date

@@ -18,6 +18,7 @@ from data_collect.data_access.bulk_loader import (
     copy_or_execute_values,
     create_projection_staging,
 )
+from data_collect.data_access.snapshot_lifecycle import require_snapshot_batch
 
 
 class WriteGateway:
@@ -995,7 +996,7 @@ class WriteGateway:
         self, context: RunContext, scope: WorkScope, snapshot_ids: Sequence[str], reason: str,
     ) -> int:
         """Mark only BUILDING snapshots as FAILED; FROZEN rows remain immutable."""
-        ids = tuple(str(value) for value in snapshot_ids)
+        ids = require_snapshot_batch(snapshot_ids, "snapshot failure transition")
         if not ids:
             return 0
         plan = SqlPlan(operation=Operation.UPSERT, target="research.snapshot_manifest", scope=scope, expected_mode="ROW_BASED", estimated_rows=len(ids))
@@ -1097,9 +1098,9 @@ class WriteGateway:
             raise TypeError(
                 "set_snapshot_lineage_storage_version requires RunContext and WorkScope"
             )
-        ids = tuple(str(snapshot_id) for snapshot_id in snapshot_ids)
-        if not ids or len(ids) > self._kernel.transaction_manager.config.max_rows_per_tx:
-            raise ValueError("snapshot lineage version migration batch is out of bounds")
+        ids = require_snapshot_batch(
+            snapshot_ids, "snapshot lineage version migration", allow_empty=False,
+        )
         if from_version not in {"v1", "v2"} or to_version not in {"v1", "v2"}:
             raise ValueError("unsupported snapshot lineage storage version")
         if from_version == to_version:
@@ -1145,9 +1146,9 @@ class WriteGateway:
             raise TypeError(
                 "prepare_snapshot_lineage_v2_rebuild requires RunContext and WorkScope"
             )
-        ids = tuple(str(snapshot_id) for snapshot_id in snapshot_ids)
-        if not ids or len(ids) > self._kernel.transaction_manager.config.max_rows_per_tx:
-            raise ValueError("snapshot lineage v2 rebuild batch is out of bounds")
+        ids = require_snapshot_batch(
+            snapshot_ids, "snapshot lineage v2 rebuild", allow_empty=False,
+        )
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("snapshot lineage v2 rebuild reason must not be blank")
         plan = SqlPlan(
@@ -1373,6 +1374,12 @@ class WriteGateway:
             raise TypeError("snapshot manifest transition requires RunContext and WorkScope")
         if not rows or not from_statuses or not str(to_status).strip():
             raise ValueError("snapshot manifest transition arguments are incomplete")
+        if any("snapshot_id" not in row for row in rows):
+            raise ValueError("snapshot manifest transition requires snapshot_id")
+        require_snapshot_batch(
+            (row["snapshot_id"] for row in rows), "snapshot manifest transition",
+            allow_empty=False,
+        )
         transitions = {
             "DRAFT": {"BUILDING", "FAILED"}, "FAILED": {"BUILDING", "FAILED"},
             "BUILDING": {"BUILDING", "VALIDATED", "FAILED"}, "VALIDATED": {"FROZEN", "FAILED"},
@@ -1388,8 +1395,6 @@ class WriteGateway:
         mutable = set().union(*(set(row) - {"snapshot_id"} for row in rows))
         if not mutable <= allowed:
             raise ValueError(f"unsupported snapshot manifest fields: {sorted(mutable - allowed)}")
-        if any("snapshot_id" not in row for row in rows):
-            raise ValueError("snapshot manifest transition requires snapshot_id")
         columns = tuple(sorted(mutable - {"status"}))
         if any(set(row) - {"snapshot_id", "status", *columns} for row in rows):
             raise ValueError("snapshot manifest transition rows must have a stable field set")

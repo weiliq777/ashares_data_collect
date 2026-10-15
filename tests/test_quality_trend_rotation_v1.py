@@ -64,6 +64,8 @@ def _bar(day, code, amount=60_000_000.0):
         raw_close=10.0,
         volume=100_000.0,
         amount=amount,
+        up_limit=15.0,
+        down_limit=5.0,
     )
 
 
@@ -247,14 +249,18 @@ def test_target_value_engine_retries_failed_sell_on_each_following_trading_day()
                 )]
             return []
 
-    bars = {
-        (day, "000001.SZ"): MarketBar(
-            day, "000001.SZ", 10.0, 10.2, 9.8, 10.0,
+    bars = {}
+    for day in days:
+        locked_at_lower_limit = day == days[2]
+        bars[(day, "000001.SZ")] = MarketBar(
+            day, "000001.SZ", 10.0,
+            10.0 if locked_at_lower_limit else 10.2,
+            10.0 if locked_at_lower_limit else 9.8,
+            10.0,
             volume=100_000.0, amount=1_000_000.0,
-            can_sell=(day != days[2]),
+            up_limit=11.0,
+            down_limit=10.0 if locked_at_lower_limit else 9.0,
         )
-        for day in days
-    }
     dataset = BacktestDataset(
         dataset_id="target-engine-fixture", calendar=days,
         warmup_start=days[0], evaluation_start=days[0], evaluation_end=days[-1],

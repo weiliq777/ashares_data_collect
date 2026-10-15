@@ -254,39 +254,93 @@ def _build_dataset_batched(dataset_id: str, *, batch_days: int = 5, force_rebuil
         raise ValueError("batch_days 必须在 1..5 之间")
     kernel, repository, context = _source_service(dataset_id, date.today())
     try:
-        manifest, boundaries, metadata = _prepare_manifest(dataset_id, repository, context)
-        batches = _trading_batches(dataset_id, batch_days, repository, context)
-        if force_rebuild:
-            repository.delete_batch_checkpoints(dataset_id, context)
-        results = []
-        for index, (batch_start, batch_end, _days) in enumerate(batches, start=1):
-            checkpoint = _batch_checkpoint(dataset_id, batch_start, repository, context)
-            checkpoint_is_eligible = (
-                not force_rebuild
-                and checkpoint
-                and checkpoint["status"] == "COMPLETED"
-                and checkpoint["batch_end"] == batch_end
-                and checkpoint["code_version"] == metadata["code_version"]
-                and (checkpoint.get("details") or {}).get("diff_hash") == metadata["diff_hash"]
-                and checkpoint["batch_hash"]
+        with repository.lifecycle_lock(dataset_id):
+            return _build_dataset_batched_locked(
+                dataset_id,
+                batch_days=batch_days,
+                force_rebuild=force_rebuild,
+                repository=repository,
+                context=context,
             )
-            if checkpoint_is_eligible:
-                expected_rows = int(checkpoint["row_count"] or 0)
-                actual_rows = repository.execution_row_count(
-                    dataset_id, batch_start, batch_end, context
-                )
-                if actual_rows == expected_rows:
-                    results.append({"batch_start": batch_start, "batch_end": batch_end, "rows": expected_rows, "skipped": True})
-                    _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
-                    continue
-            results.append(_build_execution_batch(dataset_id, batch_start, batch_end, _days, boundaries, metadata["code_version"], metadata["diff_hash"], repository, context))
-            _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
-        repository.rebuild_auxiliary(dataset_id, manifest, boundaries, context)
-        result = _finalize_build(dataset_id, manifest, metadata, repository, context)
-        result.update({"batch_days": batch_days, "batches": len(batches), "skipped_batches": sum(1 for item in results if item.get("skipped"))})
-        return result
     finally:
         kernel.close()
+
+
+def _build_dataset_batched_locked(
+    dataset_id: str,
+    *,
+    batch_days: int,
+    force_rebuild: bool,
+    repository: DatasetRepository,
+    context: RunContext,
+) -> dict[str, Any]:
+    """Build while holding the Dataset lifecycle lock across every write."""
+    manifest = repository.manifest(dataset_id, context)
+    if force_rebuild and manifest["status"] == "VALIDATED":
+        changed = repository.transition_manifest(
+            context,
+            dataset_id,
+            ("VALIDATED",),
+            "FAILED",
+            {
+                "failure_reason": "explicit force rebuild requested after validation",
+                "failed_at": None,
+                "validated_at": None,
+                "quality_report": None,
+                "quality_report_hash": None,
+                "calendar_hash": None,
+                "rules_hash": None,
+                "execution_hash": None,
+                "corporate_action_hash": None,
+                "benchmark_hash": None,
+                "input_manifest_hash": None,
+                "code_version": None,
+                "git_commit": None,
+                # dataset_manifest.git_dirty is NOT NULL; FALSE is the
+                # explicit cleared sentinel before the next build writes the
+                # actual current-worktree identity.
+                "git_dirty": False,
+                "diff_hash": None,
+                "code_archive_path": None,
+                "code_archive_sha256": None,
+                "code_archive_size_bytes": None,
+            },
+        )
+        if changed != 1:
+            raise RuntimeError(
+                f"failed to reopen validated Dataset for explicit rebuild: {dataset_id}"
+            )
+    manifest, boundaries, metadata = _prepare_manifest(dataset_id, repository, context)
+    batches = _trading_batches(dataset_id, batch_days, repository, context)
+    if force_rebuild:
+        repository.delete_batch_checkpoints(dataset_id, context)
+    results = []
+    for index, (batch_start, batch_end, _days) in enumerate(batches, start=1):
+        checkpoint = _batch_checkpoint(dataset_id, batch_start, repository, context)
+        checkpoint_is_eligible = (
+            not force_rebuild
+            and checkpoint
+            and checkpoint["status"] == "COMPLETED"
+            and checkpoint["batch_end"] == batch_end
+            and checkpoint["code_version"] == metadata["code_version"]
+            and (checkpoint.get("details") or {}).get("diff_hash") == metadata["diff_hash"]
+            and checkpoint["batch_hash"]
+        )
+        if checkpoint_is_eligible:
+            expected_rows = int(checkpoint["row_count"] or 0)
+            actual_rows = repository.execution_row_count(
+                dataset_id, batch_start, batch_end, context
+            )
+            if actual_rows == expected_rows:
+                results.append({"batch_start": batch_start, "batch_end": batch_end, "rows": expected_rows, "skipped": True})
+                _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
+                continue
+        results.append(_build_execution_batch(dataset_id, batch_start, batch_end, _days, boundaries, metadata["code_version"], metadata["diff_hash"], repository, context))
+        _set_checkpoint(dataset_id, "BUILD", "RUNNING", progress_done=index, progress_total=len(batches), last_trade_date=batch_end, details={"mode": "date_batched_resumable", "batch_days": batch_days})
+    repository.rebuild_auxiliary(dataset_id, manifest, boundaries, context)
+    result = _finalize_build(dataset_id, manifest, metadata, repository, context)
+    result.update({"batch_days": batch_days, "batches": len(batches), "skipped_batches": sum(1 for item in results if item.get("skipped"))})
+    return result
 
 
 @warehouse_write_job

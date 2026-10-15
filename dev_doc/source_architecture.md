@@ -1,6 +1,6 @@
 # 源码架构现状
 
-> 核对日期：2026-10-11。本文按当前工作区的 Python 源码、示例配置、SQL 迁移和测试整理；不读取本机 `config.yaml`、数据库或外部服务，因此不代表某个部署环境的运行状态。具体行为以代码和迁移为准。
+> 核对日期：2026-10-12。本文按当前工作区的 Python 源码、示例配置、SQL 迁移和测试整理；不读取本机 `config.yaml`、数据库或外部服务，因此不代表某个部署环境的运行状态。具体行为以代码和迁移为准。
 
 ## 系统轮廓
 
@@ -102,6 +102,12 @@ production_instrument_raw
 主要研究链由相应 Job 与 Repository 组织：市场数据和 Feature 发布后，Research Snapshot 将输入固定下来；Backtest Dataset 再固定回测所需行情、快照和规则，供 `data_collect/backtest/engine.py` 纯 Python 执行。具体可用状态须检查数据库中的发布记录，不能从源码结构推断某个 Snapshot 或 Dataset 已存在。
 
 `data_collect/backtest/strategy/quality_trend_rotation_v1.py` 定义策略信号规则，`strategy/contract.py` 固定信号与执行时点契约。`decision/` 产生待审阅候选；`portfolio/` 只模拟经人工批准的纸面意图。两个 Dashboard 从 Repository 读取已有结果，不是数据生产入口。
+
+Backtest Dataset 的创建、物化构建、校验（含 FAILED 恢复）、基准修复、替换 Dataset 准备、组合 Dataset 组件写入和冻结，共用按 Dataset ID 区分的 PostgreSQL 会话级生命周期锁。生命周期操作按顺序等待同一 Dataset 的锁；不同 Dataset 可并行。长时间流式校验只占用对应 Dataset 的锁，不占用全局仓库写锁，避免校验看到分批构建中的部分物料并将过期哈希证明冻结。
+
+Research Snapshot 的构建、单条/批量校验和单条/批量冻结，以及系列恢复、重开和 lineage 重建准备，也共用按 Snapshot ID 区分的 PostgreSQL 会话级生命周期锁；批量操作按稳定 ID 顺序取锁。构建开始后的异常在锁释放前将仍处于 `BUILDING` 的 Snapshot 标记为 `FAILED`，避免验证器观察到半成品。只读诊断查询不改变生命周期状态，因此不获取该锁。
+
+开盘撮合使用涨跌停价和当日开盘价判断是否封板；涨跌停价对缺失或任一价格无效时按不可撮合处理。日终派生的 `can_buy`/`can_sell` 不作为开盘门禁，避免把收盘状态带入开盘决策。日线不能证明集合竞价排队或实际流动性，因此通过该门禁仍只是回测假设。该撮合语义由 `daily-next-open-v4` 标识。
 
 ## 查阅代码的入口
 

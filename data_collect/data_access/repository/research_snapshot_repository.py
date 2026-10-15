@@ -8,15 +8,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import date
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, NamedTuple
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
 from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.snapshot_lifecycle import (
+    MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
+    require_snapshot_batch,
+    snapshot_id_batches,
+)
 
 
 _IMMUTABLE_INPUT_STATS_CACHE: dict[tuple, dict[str, Any]] = {}
+
+
+class ResearchBaseline(NamedTuple):
+    """Validated release evidence shared by Research Snapshot operations.
+
+    This remains a tuple for compatibility with existing internal callers,
+    while named fields make the repository contract explicit.
+    """
+
+    release_tag: str
+    baseline_cutoff_date: date
+    status: str
+    quality_report_hash: str
+    source_manifest_hash: str
+    source_manifest: dict[str, Any]
+    schema_version: str | None
+    quality_report: dict[str, Any] | None = None
 
 
 class ResearchSnapshotRepository(BaseRepository):
@@ -71,6 +94,53 @@ class ResearchSnapshotRepository(BaseRepository):
         "fundamental_history",
     )
     MAX_SNAPSHOT_CODES = 20_000
+
+    @contextmanager
+    def lifecycle_lock(self, snapshot_id: str):
+        """Serialize one Snapshot's build, validation, and freeze lifecycle."""
+        with self.kernel.lock_manager.session_exclusive(
+            "research.snapshot", str(snapshot_id), wait=True,
+        ):
+            yield
+
+    @contextmanager
+    def lifecycle_locks(self, snapshot_ids: Iterable[str]):
+        """Acquire one bounded set of Snapshot lifecycle locks in stable order."""
+        ids = require_snapshot_batch(
+            snapshot_ids, "snapshot lifecycle lock", allow_empty=False,
+        )
+        with self.kernel.lock_manager.session_exclusive_many(
+            "research.snapshot", ids, wait=True,
+        ):
+            yield
+
+    @contextmanager
+    def _snapshot_build_locks(
+        self, snapshot_ids: Iterable[str], context: RunContext,
+    ):
+        """Mark started builds failed before releasing their lifecycle locks."""
+        started: list[tuple[str, date]] = []
+        with self.lifecycle_locks(snapshot_ids):
+            try:
+                yield started
+            except Exception as exc:
+                reason = str(exc)[:2000]
+                for snapshot_id, cutoff in started:
+                    try:
+                        self.kernel.write.transition_snapshot_manifest(
+                            context,
+                            self._snapshot_scope(snapshot_id, cutoff),
+                            snapshot_id,
+                            ("BUILDING",),
+                            "FAILED",
+                            {"failure_reason": reason},
+                        )
+                    except Exception:
+                        # Keep the original build error; incomplete BUILDING
+                        # data is still rejected by the acceptance checks.
+                        pass
+                raise
+
     # A timeout means the database rolled back the whole typed Gateway
     # statement.  Split the exact code set and retry only the smaller
     # idempotent unit; never increase the statement deadline or retry an
@@ -1450,10 +1520,21 @@ class ResearchSnapshotRepository(BaseRepository):
         pairs = [(str(snapshot_id), cutoff) for snapshot_id, cutoff in snapshot_dates]
         if not pairs:
             return {}
+        if len(pairs) != len(set(pairs)):
+            raise ValueError("snapshot materialization count batches require unique pairs")
+        if len(pairs) > self.REPLACEMENT_INTEGRITY_BATCH_SIZE:
+            raise ValueError(
+                "snapshot materialization count batches are limited to "
+                f"{self.REPLACEMENT_INTEGRITY_BATCH_SIZE} pairs"
+            )
         if any(not isinstance(cutoff, date) for _snapshot_id, cutoff in pairs):
             raise TypeError("snapshot materialization cutoff must be date values")
         range_start = min(cutoff for _snapshot_id, cutoff in pairs)
         range_end = max(cutoff for _snapshot_id, cutoff in pairs)
+        if (range_start.year, range_start.month) != (range_end.year, range_end.month):
+            raise ValueError(
+                "snapshot materialization count batches must stay within one month"
+            )
         rows = self.kernel.read._repository_query(
             context,
             "research.stock_snapshot_daily",
@@ -1519,31 +1600,31 @@ class ResearchSnapshotRepository(BaseRepository):
     def snapshot_manifests(
         self, snapshot_ids: Iterable[str], context: RunContext,
     ) -> dict[str, dict[str, Any]]:
-        """Read replacement manifests in one bounded metadata query."""
-        ids = tuple(dict.fromkeys(str(value) for value in snapshot_ids))
-        if not ids:
-            return {}
-        rows = self.kernel.read._repository_query(
-            context,
-            "research.snapshot_manifest",
-            """
-            SELECT snapshot_id, research_cutoff_date AS cutoff,
-                   data_baseline_tag AS baseline, schema_version, status,
-                   lineage_storage_version, code_version, git_commit,
-                   git_dirty, diff_hash, code_archive_path, code_archive_sha256,
-                   code_archive_size_bytes AS code_archive_size,
-                   quality_report_hash AS quality_hash,
-                   baseline_quality_report_hash AS baseline_quality_hash,
-                   baseline_source_manifest_hash, input_manifest_hash AS input_hash,
-                   quality_report
-              FROM research.snapshot_manifest
-             WHERE snapshot_id=ANY(%s::uuid[])
-            """,
-            (list(ids),),
-            WorkScope(partition="snapshot:replacement-manifests"),
-            max_rows=len(ids) + 1,
-        )
-        return {str(row["snapshot_id"]): row for row in rows}
+        """Read manifests through bounded primary-key lookups."""
+        result: dict[str, dict[str, Any]] = {}
+        for ids in snapshot_id_batches(snapshot_ids):
+            rows = self.kernel.read._repository_query(
+                context,
+                "research.snapshot_manifest",
+                """
+                SELECT snapshot_id, research_cutoff_date AS cutoff,
+                       data_baseline_tag AS baseline, schema_version, status,
+                       lineage_storage_version, code_version, git_commit,
+                       git_dirty, diff_hash, code_archive_path, code_archive_sha256,
+                       code_archive_size_bytes AS code_archive_size,
+                       quality_report_hash AS quality_hash,
+                       baseline_quality_report_hash AS baseline_quality_hash,
+                       baseline_source_manifest_hash, input_manifest_hash AS input_hash,
+                       quality_report
+                  FROM research.snapshot_manifest
+                 WHERE snapshot_id=ANY(%s::uuid[])
+                """,
+                (list(ids),),
+                WorkScope(partition="snapshot:replacement-manifests"),
+                max_rows=len(ids) + 1,
+            )
+            result.update({str(row["snapshot_id"]): row for row in rows})
+        return result
 
     def materialize_legacy_lineage_v2(
         self,
@@ -1558,11 +1639,9 @@ class ResearchSnapshotRepository(BaseRepository):
         responsible for proving that they are complete before VALIDATED is
         restored.
         """
-        ids = tuple(str(value) for value in snapshot_ids)
+        ids = require_snapshot_batch(snapshot_ids, "legacy lineage migration")
         if not ids:
             return {}
-        if len(ids) > 20:
-            raise ValueError("legacy lineage migration batches are limited to 20 snapshots")
 
         results: dict[str, int] = {}
         sql = self.legacy_lineage_bundle_sql()
@@ -1586,22 +1665,26 @@ class ResearchSnapshotRepository(BaseRepository):
 
             cutoff = manifest["cutoff"]
             snapshot_scope = self._snapshot_scope(snapshot_id, cutoff)
-            with self.kernel.lock_manager.session_exclusive(
-                "research.snapshot", snapshot_id,
-            ):
-                changed = self.kernel.write.transition_snapshot_manifest(
-                    context,
-                    snapshot_scope,
-                    snapshot_id,
-                    ("DRAFT", "FAILED"),
-                    "BUILDING",
-                    {"failure_reason": None},
-                )
+            with self._snapshot_build_locks((snapshot_id,), context) as started:
+                try:
+                    changed = self.kernel.write.transition_snapshot_manifest(
+                        context,
+                        snapshot_scope,
+                        snapshot_id,
+                        ("DRAFT", "FAILED"),
+                        "BUILDING",
+                        {"failure_reason": None},
+                    )
+                except Exception:
+                    # A commit can succeed even if its response is lost.
+                    started.append((snapshot_id, cutoff))
+                    raise
                 if changed != 1:
                     raise RuntimeError(
                         "snapshot lifecycle changed before legacy lineage migration: "
                         f"{snapshot_id}"
                     )
+                started.append((snapshot_id, cutoff))
 
                 # A previous interrupted v2 attempt may have left a partial
                 # bundle.  Clear only that physical representation.  The
@@ -1851,15 +1934,18 @@ class ResearchSnapshotRepository(BaseRepository):
         if self.lineage_target(target) != self.BUNDLE_LINEAGE_TARGET:
             raise RuntimeError("Foundation replacement requires compact lineage v2")
         try:
-            with self.kernel.lock_manager.session_exclusive(
-                "research.snapshot", str(snapshot_id),
-            ):
-                changed = self.kernel.write.transition_snapshot_manifest(
-                    context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
-                    {"failure_reason": None},
-                )
+            with self._snapshot_build_locks((snapshot_id,), context) as started:
+                try:
+                    changed = self.kernel.write.transition_snapshot_manifest(
+                        context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
+                        {"failure_reason": None},
+                    )
+                except Exception:
+                    started.append((str(snapshot_id), cutoff))
+                    raise
                 if changed != 1:
                     raise RuntimeError("replacement Snapshot lifecycle changed before build")
+                started.append((str(snapshot_id), cutoff))
                 for child in (
                     self.BUNDLE_LINEAGE_TARGET,
                     "research.stock_snapshot_daily",
@@ -1994,19 +2080,14 @@ class ResearchSnapshotRepository(BaseRepository):
                     "financial_rows": enriched,
                     "lineage_rows": bundled,
                 }
-        except Exception as exc:
-            self.kernel.write.transition_snapshot_manifest(
-                context, scope, snapshot_id,
-                ("DRAFT", "BUILDING", "FAILED"), "FAILED",
-                {"failure_reason": str(exc)[:2000]},
-            )
+        except Exception:
             raise
 
     def build_snapshot(
         self,
         snapshot_id: str,
         manifest: dict[str, Any],
-        baseline: tuple,
+        baseline: ResearchBaseline,
         quality_report: dict[str, Any],
         quality_hash: str,
         metadata: dict[str, Any],
@@ -2021,7 +2102,7 @@ class ResearchSnapshotRepository(BaseRepository):
         lineage_target = self.lineage_target(manifest)
         try:
             stats, input_manifest_hash = self._precompute_input_manifest(
-                definitions, cutoff, baseline[5], context, row_bytes, manifest_hash,
+                definitions, cutoff, baseline.source_manifest, context, row_bytes, manifest_hash,
             )
             input_rows = [
                 {
@@ -2033,24 +2114,32 @@ class ResearchSnapshotRepository(BaseRepository):
                 }
                 for item in stats
             ]
-            with self.kernel.lock_manager.session_exclusive("research.snapshot", str(snapshot_id)):
-                changed = self.kernel.write.transition_snapshot_manifest(
-                    context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
-                    {
-                        "quality_report_hash": quality_hash,
-                        "quality_report": json.dumps(quality_report, ensure_ascii=False, default=str),
-                        "code_version": metadata["code_version"], "git_commit": metadata["commit"],
-                        "git_dirty": metadata["dirty"], "diff_hash": metadata["diff_hash"],
-                        "failure_reason": None,
-                    },
-                )
+            with self._snapshot_build_locks((snapshot_id,), context) as started:
+                try:
+                    changed = self.kernel.write.transition_snapshot_manifest(
+                        context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
+                        {
+                            "quality_report_hash": quality_hash,
+                            "quality_report": json.dumps(
+                                quality_report, ensure_ascii=False, default=str,
+                            ),
+                            "code_version": metadata["code_version"],
+                            "git_commit": metadata["commit"],
+                            "git_dirty": metadata["dirty"], "diff_hash": metadata["diff_hash"],
+                            "failure_reason": None,
+                        },
+                    )
+                except Exception:
+                    started.append((str(snapshot_id), cutoff))
+                    raise
                 if changed != 1:
                     raise RuntimeError("Snapshot 状态在构建期间发生变化")
+                started.append((str(snapshot_id), cutoff))
                 for target in (
                     lineage_target, "research.stock_snapshot_daily", "research.snapshot_input",
                 ):
                     self._delete_snapshot_rows(snapshot_id, context, target, cutoff)
-                high_water = baseline[5]["append_only_sources"]["tushare_stock_basic_raw_version"]["max_record_id"]
+                high_water = baseline.source_manifest["append_only_sources"]["tushare_stock_basic_raw_version"]["max_record_id"]
                 if high_water is None:
                     raise RuntimeError("基线缺少 stock_basic Raw 版本高水位")
                 stock_plan = SqlPlan(
@@ -2149,17 +2238,13 @@ class ResearchSnapshotRepository(BaseRepository):
                 )
                 if changed != 1:
                     raise RuntimeError("Snapshot 输入 Manifest 更新失败")
-        except Exception as exc:
-            self.kernel.write.transition_snapshot_manifest(
-                context, scope, snapshot_id, ("DRAFT", "BUILDING", "FAILED"), "FAILED",
-                {"failure_reason": str(exc)[:2000]},
-            )
+        except Exception:
             raise
 
     def build_snapshots_batch(
         self,
         manifests: list[dict[str, Any]],
-        baseline: tuple,
+        baseline: ResearchBaseline,
         quality_reports: dict[str, tuple[dict, str]],
         metadata: dict[str, Any],
         definitions,
@@ -2179,8 +2264,11 @@ class ResearchSnapshotRepository(BaseRepository):
         """
         if not manifests:
             return
-        if len(manifests) > 20:
-            raise ValueError("snapshot build batches are limited to 20")
+        if len(manifests) > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+            raise ValueError(
+                "snapshot build batches are limited to "
+                f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+            )
         ids = tuple(str(item["snapshot_id"]) for item in manifests)
         cutoffs = tuple(item["cutoff"] for item in manifests)
         if len(set(ids)) != len(ids) or len(set(cutoffs)) != len(cutoffs):
@@ -2203,8 +2291,8 @@ class ResearchSnapshotRepository(BaseRepository):
                     f"批量构建只允许 DRAFT/FAILED Snapshot: {snapshot_id} ({manifest['status']})"
                 )
             if (
-                baseline[3] != manifest["baseline_quality_hash"]
-                or baseline[4] != manifest["baseline_source_manifest_hash"]
+                baseline.quality_report_hash != manifest["baseline_quality_hash"]
+                or baseline.source_manifest_hash != manifest["baseline_source_manifest_hash"]
             ):
                 raise RuntimeError("数据基线 Manifest 已变化，拒绝批量构建")
             report, quality_hash = quality_reports.get(snapshot_id, (None, None))
@@ -2213,7 +2301,7 @@ class ResearchSnapshotRepository(BaseRepository):
             if report["failures"]:
                 raise RuntimeError(f"质量门禁未通过: {manifest['cutoff']} {report['failures']}")
             stats, input_hash = self._precompute_input_manifest(
-                definitions, manifest["cutoff"], baseline[5], context, row_bytes, manifest_hash,
+                definitions, manifest["cutoff"], baseline.source_manifest, context, row_bytes, manifest_hash,
             )
             prepared.append({
                 "manifest": manifest,
@@ -2245,36 +2333,34 @@ class ResearchSnapshotRepository(BaseRepository):
                 "snapshot_ids": ids,
             },
         )
-        started: list[dict[str, Any]] = []
+        started: list[tuple[str, date]] = []
         try:
-            with self.kernel.lock_manager.session_exclusive_many("research.snapshot", ids):
+            with self._snapshot_build_locks(ids, context) as started:
                 for item in prepared:
                     manifest = item["manifest"]
                     snapshot_id = str(manifest["snapshot_id"])
                     scope = self._snapshot_scope(snapshot_id, manifest["cutoff"])
-                    changed = self.kernel.write.transition_snapshot_manifest(
-                        context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
-                        {
-                            "quality_report_hash": item["quality_hash"],
-                            "quality_report": json.dumps(
-                                item["report"], ensure_ascii=False, default=str,
-                            ),
-                            "code_version": metadata["code_version"],
-                            "git_commit": metadata["commit"],
-                            "git_dirty": metadata["dirty"],
-                            "diff_hash": metadata["diff_hash"],
-                            "failure_reason": None,
-                        },
-                    )
+                    try:
+                        changed = self.kernel.write.transition_snapshot_manifest(
+                            context, scope, snapshot_id, ("DRAFT", "FAILED"), "BUILDING",
+                            {
+                                "quality_report_hash": item["quality_hash"],
+                                "quality_report": json.dumps(
+                                    item["report"], ensure_ascii=False, default=str,
+                                ),
+                                "code_version": metadata["code_version"],
+                                "git_commit": metadata["commit"],
+                                "git_dirty": metadata["dirty"],
+                                "diff_hash": metadata["diff_hash"],
+                                "failure_reason": None,
+                            },
+                        )
+                    except Exception:
+                        started.append((snapshot_id, manifest["cutoff"]))
+                        raise
                     if changed != 1:
                         raise RuntimeError(f"Snapshot 状态在构建期间发生变化: {snapshot_id}")
-                    # The manifest is now BUILDING, so register it for
-                    # failure recovery before any child cleanup starts. If a
-                    # delete times out or the connection is lost, leaving a
-                    # BUILDING row outside ``started`` could make the next
-                    # resume validate stale child rows instead of rebuilding
-                    # them.
-                    started.append(item)
+                    started.append((snapshot_id, manifest["cutoff"]))
                     for target in (
                         lineage_target,
                         "research.stock_snapshot_daily",
@@ -2282,7 +2368,7 @@ class ResearchSnapshotRepository(BaseRepository):
                     ):
                         self._delete_snapshot_rows(snapshot_id, context, target, manifest["cutoff"])
 
-                high_water = baseline[5]["append_only_sources"][
+                high_water = baseline.source_manifest["append_only_sources"][
                     "tushare_stock_basic_raw_version"
                 ]["max_record_id"]
                 if high_water is None:
@@ -2417,25 +2503,10 @@ class ResearchSnapshotRepository(BaseRepository):
                     )
                     if changed != 1:
                         raise RuntimeError(f"Snapshot 输入 Manifest 更新失败: {snapshot_id}")
-        except Exception as exc:
-            reason = f"batch build failed: {str(exc)[:1900]}"
-            for item in started:
-                manifest = item["manifest"]
-                try:
-                    self.kernel.write.transition_snapshot_manifest(
-                        context,
-                        self._snapshot_scope(str(manifest["snapshot_id"]), manifest["cutoff"]),
-                        str(manifest["snapshot_id"]),
-                        ("DRAFT", "BUILDING", "FAILED"), "FAILED",
-                        {"failure_reason": reason},
-                    )
-                except Exception:
-                    # Preserve the original batch error; the next resume will
-                    # inspect BUILDING completeness before rebuilding.
-                    pass
+        except Exception:
             raise
 
-    def validate_snapshot(self, manifest: dict[str, Any], baseline: tuple, quality_hash: str,
+    def validate_snapshot(self, manifest: dict[str, Any], baseline: ResearchBaseline, quality_hash: str,
                           issues: list[dict[str, Any]], context: RunContext) -> None:
         if issues:
             raise RuntimeError(f"Research 快照校验失败: {issues}")
@@ -2639,7 +2710,7 @@ class ResearchSnapshotRepository(BaseRepository):
         tag: str,
         context: RunContext,
         verify_source_manifest: bool = True,
-    ) -> tuple:
+    ) -> ResearchBaseline:
         rows = self.kernel.read._repository_query(
             context,
             "ops.tushare_data_release",
@@ -2663,7 +2734,7 @@ class ResearchSnapshotRepository(BaseRepository):
             _, current_hash = ReleaseRepository(self.kernel).source_manifest(row["baseline_cutoff_date"], context)
             if current_hash != row["source_manifest_hash"]:
                 raise RuntimeError(f"baseline source manifest changed; rebuild release: {tag}")
-        return (
+        return ResearchBaseline(
             row["release_tag"], row["baseline_cutoff_date"], row["status"],
             row["quality_report_hash"], row["source_manifest_hash"],
             row["source_manifest"], row["schema_version"], row["quality_report"],
@@ -2683,17 +2754,28 @@ class ResearchSnapshotRepository(BaseRepository):
     def existing_snapshots(self, cutoffs: list[date], baseline_tag: str, schema_version: str, context: RunContext) -> dict[date, tuple[str, str]]:
         if not cutoffs:
             return {}
-        rows = self.kernel.read._repository_query(
-            context, "research.snapshot_manifest",
-            """SELECT snapshot_id, research_cutoff_date, status
-                 FROM research.snapshot_manifest
-                WHERE data_baseline_tag=%s AND schema_version=%s
-                  AND research_cutoff_date=ANY(%s::date[])""",
-            (baseline_tag, schema_version, list(cutoffs)),
-            WorkScope(date_from=min(cutoffs), date_to=max(cutoffs), partition="snapshot-manifest-batch"),
-            max_rows=max(2, len(cutoffs) + 1),
-        )
-        return {row["research_cutoff_date"]: (str(row["snapshot_id"]), row["status"]) for row in rows}
+        result = {}
+        dates = tuple(dict.fromkeys(cutoffs))
+        for offset in range(0, len(dates), MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE):
+            batch = dates[offset:offset + MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE]
+            rows = self.kernel.read._repository_query(
+                context, "research.snapshot_manifest",
+                """SELECT snapshot_id, research_cutoff_date, status
+                     FROM research.snapshot_manifest
+                    WHERE data_baseline_tag=%s AND schema_version=%s
+                      AND research_cutoff_date=ANY(%s::date[])""",
+                (baseline_tag, schema_version, list(batch)),
+                WorkScope(
+                    date_from=min(batch), date_to=max(batch),
+                    partition="snapshot-manifest-batch",
+                ),
+                max_rows=len(batch) + 1,
+            )
+            result.update({
+                row["research_cutoff_date"]: (str(row["snapshot_id"]), row["status"])
+                for row in rows
+            })
+        return result
 
     def create_manifests(
         self, candidates: list[dict[str, Any]], context: RunContext,
@@ -2774,6 +2856,11 @@ class ResearchSnapshotRepository(BaseRepository):
     def price_vintage_dates(self, cutoffs: list[date], snapshot_ids: list[str], schema_version: str, context: RunContext) -> None:
         if not cutoffs or (not is_foundation_schema(schema_version) and schema_version != "research-v1.3"):
             return
+        if len(cutoffs) > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+            raise ValueError(
+                "snapshot price vintage batches are limited to "
+                f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+            )
         rows = self.kernel.read._repository_query(
             context, "feature.price_daily_v2",
             """WITH dates(trade_date) AS (SELECT unnest(%s::date[])),
@@ -3129,8 +3216,15 @@ class ResearchSnapshotRepository(BaseRepository):
         """
         if not manifests:
             return {}
-        if len(manifests) > 100:
-            raise ValueError("snapshot inspection batches are limited to 100")
+        if len(manifests) > MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE:
+            raise ValueError(
+                "snapshot inspection batches are limited to "
+                f"{MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE}"
+            )
+        require_snapshot_batch(
+            (item["snapshot_id"] for item in manifests), "snapshot inspection batch",
+            allow_empty=False,
+        )
         ids = [str(item["snapshot_id"]) for item in manifests]
         cutoffs = [item["cutoff"] for item in manifests]
         lineage_targets = {self.lineage_target(item) for item in manifests}
