@@ -420,6 +420,71 @@ def test_dataset_research_snapshot_contracts_are_joined_in_one_bounded_read():
     assert query["params"] == ("dataset-1",)
 
 
+def test_frozen_dataset_inventory_is_newest_first_and_capped():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    rows = DatasetRepository(kernel).frozen_inventory(ctx(), limit=25)
+    assert rows == []
+    query = conn.executed[-1]["sql"]
+    assert "WHERE status='FROZEN'" in query
+    assert "ORDER BY frozen_at DESC NULLS LAST" in query
+    assert "LIMIT 25" in query
+
+
+def test_observation_field_coverage_uses_fixed_fields_and_dataset_scope():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    coverage = DatasetRepository(kernel).observation_field_coverage(
+        "dataset-1", date(2024, 1, 1), date(2024, 1, 31), ctx()
+    )
+    assert coverage["row_count"] == 0
+    assert "roe_ttm" in coverage["fields"]
+    query = conn.executed[-1]["sql"]
+    assert "COUNT(s.raw_close) AS raw_close_count" in query
+    assert "COUNT(s.financial_data_available_timestamp)" in query
+    assert "WHERE m.dataset_id=%s" in query
+    assert "m.research_date BETWEEN %s AND %s" in query
+    assert conn.executed[-1]["params"] == (
+        "dataset-1", date(2024, 1, 1), date(2024, 1, 31),
+    )
+
+
+def test_composite_member_validation_and_field_coverage_follow_component_ranges():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = DatasetRepository(kernel)
+    repository._component_cache["composite-1"] = [{
+        "ordinal": 1,
+        "component_dataset_id": "component-1",
+        "effective_from": date(2024, 1, 1),
+        "effective_to": date(2024, 12, 31),
+    }]
+
+    assert repository.member_validation_rows("composite-1", ctx()) == []
+    repository.observation_field_coverage(
+        "composite-1", date(2024, 1, 1), date(2024, 12, 31), ctx()
+    )
+
+    queries = [entry["sql"] for entry in conn.executed]
+    assert len(queries) == 2
+    assert all("WITH components AS" in query for query in queries)
+    assert all("m.research_date BETWEEN c.effective_from AND c.effective_to" in query for query in queries)
+    assert "m.research_date BETWEEN %s AND %s" in queries[1]
+    assert all("composite_dataset_id=%s" in query for query in queries)
+
+
 def test_instrument_repository_keeps_legacy_raw_first_seen_only():
     from data_collect.data_access.repository.instrument_repository import InstrumentRepository
 

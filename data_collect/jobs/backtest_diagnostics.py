@@ -28,7 +28,7 @@ from data_collect.evaluation.markdown import (
 from data_collect.evaluation.standard import build_capital_sensitivity, build_standard_evaluation
 
 
-_FORWARD_HORIZONS = (5, 10, 20, 40)
+_FORWARD_HORIZONS = (5, 10, 20, 40, 60)
 
 
 def _json_object(value: Any) -> dict[str, Any]:

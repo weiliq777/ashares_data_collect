@@ -471,6 +471,8 @@ def test_foundation_financial_contract_rejects_legacy_lineage_and_missing_identi
     assert "financial_source_fingerprint" in sql
     assert "financial_source_record_key IS DISTINCT FROM source_record_key" in sql
     assert "financial_data_available_timestamp IS NULL" in sql
+    assert "future_financial_availability_rows" in sql
+    assert "(research_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'" in sql
     assert "b.research_date BETWEEN %s AND %s" in sql
 
 
@@ -508,6 +510,64 @@ def test_foundation_financial_contract_is_batched_and_uses_direct_source_lookup(
     assert [len(call[2][0]) for call in calls] == [5, 1]
     assert all("source_map" not in call[1] for call in calls)
     assert all(call[5 - 1] == max(2, len(call[2][0]) + 1) for call in calls)
+
+
+def test_foundation_financial_contract_flags_future_available_v2_rows():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+
+    def fake_query(context, target, sql, params, scope, max_rows):
+        return [{
+            "snapshot_id": params[0][0],
+            "snapshot_rows": 10,
+            "missing_lineage_rows": 0,
+            "non_v2_source_rows": 0,
+            "invalid_v2_rows": 0,
+            "future_financial_availability_rows": 2,
+        }]
+
+    repository.kernel = SimpleNamespace(
+        read=SimpleNamespace(_repository_query=fake_query)
+    )
+    manifests = [{
+        "snapshot_id": "snapshot-1",
+        "cutoff": date(2026, 8, 1),
+        "schema_version": "research-v2.0",
+    }]
+
+    assert repository.foundation_financial_contract_issues(manifests, object()) == {
+        "snapshot-1": {
+            "snapshot_rows": 10,
+            "missing_lineage_rows": 0,
+            "non_v2_source_rows": 0,
+            "invalid_v2_rows": 0,
+            "future_financial_availability_rows": 2,
+        }
+    }
+
+
+def test_foundation_financial_contract_flags_requested_snapshot_with_no_rows():
+    repository = ResearchSnapshotRepository.__new__(ResearchSnapshotRepository)
+    repository.kernel = SimpleNamespace(
+        read=SimpleNamespace(
+            _repository_query=lambda context, target, sql, params, scope, max_rows: []
+        )
+    )
+    manifests = [{
+        "snapshot_id": "snapshot-missing",
+        "cutoff": date(2026, 8, 1),
+        "schema_version": "research-v2.0",
+    }]
+
+    assert repository.foundation_financial_contract_issues(manifests, object()) == {
+        "snapshot-missing": {
+            "snapshot_rows": 0,
+            "missing_snapshot_rows": 1,
+            "missing_lineage_rows": 0,
+            "non_v2_source_rows": 0,
+            "invalid_v2_rows": 0,
+            "future_financial_availability_rows": 0,
+        }
+    }
 
 
 def test_lineage_contract_has_all_required_groups():

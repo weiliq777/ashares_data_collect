@@ -12,6 +12,15 @@ from data_collect.data_access.repository.base import BaseRepository
 
 
 class DatasetRepository(BaseRepository):
+    OBSERVATION_COVERAGE_FIELDS = (
+        "raw_close", "return_20d", "return_60d", "ma20", "ma60",
+        "volume_ratio_20d", "total_mv", "pe_ttm", "pe_pct_5y",
+        "roe_5y_min", "roe_5y_all_above_15", "ocf_3y_all_positive",
+        "q_sales_yoy_4q_all_above_30", "roe_ttm", "operating_cashflow_ttm",
+        "debt_to_assets", "financial_source_record_key",
+        "financial_payload_hash", "financial_data_available_timestamp",
+    )
+
     def __init__(self, kernel) -> None:
         super().__init__(kernel)
         # A streaming backtest asks for bars/observations once per date. Cache
@@ -627,19 +636,89 @@ class DatasetRepository(BaseRepository):
         return [row["research_date"] for row in rows]
 
     def member_validation_rows(self, dataset_id: str, context: RunContext) -> list[tuple]:
-        rows = self.kernel.read._repository_query(
-            context, "backtest.dataset_member",
-            """SELECT m.research_date, m.member_role, m.snapshot_input_hash,
-                              s.status, s.schema_version, m.observation_row_count,
-                              m.execution_row_count, m.execution_hash,
-                              m.corporate_action_hash, m.quality_status
-                         FROM backtest.dataset_member m
-                         JOIN research.snapshot_manifest s ON s.snapshot_id=m.research_snapshot_id
-                        WHERE m.dataset_id=%s ORDER BY m.research_date""",
-            (dataset_id,), WorkScope(partition=dataset_id), 100_000,
-        )
+        components = self.composition_components(dataset_id, context)
+        if components:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_member",
+                self._component_cte() + """
+                SELECT m.research_date, m.member_role, m.snapshot_input_hash,
+                       s.status, s.schema_version, m.observation_row_count,
+                       m.execution_row_count, m.execution_hash,
+                       m.corporate_action_hash, m.quality_status
+                  FROM components c
+                  JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                   AND m.research_date BETWEEN c.effective_from AND c.effective_to
+                  JOIN research.snapshot_manifest s
+                    ON s.snapshot_id=m.research_snapshot_id
+                 ORDER BY m.research_date
+                """,
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
+        else:
+            rows = self.kernel.read._repository_query(
+                context, "backtest.dataset_member",
+                """SELECT m.research_date, m.member_role, m.snapshot_input_hash,
+                                  s.status, s.schema_version, m.observation_row_count,
+                                  m.execution_row_count, m.execution_hash,
+                                  m.corporate_action_hash, m.quality_status
+                             FROM backtest.dataset_member m
+                             JOIN research.snapshot_manifest s ON s.snapshot_id=m.research_snapshot_id
+                            WHERE m.dataset_id=%s ORDER BY m.research_date""",
+                (dataset_id,), WorkScope(partition=dataset_id), 100_000,
+            )
         keys = ("research_date", "member_role", "snapshot_input_hash", "status", "schema_version", "observation_row_count", "execution_row_count", "execution_hash", "corporate_action_hash", "quality_status")
         return [tuple(row[key] for key in keys) for row in rows]
+
+    def observation_field_coverage(
+        self, dataset_id: str, date_from, date_to, context: RunContext,
+    ) -> dict[str, Any]:
+        """Aggregate fixed strategy/research fields over one bounded date range."""
+        if date_from > date_to:
+            raise ValueError("observation coverage date_from must not exceed date_to")
+        fields = self.OBSERVATION_COVERAGE_FIELDS
+        selected = ",\n".join(
+            f"COUNT(s.{field}) AS {field}_count" for field in fields
+        )
+        components = self.composition_components(dataset_id, context)
+        if components:
+            sql = self._component_cte() + f"""
+                SELECT COUNT(*) AS row_count, {selected}
+                  FROM components c
+                  JOIN backtest.dataset_member m ON m.dataset_id=c.dataset_id
+                   AND m.research_date BETWEEN c.effective_from AND c.effective_to
+                  JOIN research.stock_snapshot_daily s
+                    ON s.snapshot_id=m.research_snapshot_id
+                   AND s.research_date=m.research_date
+                 WHERE m.research_date BETWEEN %s AND %s
+            """
+            params = (dataset_id, date_from, date_to)
+        else:
+            sql = f"""SELECT COUNT(*) AS row_count, {selected}
+                         FROM backtest.dataset_member m
+                         JOIN research.stock_snapshot_daily s
+                           ON s.snapshot_id=m.research_snapshot_id
+                          AND s.research_date=m.research_date
+                        WHERE m.dataset_id=%s
+                          AND m.research_date BETWEEN %s AND %s"""
+            params = (dataset_id, date_from, date_to)
+        rows = self.kernel.read._repository_query(
+            context,
+            "backtest.dataset_member",
+            sql,
+            params,
+            WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to),
+            2,
+        )
+        if not rows:
+            return {"row_count": 0, "fields": {field: 0 for field in fields}}
+        row = rows[0]
+        return {
+            "row_count": int(row.get("row_count") or 0),
+            "fields": {
+                field: int(row.get(f"{field}_count") or 0)
+                for field in fields
+            },
+        }
 
     def update_member_stats(self, dataset_id: str, rows: Sequence[dict[str, Any]], context: RunContext) -> int:
         materialized = [
@@ -815,6 +894,28 @@ class DatasetRepository(BaseRepository):
             rows[0].get("dataset_kind") or "MATERIALIZED"
         )
         return rows[0]
+
+    def frozen_inventory(
+        self, context: RunContext, *, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List a bounded, newest-first inventory of frozen Backtest Datasets."""
+        if limit < 1 or limit > 500:
+            raise ValueError("frozen Dataset inventory limit must be between 1 and 500")
+        return self.kernel.read._repository_query(
+            context,
+            "backtest.dataset_manifest",
+            f"""SELECT dataset_id, dataset_version, dataset_name, dataset_kind,
+                              status, warmup_start, evaluation_start, evaluation_end,
+                              out_of_sample_start, frozen_at, baseline_quality_report_hash,
+                              input_manifest_hash
+                         FROM backtest.dataset_manifest
+                        WHERE status='FROZEN'
+                        ORDER BY frozen_at DESC NULLS LAST, dataset_id
+                        LIMIT {int(limit)}""",
+            (),
+            WorkScope(partition="frozen-dataset-inventory"),
+            limit,
+        )
 
     def frozen_snapshot_ids(self, baseline_tag: str, schema_version: str, start, end, context: RunContext) -> list[str]:
         rows = self.kernel.read._repository_query(

@@ -145,6 +145,22 @@ class BacktestRunRepository(BaseRepository):
         )
         return rows[0] if rows else None
 
+    def diagnostic_dataset_kind(self, dataset_id: str, context: RunContext) -> str | None:
+        rows = self.kernel.read._repository_query(
+            context,
+            "backtest.dataset_manifest",
+            """SELECT dataset_kind
+                 FROM backtest.dataset_manifest
+                WHERE dataset_id=%s
+                LIMIT 2""",
+            (dataset_id,),
+            self._scope(dataset_id, dataset_id),
+            2,
+        )
+        if not rows:
+            return None
+        return str(rows[0].get("dataset_kind") or "MATERIALIZED").upper()
+
     def diagnostic_run_by_version(
         self,
         dataset_id: str,
@@ -222,6 +238,90 @@ class BacktestRunRepository(BaseRepository):
             (dataset_id, strategy_id, normalized),
             self._scope(dataset_id, dataset_id),
             10,
+        )
+        return rows
+
+    def readiness_run_inventory(
+        self,
+        dataset_id: str,
+        strategy_identities: list[tuple[str, str]],
+        capitals: list[float],
+        context: RunContext,
+    ) -> list[dict[str, Any]]:
+        """Return the preferred persisted Run for each current strategy/capital pair.
+
+        Successful Runs take precedence over incomplete attempts. The query is
+        restricted to one frozen Dataset, exact strategy/version identities,
+        and a caller-supplied small capital set.
+        """
+        normalized_identities = sorted({
+            (str(strategy_id).strip(), str(strategy_version).strip())
+            for strategy_id, strategy_version in strategy_identities
+            if str(strategy_id).strip() and str(strategy_version).strip()
+        })
+        normalized_capitals = sorted({float(value) for value in capitals if float(value) > 0})
+        if not normalized_identities or not normalized_capitals:
+            return []
+        if len(normalized_identities) > 10 or len(normalized_capitals) > 10:
+            raise ValueError("Run inventory accepts at most 10 strategy identities and 10 capitals")
+        identity_values = ", ".join("(%s, %s)" for _ in normalized_identities)
+        identity_params = [value for identity in normalized_identities for value in identity]
+        rows = self.kernel.read._repository_query(
+            context,
+            "backtest.run_manifest",
+            f"""WITH ranked AS (
+                         SELECT run_id, dataset_id, strategy_id, strategy_version,
+                                run_version, initial_cash, status, parameters,
+                                parameters_hash, input_hash, code_version,
+                                git_commit, git_dirty, diff_hash,
+                                execution_model_version, code_archive_sha256,
+                                created_at, started_at, finished_at, failure_reason,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY strategy_id, strategy_version, initial_cash
+                                    ORDER BY CASE WHEN status='SUCCEEDED' THEN 0 ELSE 1 END,
+                                             finished_at DESC NULLS LAST,
+                                             created_at DESC
+                                ) AS rank_no,
+                                FIRST_VALUE(run_id) OVER (
+                                    PARTITION BY strategy_id, strategy_version, initial_cash
+                                    ORDER BY created_at DESC NULLS LAST, run_id DESC
+                                ) AS latest_attempt_run_id,
+                                FIRST_VALUE(status) OVER (
+                                    PARTITION BY strategy_id, strategy_version, initial_cash
+                                    ORDER BY created_at DESC NULLS LAST, run_id DESC
+                                ) AS latest_attempt_status,
+                                FIRST_VALUE(created_at) OVER (
+                                    PARTITION BY strategy_id, strategy_version, initial_cash
+                                    ORDER BY created_at DESC NULLS LAST, run_id DESC
+                                ) AS latest_attempt_created_at,
+                                FIRST_VALUE(finished_at) OVER (
+                                    PARTITION BY strategy_id, strategy_version, initial_cash
+                                    ORDER BY created_at DESC NULLS LAST, run_id DESC
+                                ) AS latest_attempt_finished_at,
+                                FIRST_VALUE(failure_reason) OVER (
+                                    PARTITION BY strategy_id, strategy_version, initial_cash
+                                    ORDER BY created_at DESC NULLS LAST, run_id DESC
+                                ) AS latest_attempt_failure_reason
+                           FROM backtest.run_manifest
+                          WHERE dataset_id=%s
+                            AND (strategy_id, strategy_version) IN ({identity_values})
+                            AND initial_cash = ANY(%s::numeric[])
+                     )
+                     SELECT run_id, dataset_id, strategy_id, strategy_version,
+                            run_version, initial_cash, status, parameters,
+                            parameters_hash, input_hash, code_version, git_commit,
+                            git_dirty, diff_hash, execution_model_version,
+                            code_archive_sha256, created_at, started_at,
+                            finished_at, failure_reason, latest_attempt_run_id,
+                            latest_attempt_status, latest_attempt_created_at,
+                            latest_attempt_finished_at, latest_attempt_failure_reason
+                       FROM ranked
+                      WHERE rank_no=1
+                      ORDER BY strategy_id, strategy_version, initial_cash
+                      LIMIT 100""",
+            (dataset_id, *identity_params, normalized_capitals),
+            self._scope(dataset_id, dataset_id),
+            100,
         )
         return rows
 
@@ -329,6 +429,19 @@ class BacktestRunRepository(BaseRepository):
             partition=dataset_id,
             dimensions={"dataset_id": dataset_id},
         )
+        if self.diagnostic_dataset_kind(dataset_id, context) == "MATERIALIZED":
+            return self.kernel.read._repository_query(
+                context,
+                "backtest.dataset_benchmark_bar",
+                """SELECT trade_date, ts_code, close
+                     FROM backtest.dataset_benchmark_bar
+                    WHERE dataset_id=%s
+                      AND trade_date BETWEEN %s AND %s
+                    ORDER BY trade_date""",
+                (dataset_id, date_from, date_to),
+                scope,
+                10_000,
+            )
         return self.kernel.read._repository_query(
             context,
             "backtest.dataset_benchmark_bar",
@@ -366,6 +479,25 @@ class BacktestRunRepository(BaseRepository):
             partition=ts_code,
             dimensions={"ts_code": ts_code},
         )
+        if self.diagnostic_dataset_kind(dataset_id, context) == "MATERIALIZED":
+            return self.kernel.read._repository_query(
+                context,
+                "research.stock_snapshot_daily",
+                """SELECT s.research_date, s.ts_code, s.name, s.raw_close,
+                          s.adj_close_base, s.ma20, s.ma60, s.return_60d,
+                          s.is_st_asof, s.quality_status
+                     FROM backtest.dataset_member m
+                     JOIN research.stock_snapshot_daily s
+                       ON s.snapshot_id=m.research_snapshot_id
+                      AND s.research_date=m.research_date
+                    WHERE m.dataset_id=%s
+                      AND s.ts_code=%s
+                      AND s.research_date BETWEEN %s AND %s
+                    ORDER BY s.research_date""",
+                (dataset_id, ts_code, date_from, date_to),
+                scope,
+                100_000,
+            )
         return self.kernel.read._repository_query(
             context,
             "research.stock_snapshot_daily",
@@ -446,10 +578,10 @@ class BacktestRunRepository(BaseRepository):
         date_from: date,
         context: RunContext,
     ) -> list[dict[str, Any]]:
-        """Read only 5/10/20/40 future execution bars for actual entries.
+        """Read only 5/10/20/40/60 future execution bars for actual entries.
 
-        The bounded 120-calendar-day window is deliberately conservative for
-        40 A-share trading days and avoids a five-year scan for each trade.
+        The bounded 180-calendar-day window is deliberately conservative for
+        60 A-share trading days and avoids a five-year scan for each trade.
         Entries are deliberately read in small batches: this diagnostic runs
         against a large frozen execution-bar table, and one large ``unnest``
         join can make PostgreSQL choose a plan that exceeds the statement
@@ -460,21 +592,44 @@ class BacktestRunRepository(BaseRepository):
             return []
         unique_entries = list(dict.fromkeys(entries))
         output: list[dict[str, Any]] = []
+        dataset_kind = self.diagnostic_dataset_kind(dataset_id, context)
         for start in range(0, len(unique_entries), DIAGNOSTIC_ENTRY_BATCH_SIZE):
             batch = unique_entries[start:start + DIAGNOSTIC_ENTRY_BATCH_SIZE]
             codes = [item[0] for item in batch]
             dates = [item[1] for item in batch]
-            date_to = max(dates) + timedelta(days=120)
+            date_to = max(dates) + timedelta(days=180)
             scope = WorkScope(
                 date_from=min(date_from, min(dates)),
                 date_to=date_to,
                 partition=dataset_id,
                 dimensions={"dataset_id": dataset_id},
             )
-            output.extend(self.kernel.read._repository_query(
-                context,
-                "backtest.dataset_execution_bar",
-                """WITH components AS (
+            if dataset_kind == "MATERIALIZED":
+                sql = """WITH entries(ts_code, buy_date) AS (
+                             SELECT * FROM unnest(%s::text[], %s::date[])
+                         ), ranked AS (
+                             SELECT e.ts_code, e.buy_date, b.trade_date,
+                                    b.raw_close,
+                                    row_number() OVER (
+                                        PARTITION BY e.ts_code, e.buy_date
+                                        ORDER BY b.trade_date
+                                    ) AS horizon
+                               FROM entries e
+                               JOIN backtest.dataset_execution_bar b
+                                 ON b.dataset_id=%s
+                                AND b.ts_code=e.ts_code
+                                AND b.trade_date>e.buy_date
+                                AND b.trade_date<=e.buy_date + INTERVAL '180 days'
+                              WHERE b.raw_close IS NOT NULL
+                         )
+                         SELECT ts_code, buy_date, trade_date, raw_close,
+                                horizon
+                           FROM ranked
+                          WHERE horizon IN (5, 10, 20, 40, 60)
+                          ORDER BY buy_date, ts_code, horizon"""
+                params = (codes, dates, dataset_id)
+            else:
+                sql = """WITH components AS (
                              SELECT component_dataset_id AS dataset_id,effective_from,effective_to
                                FROM backtest.dataset_component
                               WHERE composite_dataset_id=%s
@@ -493,21 +648,28 @@ class BacktestRunRepository(BaseRepository):
                                     ) AS horizon
                                FROM entries e
                                JOIN components c ON e.buy_date <= c.effective_to
-                                                 AND e.buy_date + INTERVAL '120 days' >= c.effective_from
+                                                 AND e.buy_date + INTERVAL '180 days' >= c.effective_from
                                JOIN backtest.dataset_execution_bar b
                                  ON b.dataset_id=c.dataset_id
                                 AND b.trade_date BETWEEN c.effective_from AND c.effective_to
                                 AND b.ts_code=e.ts_code
                                 AND b.trade_date>e.buy_date
-                                AND b.trade_date<=e.buy_date + INTERVAL '120 days'
+                                AND b.trade_date<=e.buy_date + INTERVAL '180 days'
                               WHERE b.raw_close IS NOT NULL
                          )
                          SELECT ts_code, buy_date, trade_date, raw_close,
                                 horizon
                            FROM ranked
-                          WHERE horizon IN (5, 10, 20, 40)
-                          ORDER BY buy_date, ts_code, horizon""",
-                (dataset_id, dataset_id, codes, dates), scope, 10_000,
+                          WHERE horizon IN (5, 10, 20, 40, 60)
+                          ORDER BY buy_date, ts_code, horizon"""
+                params = (dataset_id, dataset_id, codes, dates)
+            output.extend(self.kernel.read._repository_query(
+                context,
+                "backtest.dataset_execution_bar",
+                sql,
+                params,
+                scope,
+                10_000,
             ))
         output.sort(key=lambda row: (
             row.get("buy_date"), row.get("ts_code"), row.get("horizon"),

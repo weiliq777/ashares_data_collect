@@ -1823,7 +1823,13 @@ class ResearchSnapshotRepository(BaseRepository):
                          OR financial_feature_contract_version IS DISTINCT FROM 'feature-contract-v2.0'
                          OR financial_data_available_timestamp IS NULL
                      )
-               )::integer AS invalid_v2_rows
+               )::integer AS invalid_v2_rows,
+               COUNT(*) FILTER (
+                   WHERE source_table='feature.company_financial_v2'
+                     AND source_record_key NOT LIKE '%%:missing'
+                     AND financial_data_available_timestamp >=
+                         (research_date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'
+               )::integer AS future_financial_availability_rows
           FROM rows
          GROUP BY snapshot_id
         """
@@ -1887,16 +1893,30 @@ class ResearchSnapshotRepository(BaseRepository):
                 ),
                 max_rows=max(2, len(snapshot_ids) + 1),
             )
+            returned_snapshot_ids: set[str] = set()
             for row in rows:
+                snapshot_id = str(row["snapshot_id"])
+                returned_snapshot_ids.add(snapshot_id)
                 values = {
                     key: int(row.get(key) or 0)
                     for key in (
                         "snapshot_rows", "missing_lineage_rows",
                         "non_v2_source_rows", "invalid_v2_rows",
+                        "future_financial_availability_rows",
                     )
                 }
                 if any(values[key] for key in values if key != "snapshot_rows"):
-                    issues[str(row["snapshot_id"])] = values
+                    issues[snapshot_id] = values
+            for snapshot_id in snapshot_ids:
+                if snapshot_id not in returned_snapshot_ids:
+                    issues[snapshot_id] = {
+                        "snapshot_rows": 0,
+                        "missing_snapshot_rows": 1,
+                        "missing_lineage_rows": 0,
+                        "non_v2_source_rows": 0,
+                        "invalid_v2_rows": 0,
+                        "future_financial_availability_rows": 0,
+                    }
         return issues
 
     def build_financial_replacement_snapshot(

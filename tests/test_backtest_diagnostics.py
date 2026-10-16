@@ -123,11 +123,13 @@ def test_forward_returns_use_future_execution_closes_not_position_state():
     future = [
         {"ts_code": "000001.SZ", "buy_date": date(2024, 1, 8), "trade_date": date(2024, 1, 15), "raw_close": 11, "horizon": 5},
         {"ts_code": "000001.SZ", "buy_date": date(2024, 1, 8), "trade_date": date(2024, 2, 5), "raw_close": 9, "horizon": 20},
+        {"ts_code": "000001.SZ", "buy_date": date(2024, 1, 8), "trade_date": date(2024, 4, 1), "raw_close": 8, "horizon": 60},
     ]
     report = summarize_forward_returns(trades, future)
     assert report["horizon_5d"]["returns"]["count"] == 1
     assert report["horizon_5d"]["returns"]["mean"] == 0.1
     assert report["horizon_20d"]["returns"]["mean"] == -0.1
+    assert report["horizon_60d"]["returns"]["mean"] == -0.2
 
 
 def test_entry_diagnostics_flags_historical_st_only_when_pit_says_true():

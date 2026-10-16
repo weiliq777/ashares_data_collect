@@ -183,7 +183,10 @@ def create_run(dataset_id: str, strategy_id: str, config: BacktestConfig,
         parameters["fee_rule"]["effective_slippage_bps"] = sorted({row["slippage_bps"] for row in rule_rows})
         if len(parameters["fee_rule"]["effective_slippage_bps"]) == 1:
             parameters["fee_rule"]["slippage_bps"] = parameters["fee_rule"]["effective_slippage_bps"][0]
-        parameters["market_rule"]["effective_liquidity"] = sorted({(row["parameters"] or {}).get("max_volume_participation_pct") for row in rule_rows})
+        parameters["market_rule"]["effective_liquidity"] = sorted({
+            (row["parameters"] or {}).get("max_volume_participation_pct", 1.0)
+            for row in rule_rows
+        })
         parameters["market_rule"]["liquidity_policy"] = sorted({(row["parameters"] or {}).get("liquidity_policy", "reject_full_order") for row in rule_rows})
         if scenario_config is None and config.allocation_mode == "target_value":
             scenario_config = ScenarioConfig(
