@@ -53,6 +53,13 @@ def _parameters_hash(parameters: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(parameters, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _scenario_id_for_capital(initial_capital: float) -> str:
+    capital = float(initial_capital)
+    thousands = capital / 1_000
+    label = f"{thousands:g}k" if math.isclose(thousands, round(thousands)) else f"{capital:g}"
+    return f"scen_a_share_{label}_v1"
+
+
 def _json_param(value: Any):
     return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -190,6 +197,7 @@ def create_run(dataset_id: str, strategy_id: str, config: BacktestConfig,
         parameters["market_rule"]["liquidity_policy"] = sorted({(row["parameters"] or {}).get("liquidity_policy", "reject_full_order") for row in rule_rows})
         if scenario_config is None and config.allocation_mode == "target_value":
             scenario_config = ScenarioConfig(
+                scenario_id=_scenario_id_for_capital(config.initial_cash),
                 initial_capital=config.initial_cash,
                 target_positions=config.max_positions,
                 target_position_ratio=float(config.target_position_ratio),

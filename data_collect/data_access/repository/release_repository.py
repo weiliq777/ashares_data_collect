@@ -288,7 +288,25 @@ class ReleaseRepository(BaseRepository):
         invariants = quality.phase2_invariants(context, cutoff, skipped_invariants)
         checkpoints = quality.phase2_checkpoint_completeness(context, cutoff)
         lifecycle = self._scalar("std.security_lifecycle", "SELECT COUNT(*) AS value FROM std.security_lifecycle a JOIN std.security_lifecycle b ON a.ts_code=b.ts_code AND a.lifecycle_id<b.lifecycle_id AND a.effective_from<=COALESCE(b.effective_to,DATE '9999-12-31') AND b.effective_from<=COALESCE(a.effective_to,DATE '9999-12-31')", context, "release:lifecycle")
-        duplicates = self._scalar("std.dividend_event", "SELECT COUNT(*) AS value FROM (SELECT business_key FROM std.dividend_event GROUP BY business_key HAVING COUNT(*)>1) d", context, "release:dividend-duplicates")
+        duplicates = self._scalar(
+            "std.dividend_event",
+            """SELECT COUNT(*) AS value
+                 FROM (
+                    SELECT business_key
+                      FROM (
+                            SELECT DISTINCT ON (source, source_record_key)
+                                   business_key
+                              FROM std.dividend_event
+                             WHERE business_key IS NOT NULL
+                             ORDER BY source, source_record_key,
+                                      record_version DESC, dividend_id DESC
+                           ) latest_source_versions
+                     GROUP BY business_key
+                    HAVING COUNT(*) > 1
+                 ) d""",
+            context,
+            "release:dividend-duplicates",
+        )
         missing_ex_date = self._scalar("std.dividend_event", "SELECT COUNT(*) AS value FROM std.dividend_event WHERE implementation_status='实施' AND ex_date IS NULL", context, "release:dividend-ex-date")
         failures = {}
         for name, value in invariants.items():

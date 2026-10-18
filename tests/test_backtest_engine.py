@@ -427,6 +427,23 @@ def test_unsettled_dividend_and_stock_rights_are_carried_in_daily_nav():
     )
 
 
+def test_daily_drawdown_is_zero_at_new_equity_high_and_measured_from_it():
+    days = [date(2026, 1, 5), date(2026, 1, 6)]
+    dataset = BacktestDataset(
+        dataset_id="drawdown-new-high", calendar=tuple(days), warmup_start=days[0],
+        evaluation_start=days[0], evaluation_end=days[-1], observations={}, bars={},
+    )
+    engine = BacktestEngine(BacktestConfig(initial_cash=10_000.0))
+
+    engine.cash = 11_000.0
+    engine._record_daily(days[0], dataset)
+    engine.cash = 10_450.0
+    engine._record_daily(days[1], dataset)
+
+    assert engine._performance_daily[0]["drawdown"] == pytest.approx(0.0)
+    assert engine._performance_daily[1]["drawdown"] == pytest.approx(0.05)
+
+
 def test_dividend_uses_pre_tax_amount_for_coordinate_and_after_tax_for_income():
     days = [date(2026, 1, 2), date(2026, 1, 5)]
     event = DividendEvent(

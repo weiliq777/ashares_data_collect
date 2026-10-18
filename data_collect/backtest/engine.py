@@ -1668,7 +1668,10 @@ class BacktestEngine:
         equity = self.cash + position_value + receivable_total
         previous = self._performance_daily[-1]["total_equity"] if self._performance_daily else self.config.initial_cash
         daily_return = equity / previous - 1 if previous else 0.0
-        peak = max([row["total_equity"] for row in self._performance_daily] + [self.config.initial_cash])
+        peak = max(
+            [row["total_equity"] for row in self._performance_daily]
+            + [self.config.initial_cash, equity]
+        )
         turnover = sum(
             fill["fill_price"] * fill["fill_shares"]
             for fill in self._fills if fill["fill_date"] == day

@@ -9,8 +9,14 @@ from data_collect.jobs.backtest_dataset import (
     _foundation_contract_issues,
     missing_snapshot_dates,
 )
+from data_collect.jobs.backtest_run import _scenario_id_for_capital
 from data_collect.jobs.research_snapshot import FOUNDATION_SCHEMA_VERSION, SCHEMA_VERSION
 from data_collect.data_access.research_contract import STRATEGY_NEUTRAL_SCHEMA_VERSION
+
+
+def test_backtest_scenario_identity_tracks_initial_capital():
+    assert _scenario_id_for_capital(10_000) == "scen_a_share_10k_v1"
+    assert _scenario_id_for_capital(20_000) == "scen_a_share_20k_v1"
 
 
 def test_backtest_migration_has_frozen_dataset_and_run_contract():

@@ -120,6 +120,39 @@ def test_research_release_gate_blocks_implemented_dividends_without_ex_date(monk
     assert report["failures"]["implementation_without_ex_date"] == 1
 
 
+def test_research_release_duplicate_check_uses_latest_source_versions(monkeypatch):
+    from data_collect.data_access.repository.quality_inspection_repository import (
+        QualityInspectionRepository,
+    )
+
+    monkeypatch.setattr(
+        QualityInspectionRepository,
+        "phase2_invariants",
+        lambda self, context, cutoff, skip_names: {},
+    )
+    monkeypatch.setattr(
+        QualityInspectionRepository,
+        "phase2_checkpoint_completeness",
+        lambda self, context, cutoff: {},
+    )
+    sql_by_partition = {}
+
+    def scalar(table, sql, context, partition, params=()):
+        sql_by_partition[partition] = sql
+        return 0
+
+    repository = ReleaseRepository(object())
+    monkeypatch.setattr(repository, "_scalar", scalar)
+
+    report = repository.quality_gate(date(2026, 9, 25), False, ctx())
+
+    duplicate_query = sql_by_partition["release:dividend-duplicates"]
+    assert "DISTINCT ON (source, source_record_key)" in duplicate_query
+    assert "record_version DESC, dividend_id DESC" in duplicate_query
+    assert report["dividend_business_key_duplicates"] == 0
+    assert "dividend_business_key_duplicates" not in report["failures"]
+
+
 def test_research_observation_baseline_lookup_is_domain_scoped():
     from data_collect.data_access.repository.observation_repository import (
         StockAnomalyObservationRepository,
