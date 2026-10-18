@@ -58,7 +58,7 @@ from data_collect.data_access.research_contract import (
 
 SCHEMA_VERSION = "backtest-dataset-v2"
 ADAPTER_VERSION = "research-to-backtest-v2"
-FEATURE_VERSION = "research-foundation-features-v2"
+FEATURE_VERSION = "research-foundation-features-v3"
 SUPPORTED_RESEARCH_SCHEMA_VERSIONS = frozenset(
     {RESEARCH_SCHEMA_VERSION, FOUNDATION_SCHEMA_VERSION, STRATEGY_NEUTRAL_SCHEMA_VERSION}
 )
@@ -200,11 +200,13 @@ SELECTION_PREDICATE = (
 SELECTED_COLUMNS = {
     "research": [
         "research_date", "ts_code", "list_date", "delist_date", "raw_close", "adj_close_base", "ma20", "ma60",
-        "volume_ratio_20d", "pe_ttm", "pe_pct_5y", "pb_pct_5y", "is_pe_meaningful",
+        "return_20d", "return_60d", "price_feature_version", "price_adjustment_mode",
+        "total_mv", "volume_ratio_20d", "pe_ttm", "pe_pct_5y", "pb_pct_5y", "is_pe_meaningful",
         "is_listed_asof", "is_st_asof", "is_tradeable", "can_buy", "can_sell",
         "eligible_by_market", "quality_status", "effective_announce_date",
         "financial_version_available_date", "financial_record_version",
         "financial_source_record_key", "financial_payload_hash",
+        "financial_vintage_quality",
         "available_observation_count", "ma20_observation_count", "ma60_observation_count",
         "ma120_observation_count", "valuation_observation_count", "pe_window_start_date_5y",
         "has_full_pe_5y_history", "annual_report_count_5y", "roe_above_15_years_5y",

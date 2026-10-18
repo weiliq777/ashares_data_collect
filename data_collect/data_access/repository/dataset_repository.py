@@ -12,6 +12,40 @@ from data_collect.data_access.repository.base import BaseRepository
 
 
 class DatasetRepository(BaseRepository):
+    OBSERVATION_COLUMNS = frozenset({
+        "research_date", "ts_code", "symbol", "name", "market", "list_status",
+        "list_date", "delist_date", "is_listed_asof", "is_st_asof",
+        "is_suspended_asof", "eligible_by_market", "is_tradeable", "can_buy",
+        "can_sell", "limit_status", "raw_open", "raw_high", "raw_low",
+        "raw_close", "raw_volume", "raw_amount", "up_limit", "down_limit",
+        "adj_close_base", "price_feature_version", "price_adjustment_mode",
+        "return_1d", "return_20d", "return_60d", "ma20",
+        "ma60", "ma120", "volume_ratio_20d", "available_observation_count",
+        "ma20_observation_count", "ma60_observation_count", "ma120_observation_count",
+        "pe_ttm", "pb", "ps_ttm", "dv_ratio", "total_mv", "circ_mv",
+        "pe_pct_3y", "pe_pct_5y", "pb_pct_3y", "pb_pct_5y",
+        "is_pe_meaningful", "valuation_observation_count", "pe_window_start_date_5y",
+        "has_full_pe_5y_history", "report_date", "effective_announce_date",
+        "financial_version_available_date", "financial_record_version",
+        "financial_source_record_key", "financial_payload_hash",
+        "financial_vintage_quality", "financial_source_observed_at", "roe", "roa",
+        "debt_to_assets", "revenue_yoy", "tr_yoy", "q_sales_yoy", "netprofit_yoy",
+        "operating_cashflow", "net_profit", "cash_div_12m", "dividend_event_count_3y",
+        "dividend_year_count_3y", "annual_report_count_5y", "roe_above_15_years_5y",
+        "roe_5y_min", "roe_5y_all_above_15", "ocf_report_count_3y",
+        "ocf_positive_years_3y", "ocf_3y_all_positive", "quarterly_report_count_4q",
+        "q_sales_yoy_above_30_quarters_4q", "q_sales_yoy_4q_all_above_30",
+        "instrument_source_record_key", "instrument_source_record_version",
+        "instrument_source_payload_hash", "quality_status",
+        "financial_feature_contract_version", "financial_data_available_timestamp",
+        "net_profit_consolidated_ttm", "net_profit_parent_ttm", "operating_cashflow_ttm",
+        "ocf_to_net_profit_consolidated_ttm", "roe_ttm", "gross_margin_ttm",
+        "net_margin_consolidated_ttm", "revenue_growth_yoy", "profit_growth_yoy",
+        "cashflow_quality_status", "roe_quality_status", "growth_quality_status",
+        "ttm_complete", "dv_ttm", "dv_ttm_percentile_5y", "dv_ttm_source",
+        "dv_window_start", "dv_window_end", "dv_observation_days", "dv_window_complete",
+        "financial_component_lineage", "financial_source_fingerprint",
+    })
     OBSERVATION_COVERAGE_FIELDS = (
         "raw_close", "return_20d", "return_60d", "ma20", "ma60",
         "volume_ratio_20d", "total_mv", "pe_ttm", "pe_pct_5y",
@@ -1160,7 +1194,9 @@ class DatasetRepository(BaseRepository):
                 self._component_cte() + f"""
                 SELECT b.trade_date, b.ts_code, b.raw_open, b.raw_high, b.raw_low,
                        b.raw_close, b.volume, b.amount, b.up_limit, b.down_limit,
-                       b.is_suspended, b.can_buy, b.can_sell, b.limit_status, b.market
+                       b.is_suspended, b.can_buy, b.can_sell, b.limit_status, b.market,
+                       b.quality_status, b.source_record_key, b.source_record_version,
+                       b.source_payload_hash
                   FROM components c
                   JOIN backtest.dataset_execution_bar b ON b.dataset_id=c.dataset_id
                    AND b.trade_date BETWEEN c.effective_from AND c.effective_to
@@ -1186,7 +1222,8 @@ class DatasetRepository(BaseRepository):
             context, "backtest.dataset_execution_bar",
             f"""SELECT trade_date, ts_code, raw_open, raw_high, raw_low, raw_close,
                               volume, amount, up_limit, down_limit, is_suspended,
-                              can_buy, can_sell, limit_status, market
+                              can_buy, can_sell, limit_status, market, quality_status,
+                              source_record_key, source_record_version, source_payload_hash
                          FROM backtest.dataset_execution_bar
                         WHERE dataset_id=%s {bounds} {keyset}
                         ORDER BY trade_date, ts_code LIMIT {int(limit)}""",
@@ -1200,8 +1237,12 @@ class DatasetRepository(BaseRepository):
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("observation page limit must be between 1 and 50000")
-        if not columns or any(not str(column).isidentifier() for column in columns):
-            raise ValueError("observation columns must be identifiers")
+        invalid_columns = set(map(str, columns)) - self.OBSERVATION_COLUMNS
+        if not columns or invalid_columns:
+            raise ValueError(
+                "unsupported frozen observation columns: "
+                f"{sorted(invalid_columns) if invalid_columns else 'empty selection'}"
+            )
         selected = ", ".join(f"s.{column}" for column in columns)
         components = self.composition_components(dataset_id, context)
         if components:
@@ -1291,6 +1332,67 @@ class DatasetRepository(BaseRepository):
             )
             return [tuple(row[key] for key in keys) for row in rows]
         return self.materialized_dividend_rows(dataset_id, context)
+
+    def dividend_page(
+        self,
+        dataset_id: str,
+        context: RunContext,
+        last_key: tuple | None = None,
+        limit: int = 10_000,
+        date_from=None,
+        date_to=None,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded, keyset-paginated slice of frozen company actions."""
+        if limit <= 0 or limit > 50_000:
+            raise ValueError("dividend page limit must be between 1 and 50000")
+        components = self.composition_components(dataset_id, context)
+        keyset = "" if last_key is None else (
+            " AND (d.ex_date, d.ts_code, COALESCE(d.source_record_key, ''), "
+            "COALESCE(d.source_record_version, 0)) > (%s, %s, %s, %s)"
+        )
+        bounds = ""
+        params: tuple[Any, ...] = (dataset_id,)
+        if date_from is not None:
+            bounds += " AND d.ex_date >= %s"
+            params += (date_from,)
+        if date_to is not None:
+            bounds += " AND d.ex_date <= %s"
+            params += (date_to,)
+        if last_key is not None:
+            params += (
+                last_key[0], last_key[1], last_key[2] or "", int(last_key[3] or 0),
+            )
+        source = "backtest.dataset_dividend_event"
+        if components:
+            sql = self._component_cte() + f"""
+                SELECT d.ts_code, d.report_date, d.announce_date, d.implementation_status,
+                       d.stock_div, d.stock_bonus_rate, d.stock_conversion_rate, d.cash_div,
+                       d.cash_div_tax, d.record_date, d.ex_date, d.pay_date, d.div_list_date,
+                       d.implementation_announce_date, d.source_record_key,
+                       d.source_record_version, d.source_payload_hash
+                  FROM components c
+                  JOIN backtest.dataset_dividend_event d ON d.dataset_id=c.dataset_id
+                   AND d.ex_date BETWEEN c.effective_from AND c.effective_to
+                 WHERE TRUE {bounds} {keyset}
+                 ORDER BY d.ex_date, d.ts_code, COALESCE(d.source_record_key, ''),
+                          COALESCE(d.source_record_version, 0) LIMIT {int(limit)}
+            """
+        else:
+            sql = f"""
+                SELECT ts_code, report_date, announce_date, implementation_status,
+                       stock_div, stock_bonus_rate, stock_conversion_rate, cash_div,
+                       cash_div_tax, record_date, ex_date, pay_date, div_list_date,
+                       implementation_announce_date, source_record_key,
+                       source_record_version, source_payload_hash
+                  FROM backtest.dataset_dividend_event d
+                 WHERE dataset_id=%s {bounds} {keyset}
+                 ORDER BY d.ex_date, d.ts_code, COALESCE(d.source_record_key, ''),
+                          COALESCE(d.source_record_version, 0) LIMIT {int(limit)}
+            """
+        return self.kernel.read._repository_query(
+            context, source, sql, params,
+            WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to), limit,
+        )
 
     def load_rules(self, dataset_id: str, context: RunContext) -> list[tuple]:
         components = self.composition_components(dataset_id, context)
