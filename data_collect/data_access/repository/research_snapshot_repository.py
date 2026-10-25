@@ -14,7 +14,10 @@ from typing import Any, Callable, Iterable, NamedTuple
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
-from data_collect.data_access.research_contract import is_foundation_schema
+from data_collect.data_access.research_contract import (
+    INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION,
+    is_foundation_schema,
+)
 from data_collect.data_access.snapshot_lifecycle import (
     MAX_SNAPSHOT_LIFECYCLE_BATCH_SIZE,
     require_snapshot_batch,
@@ -191,7 +194,13 @@ class ResearchSnapshotRepository(BaseRepository):
         "roe_quality_status", "growth_quality_status", "ttm_complete", "dv_ttm",
         "dv_ttm_percentile_5y", "dv_ttm_source", "dv_window_start", "dv_window_end",
         "dv_observation_days", "dv_window_complete", "financial_component_lineage",
-        "financial_source_fingerprint", "quality_status",
+        "financial_source_fingerprint", "debt_to_assets_quality_status",
+        "debt_to_assets_quality_reason", "debt_to_assets_data_available_timestamp",
+        "debt_to_assets_source_observed_at", "debt_to_assets_vintage_quality",
+        "debt_to_assets_source_quality_status", "debt_to_assets_source_record_key",
+        "debt_to_assets_source_record_version", "debt_to_assets_source_payload_hash",
+        "debt_to_assets_feature_contract_version", "debt_to_assets_report_date",
+        "quality_status",
     )
 
     @classmethod
@@ -1043,9 +1052,11 @@ class ResearchSnapshotRepository(BaseRepository):
         return sql
 
     @staticmethod
-    def foundation_snapshot_batch_sql():
+    def foundation_snapshot_batch_sql(*, independent_factors: bool = False):
         """Return Foundation-v2 enrichment SQL for a bounded snapshot batch."""
-        sql = ResearchSnapshotRepository.foundation_snapshot_sql()
+        sql = ResearchSnapshotRepository.foundation_snapshot_sql(
+            independent_factors=independent_factors,
+        )
         sql = sql.replace(
             "SELECT %s, s.research_date",
             "SELECT s.snapshot_id, s.research_date",
@@ -1084,7 +1095,7 @@ class ResearchSnapshotRepository(BaseRepository):
 
 
     @staticmethod
-    def foundation_inputs(base_inputs):
+    def foundation_inputs(base_inputs, *, independent_factors: bool = False):
         result = []
         for definition in base_inputs:
             key = (definition["schema"], definition["table"])
@@ -1118,6 +1129,25 @@ class ResearchSnapshotRepository(BaseRepository):
                     "order": "ts_code, report_date, data_available_timestamp, feature_id",
                     "date_column": "report_date",
                 })
+                if independent_factors:
+                    result.append({
+                        "schema": "feature", "table": "debt_to_assets_v1",
+                        "columns": (
+                            "feature_id", "ts_code", "report_date",
+                            "data_available_timestamp", "source_observed_at",
+                            "report_type", "comp_type", "end_type", "total_liab",
+                            "total_assets", "debt_to_assets", "quality_status",
+                            "quality_reason", "source_quality_status",
+                            "vintage_quality", "source_record_key", "record_version",
+                            "payload_hash", "source_fingerprint",
+                            "feature_contract_version",
+                        ),
+                        "predicate": "balance-sheet feature versions visible by signal close (15:00 Asia/Shanghai)",
+                        "where": "report_date <= %s AND data_available_timestamp < (%s::date + TIME '15:00') AT TIME ZONE 'Asia/Shanghai'",
+                        "params": lambda cutoff: (cutoff, cutoff),
+                        "order": "ts_code, report_date, data_available_timestamp, record_version, feature_id",
+                        "date_column": "report_date",
+                    })
                 # The base materialization intentionally keeps the legacy V1
                 # compatibility fields (roe/roa/vendor growth and the
                 # fundamental-history summary).  They are a real read
@@ -1146,7 +1176,7 @@ class ResearchSnapshotRepository(BaseRepository):
         return tuple(result)
 
     @staticmethod
-    def foundation_snapshot_sql() -> str:
+    def foundation_snapshot_sql(*, independent_factors: bool = False) -> str:
         """Return the typed Foundation-v2 enrichment statement.
 
         The statement intentionally preserves explicit missing lineage: a
@@ -1154,7 +1184,7 @@ class ResearchSnapshotRepository(BaseRepository):
         never silently converted into a current-value fallback.  Execution is
         performed by the Repository through a typed RebuildGateway method.
         """
-        return """
+        sql = """
         INSERT INTO research.stock_snapshot_daily
             (snapshot_id, research_date, ts_code,
              report_date, effective_announce_date,
@@ -1238,6 +1268,75 @@ class ResearchSnapshotRepository(BaseRepository):
             financial_component_lineage=EXCLUDED.financial_component_lineage,
             quality_status=EXCLUDED.quality_status
         """
+        if not independent_factors:
+            return sql
+
+        replacements = (
+            (
+                "growth_quality_status, dv_ttm, dv_ttm_percentile_5y",
+                (
+                    "growth_quality_status, debt_to_assets, debt_to_assets_quality_status, "
+                    "debt_to_assets_quality_reason, debt_to_assets_data_available_timestamp, "
+                    "debt_to_assets_source_observed_at, debt_to_assets_vintage_quality, "
+                    "debt_to_assets_source_quality_status, debt_to_assets_source_record_key, "
+                    "debt_to_assets_source_record_version, debt_to_assets_source_payload_hash, "
+                    "debt_to_assets_feature_contract_version, debt_to_assets_report_date, "
+                    "dv_ttm, dv_ttm_percentile_5y"
+                ),
+            ),
+            (
+                "f.growth_quality_status,\n               v.dv_ttm",
+                (
+                    "f.growth_quality_status,\n               da.debt_to_assets, da.quality_status, da.quality_reason, "
+                    "da.data_available_timestamp, da.source_observed_at, da.vintage_quality, "
+                    "da.source_quality_status, da.source_record_key, da.record_version, "
+                    "da.payload_hash, da.feature_contract_version, da.report_date,\n               v.dv_ttm"
+                ),
+            ),
+            (
+                "          LEFT JOIN feature.valuation_daily_v1 v",
+                (
+                    "          LEFT JOIN LATERAL (\n"
+                    "                SELECT d.* FROM feature.debt_to_assets_v1 d\n"
+                    "                 WHERE d.ts_code=s.ts_code\n"
+                    "                   AND d.report_date <= s.research_date\n"
+                    "                   AND d.data_available_timestamp <\n"
+                    "                       (s.research_date + TIME '15:00') AT TIME ZONE 'Asia/Shanghai'\n"
+                    "                 ORDER BY d.report_date DESC, d.data_available_timestamp DESC,\n"
+                    "                          d.record_version DESC NULLS LAST, d.feature_id DESC\n"
+                    "                 LIMIT 1\n"
+                    "          ) da ON TRUE\n"
+                    "          LEFT JOIN feature.valuation_daily_v1 v"
+                ),
+            ),
+            (
+                (
+                    "            growth_quality_status=EXCLUDED.growth_quality_status,\n"
+                    "            dv_ttm=EXCLUDED.dv_ttm,"
+                ),
+                (
+                    "            growth_quality_status=EXCLUDED.growth_quality_status,\n"
+                    "            debt_to_assets=EXCLUDED.debt_to_assets,\n"
+                    "            debt_to_assets_quality_status=EXCLUDED.debt_to_assets_quality_status,\n"
+                    "            debt_to_assets_quality_reason=EXCLUDED.debt_to_assets_quality_reason,\n"
+                    "            debt_to_assets_data_available_timestamp=EXCLUDED.debt_to_assets_data_available_timestamp,\n"
+                    "            debt_to_assets_source_observed_at=EXCLUDED.debt_to_assets_source_observed_at,\n"
+                    "            debt_to_assets_vintage_quality=EXCLUDED.debt_to_assets_vintage_quality,\n"
+                    "            debt_to_assets_source_quality_status=EXCLUDED.debt_to_assets_source_quality_status,\n"
+                    "            debt_to_assets_source_record_key=EXCLUDED.debt_to_assets_source_record_key,\n"
+                    "            debt_to_assets_source_record_version=EXCLUDED.debt_to_assets_source_record_version,\n"
+                    "            debt_to_assets_source_payload_hash=EXCLUDED.debt_to_assets_source_payload_hash,\n"
+                    "            debt_to_assets_feature_contract_version=EXCLUDED.debt_to_assets_feature_contract_version,\n"
+                    "            debt_to_assets_report_date=EXCLUDED.debt_to_assets_report_date,\n"
+                    "            dv_ttm=EXCLUDED.dv_ttm,"
+                ),
+            ),
+        )
+        for old, new in replacements:
+            if old not in sql:
+                raise RuntimeError("independent D/A Snapshot SQL marker changed")
+            sql = sql.replace(old, new, 1)
+        return sql
 
     def create_manifest(
         self, snapshot_id: str, cutoff: date, baseline_tag: str, schema_version: str,
@@ -1257,8 +1356,12 @@ class ResearchSnapshotRepository(BaseRepository):
             "status": "DRAFT", "notes": notes,
             "lineage_storage_version": self.LINEAGE_STORAGE_V2
             if is_foundation_schema(schema_version) else "v1",
-            "feature_contract_version": "feature-contract-v2.0"
-            if is_foundation_schema(schema_version) else None,
+            "feature_contract_version": (
+                "feature-contract-v2.0+debt-to-assets-v1"
+                if schema_version == INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION
+                else "feature-contract-v2.0"
+                if is_foundation_schema(schema_version) else None
+            ),
             "decision_timestamp": cutoff,
             "data_cutoff_timestamp": cutoff,
             "pit_evidence_level": "SOURCE_DATE_WITH_OBSERVED_VERSIONS"
@@ -1947,6 +2050,16 @@ class ResearchSnapshotRepository(BaseRepository):
             raise RuntimeError(
                 f"replacement target must be Foundation schema: {target['schema_version']}"
             )
+        target_independent = (
+            target["schema_version"] == INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION
+        )
+        source_independent = (
+            source["schema_version"] == INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION
+        )
+        if target_independent != source_independent:
+            raise RuntimeError(
+                "Snapshot replacement cannot cross the independent D/A factor contract"
+            )
         if target["cutoff"] != source["cutoff"] or target["baseline"] != source["baseline"]:
             raise RuntimeError("replacement target/source cutoff or baseline mismatch")
         cutoff = target["cutoff"]
@@ -2035,7 +2148,9 @@ class ResearchSnapshotRepository(BaseRepository):
                 if copied_inputs <= 0 or not source["input_hash"]:
                     raise RuntimeError("replacement input manifest is empty or unhashed")
 
-                foundation_sql = self.foundation_snapshot_sql().replace(
+                foundation_sql = self.foundation_snapshot_sql(
+                    independent_factors=target_independent,
+                ).replace(
                     "WHERE s.snapshot_id=%s",
                     "WHERE s.snapshot_id=%s AND s.research_date=%s "
                     "AND s.ts_code=ANY(%s)",
@@ -2197,7 +2312,12 @@ class ResearchSnapshotRepository(BaseRepository):
                         operation=Operation.REBUILD, target="research.stock_snapshot_daily", scope=scope,
                         expected_mode="SET_BASED",
                     )
-                    foundation_sql = self.foundation_snapshot_sql().replace(
+                    foundation_sql = self.foundation_snapshot_sql(
+                        independent_factors=(
+                            manifest["schema_version"]
+                            == INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION
+                        ),
+                    ).replace(
                         "WHERE s.snapshot_id=%s",
                         "WHERE s.snapshot_id=%s AND s.research_date=%s AND s.ts_code=ANY(%s)",
                         1,
@@ -2439,7 +2559,12 @@ class ResearchSnapshotRepository(BaseRepository):
                         scope=batch_scope,
                         expected_mode="SET_BASED",
                     )
-                    foundation_sql = self.foundation_snapshot_batch_sql()
+                    foundation_sql = self.foundation_snapshot_batch_sql(
+                        independent_factors=(
+                            schema_version
+                            == INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION
+                        ),
+                    )
                     for offset in range(0, len(codes), self.SNAPSHOT_CODE_BATCH_SIZE):
                         code_batch = codes[offset:offset + self.SNAPSHOT_CODE_BATCH_SIZE]
                         self._run_adaptive_code_operation(
@@ -2649,6 +2774,30 @@ class ResearchSnapshotRepository(BaseRepository):
                     'AND "ts_code" > %s '
                     'ORDER BY "ts_code", "report_date" DESC, '
                     '"data_available_timestamp" DESC, "feature_id" DESC '
+                    'LIMIT %s'
+                ),
+                params_prefix=(cutoff, cutoff),
+                page_rows=self.INPUT_STATS_PAGE_ROWS,
+                cutoff=cutoff,
+                scope_partition=f"snapshot-input:{source}",
+            )
+        elif source == "feature.debt_to_assets_v1":
+            # Hash the same latest PIT-visible D/A source row per stock that
+            # the research-v2.2 Snapshot enrichment selects.  The cursor is
+            # keyset paged by ts_code, so historical source versions cannot
+            # be skipped or counted as if they were simultaneous factors.
+            batches = self._paged_input_rows(
+                context=context,
+                source=source,
+                sql=(
+                    f'SELECT DISTINCT ON ("ts_code") {selected} FROM {source} '
+                    'WHERE "data_available_timestamp" < '
+                    "(%s::date + TIME '15:00') AT TIME ZONE "
+                    "'Asia/Shanghai' "
+                    'AND "report_date" <= %s AND "ts_code" > %s '
+                    'ORDER BY "ts_code", "report_date" DESC, '
+                    '"data_available_timestamp" DESC, '
+                    '"record_version" DESC NULLS LAST, "feature_id" DESC '
                     'LIMIT %s'
                 ),
                 params_prefix=(cutoff, cutoff),

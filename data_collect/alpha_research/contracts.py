@@ -7,13 +7,14 @@ from typing import Any
 
 from data_collect.observation.hashing import hash_object
 
-
 ALPHA_RESEARCH_VERSION = "alpha-research-v2"
-FACTOR_SET_VERSION = "frozen-factor-set-v2"
+FACTOR_SET_VERSION = "frozen-factor-set-v4"
+DEBT_TO_ASSETS_FEATURE_CONTRACT_VERSION = "debt-to-assets-v1"
+SOURCE_QUALITY_EVIDENCE_VERSION = "financial-source-quality-v1"
 LABEL_VERSION = "frozen-forward-total-return-v3"
 EVALUATION_VERSION = "cross-sectional-evaluation-v5"
 MARKET_STAGE_VERSION = "benchmark-60-session-direction-v1"
-SUPPORTED_RESEARCH_SCHEMAS = frozenset({"research-v2.0", "research-v2.1"})
+SUPPORTED_RESEARCH_SCHEMAS = frozenset({"research-v2.0", "research-v2.1", "research-v2.2"})
 HORIZONS = (20, 40, 60)
 
 
@@ -38,7 +39,15 @@ FACTORS = (
         "financial_data_available_timestamp", "financial_vintage_quality",
         "financial_component_lineage", "research_date",
     ), 1, "Parent-profit TTM ROE over average parent equity; uses its own quality status."),
-    FactorSpec("debt_to_assets", "quality", ("debt_to_assets",), -1, "Debt-to-assets ratio; lower is less levered."),
+    FactorSpec("debt_to_assets", "quality", (
+        "debt_to_assets", "debt_to_assets_quality_status",
+        "debt_to_assets_quality_reason", "debt_to_assets_data_available_timestamp",
+        "debt_to_assets_source_observed_at", "debt_to_assets_vintage_quality",
+        "debt_to_assets_source_record_key", "debt_to_assets_source_record_version",
+        "debt_to_assets_source_payload_hash", "debt_to_assets_feature_contract_version",
+        "debt_to_assets_source_quality_status", "debt_to_assets_report_date",
+        "research_date",
+    ), -1, "Balance-sheet liabilities / assets, percentage points, with independent PIT lineage."),
     FactorSpec("revenue_growth_yoy", "growth", (
         "revenue_growth_yoy", "growth_quality_status",
         "financial_feature_contract_version", "financial_data_available_timestamp",
@@ -129,7 +138,7 @@ class ResearchRunIdentity:
         selected_fields: tuple[str, ...],
         schema_versions: tuple[str, ...],
         code_hash: str,
-    ) -> "ResearchRunIdentity":
+    ) -> ResearchRunIdentity:
         parameters = {
             "spec": spec.canonical(),
             "selected_fields": sorted(selected_fields),

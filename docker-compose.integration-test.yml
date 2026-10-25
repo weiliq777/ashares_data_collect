@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ${ASHARES_TEST_CONTAINER_NAME:-ashares-integration-test-postgres}
+    restart: "no"
+    environment:
+      POSTGRES_USER: ashares
+      POSTGRES_PASSWORD: ${ASHARES_TEST_ADMIN_PASSWORD:?Generate the local integration-test credentials first}
+      POSTGRES_DB: ashares_test
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=40
+    ports:
+      - "127.0.0.1:${ASHARES_TEST_HOST_PORT:-15433}:5432"
+    volumes:
+      - test_pgdata:/var/lib/postgresql/data
+      - ./sql:/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ashares -d ashares_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    labels:
+      org.ashares.environment: integration-test
+      org.ashares.database: ashares_test
+
+volumes:
+  test_pgdata:
+    name: ${ASHARES_TEST_VOLUME_NAME:-ashares_integration_test_pgdata}
+    labels:
+      org.ashares.environment: integration-test
+      org.ashares.database: ashares_test

@@ -5,15 +5,18 @@
 """
 from __future__ import annotations
 
-from datetime import date
-import json
-from datetime import datetime
 import hashlib
-from collections.abc import Mapping
-from typing import Any, Iterable
+import json
+from collections.abc import Iterable, Mapping
+from datetime import date, datetime
+from typing import Any
 
-from data_collect.data_access.context import RunContext, RebuildMode, WorkScope
+from data_collect.data_access.context import RebuildMode, RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
+from data_collect.data_access.repository.financial_projection_repository import (
+    FinancialProjectionRepository,
+    FinancialProjectionSelection,
+)
 
 CONTRACT_VERSION = "feature-contract-v2.0"
 
@@ -41,6 +44,10 @@ class FinancialRepository(BaseRepository):
         "fin_top10_holder": ("stock_code", "end_date", "rank"),
         "fin_top10_flow_holder": ("stock_code", "end_date", "rank"),
     }
+
+    def __init__(self, kernel) -> None:
+        super().__init__(kernel)
+        self._validated_projection_scopes: set[tuple[str, str, date, date]] = set()
 
     def save_legacy_xt_table(self, target: str, rows: Iterable[dict[str, Any]], context: RunContext) -> tuple[int, int]:
         key = self._LEGACY_XT_TARGETS.get(target)
@@ -225,7 +232,7 @@ class FinancialRepository(BaseRepository):
         SELECT 'income' AS dataset, stock_code AS ts_code, report_date,
                data_available_timestamp, source_observed_at, report_type,
                comp_type, end_type, source_record_key, record_version,
-               payload_hash, vintage_quality,
+               payload_hash, vintage_quality, quality_status,
                jsonb_build_object(
                    'revenue', revenue, 'oper_cost', oper_cost,
                    'total_cogs', total_cogs,
@@ -240,7 +247,7 @@ class FinancialRepository(BaseRepository):
         UNION ALL
         SELECT 'cashflow', stock_code, report_date, data_available_timestamp,
                source_observed_at, report_type, comp_type, end_type,
-               source_record_key, record_version, payload_hash, vintage_quality,
+               source_record_key, record_version, payload_hash, vintage_quality, quality_status,
                jsonb_build_object('operating_cashflow_ytd', operating_cashflow_ytd)
           FROM std.financial_cash_flow_standard
          WHERE stock_code=ANY(%s) AND report_date BETWEEN %s AND %s
@@ -251,7 +258,7 @@ class FinancialRepository(BaseRepository):
         UNION ALL
         SELECT 'balance', stock_code, report_date, data_available_timestamp,
                source_observed_at, report_type, comp_type, end_type,
-               source_record_key, record_version, payload_hash, vintage_quality,
+               source_record_key, record_version, payload_hash, vintage_quality, quality_status,
                jsonb_build_object(
                    'parent_equity_end', parent_equity_end,
                    'total_equity_end', total_equity_end,
@@ -266,7 +273,7 @@ class FinancialRepository(BaseRepository):
         SELECT 'indicator', ts_code, report_date, data_available_timestamp,
                source_observed_at, report_type,
                COALESCE(linked_comp_type, comp_type), end_type,
-               source_record_key, record_version, payload_hash, vintage_quality,
+               source_record_key, record_version, payload_hash, vintage_quality, quality_status,
                jsonb_build_object(
                    'roe_reported', roe_reported,
                    'roe_annualized', roe_annualized,
@@ -282,8 +289,103 @@ class FinancialRepository(BaseRepository):
                   record_version
     """
 
+    _PROJECTED_EVENTS_SQL = """
+        SELECT 'income' AS dataset, s.stock_code AS ts_code, s.report_date,
+               COALESCE(p.data_available_timestamp, s.data_available_timestamp) AS data_available_timestamp,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.source_observed_at ELSE s.source_observed_at END AS source_observed_at,
+               s.report_type, s.comp_type,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.projected_end_type ELSE s.end_type END AS end_type,
+               s.source_record_key, s.record_version, s.payload_hash,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.vintage_quality ELSE s.vintage_quality END AS vintage_quality,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.quality_status ELSE s.quality_status END AS quality_status,
+               jsonb_build_object(
+                   'revenue', s.revenue, 'oper_cost', s.oper_cost,
+                   'total_cogs', s.total_cogs,
+                   'net_profit_consolidated', s.net_profit_consolidated,
+                   'net_profit_parent', s.net_profit_parent) AS values,
+               COALESCE(p.projection_version, 'standard-inline-v1') AS projection_version,
+               p.projection_content_sha256
+          FROM std.financial_income_standard s
+          LEFT JOIN pit.financial_standard_projection p
+            ON p.projection_version=%s AND p.source_dataset='income'
+           AND p.standard_id=s.financial_id
+         WHERE s.stock_code=ANY(%s) AND s.report_date BETWEEN %s AND %s
+           AND COALESCE(s.report_type,'1')='1'
+           AND COALESCE(p.data_available_timestamp,s.data_available_timestamp) IS NOT NULL
+           AND COALESCE(p.data_available_timestamp,s.data_available_timestamp) <
+               (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'
+        UNION ALL
+        SELECT 'cashflow', s.stock_code, s.report_date,
+               COALESCE(p.data_available_timestamp, s.data_available_timestamp),
+               CASE WHEN p.standard_id IS NOT NULL THEN p.source_observed_at ELSE s.source_observed_at END,
+               s.report_type, s.comp_type,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.projected_end_type ELSE s.end_type END,
+               s.source_record_key, s.record_version, s.payload_hash,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.vintage_quality ELSE s.vintage_quality END,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.quality_status ELSE s.quality_status END,
+               jsonb_build_object('operating_cashflow_ytd', s.operating_cashflow_ytd),
+               COALESCE(p.projection_version, 'standard-inline-v1'), p.projection_content_sha256
+          FROM std.financial_cash_flow_standard s
+          LEFT JOIN pit.financial_standard_projection p
+            ON p.projection_version=%s AND p.source_dataset='cashflow'
+           AND p.standard_id=s.financial_id
+         WHERE s.stock_code=ANY(%s) AND s.report_date BETWEEN %s AND %s
+           AND COALESCE(s.report_type,'1')='1'
+           AND COALESCE(p.data_available_timestamp,s.data_available_timestamp) IS NOT NULL
+           AND COALESCE(p.data_available_timestamp,s.data_available_timestamp) <
+               (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'
+        UNION ALL
+        SELECT 'balance', s.stock_code, s.report_date,
+               COALESCE(p.data_available_timestamp, s.data_available_timestamp),
+               CASE WHEN p.standard_id IS NOT NULL THEN p.source_observed_at ELSE s.source_observed_at END,
+               s.report_type, s.comp_type,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.projected_end_type ELSE s.end_type END,
+               s.source_record_key, s.record_version, s.payload_hash,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.vintage_quality ELSE s.vintage_quality END,
+               CASE WHEN p.standard_id IS NOT NULL THEN p.quality_status ELSE s.quality_status END,
+               jsonb_build_object(
+                   'parent_equity_end', s.parent_equity_end,
+                   'total_equity_end', s.total_equity_end,
+                   'total_assets', s.total_assets, 'total_liab', s.total_liab),
+               COALESCE(p.projection_version, 'standard-inline-v1'), p.projection_content_sha256
+          FROM std.financial_balance_sheet_standard s
+          LEFT JOIN pit.financial_standard_projection p
+            ON p.projection_version=%s AND p.source_dataset='balance'
+           AND p.standard_id=s.financial_id
+         WHERE s.stock_code=ANY(%s) AND s.report_date BETWEEN %s AND %s
+           AND COALESCE(s.report_type,'1')='1'
+           AND COALESCE(p.data_available_timestamp,s.data_available_timestamp) IS NOT NULL
+           AND COALESCE(p.data_available_timestamp,s.data_available_timestamp) <
+               (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'
+        UNION ALL
+        SELECT 'indicator', s.ts_code, s.report_date, s.data_available_timestamp,
+               s.source_observed_at, s.report_type,
+               COALESCE(s.linked_comp_type, s.comp_type), s.end_type,
+               s.source_record_key, s.record_version, s.payload_hash,
+               s.vintage_quality, s.quality_status,
+               jsonb_build_object(
+                   'roe_reported', s.roe_reported,
+                   'roe_annualized', s.roe_annualized,
+                   'roe_quarterly', s.roe_quarterly,
+                   'debt_to_assets', s.debt_to_assets),
+               'standard-inline-v1', NULL::char(64)
+          FROM std.fina_indicator_standard s
+         WHERE s.ts_code=ANY(%s) AND s.report_date BETWEEN %s AND %s
+           AND COALESCE(s.report_type,'1')='1'
+           AND s.data_available_timestamp IS NOT NULL
+           AND s.data_available_timestamp <
+               (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'
+         ORDER BY ts_code, data_available_timestamp, report_date, dataset,
+                  record_version
+    """
+
     def load_events(
-        self, codes: Iterable[str], warmup_start: date, output_end: date, context: RunContext
+        self,
+        codes: Iterable[str],
+        warmup_start: date,
+        output_end: date,
+        context: RunContext,
+        projection: FinancialProjectionSelection | None = None,
     ) -> list[dict[str, Any]]:
         codes = tuple(codes)
         if not codes or warmup_start > output_end:
@@ -293,10 +395,24 @@ class FinancialRepository(BaseRepository):
             self.kernel.policy_registry.require("std.financial_income_standard").max_read_rows,
         )
         events: list[dict[str, Any]] = []
+        query = self._EVENTS_SQL
+        if projection is not None:
+            projection_scope = (
+                projection.projection_version, projection.manifest_sha256,
+                warmup_start, output_end,
+            )
+            if projection_scope not in self._validated_projection_scopes:
+                FinancialProjectionRepository(self.kernel).assert_complete(
+                    projection, context, warmup_start, output_end,
+                )
+                self._validated_projection_scopes.add(projection_scope)
+            query = self._PROJECTED_EVENTS_SQL
         for offset in range(0, len(codes), self._EVENT_CODE_BATCH_SIZE):
             code_batch = codes[offset : offset + self._EVENT_CODE_BATCH_SIZE]
             params: list[Any] = []
-            for _ in range(4):
+            for index in range(4):
+                if projection is not None and index < 3:
+                    params.append(projection.projection_version)
                 params.extend((list(code_batch), warmup_start, output_end, output_end))
             scope = WorkScope(
                 date_from=warmup_start, date_to=output_end, codes=code_batch,
@@ -305,7 +421,7 @@ class FinancialRepository(BaseRepository):
             events.extend(self.kernel.read._repository_query(
                 context=context,
                 source="std.financial_income_standard",
-                sql=self._EVENTS_SQL,
+                sql=query,
                 params=params,
                 scope=scope,
                 max_rows=read_limit,
@@ -357,6 +473,48 @@ class FinancialRepository(BaseRepository):
             scope=scope,
             target=target,
             producer=lambda _scope: normalized_rows,
+            mode=RebuildMode.SCOPED_MERGE,
+        )
+
+    def balance_sheet_codes(
+        self, start: date, end: date, context: RunContext,
+        requested: Iterable[str] | None = None,
+    ) -> list[str]:
+        code_filter = " AND stock_code=ANY(%s)" if requested else ""
+        params: tuple[Any, ...] = (start, end)
+        if requested:
+            params += (list(requested),)
+        rows = self.kernel.read._repository_query(
+            context=context,
+            source="std.financial_balance_sheet_standard",
+            sql=(
+                "SELECT DISTINCT stock_code FROM std.financial_balance_sheet_standard "
+                "WHERE report_date BETWEEN %s AND %s" + code_filter +
+                " ORDER BY stock_code"
+            ),
+            params=params,
+            scope=WorkScope(date_from=start, date_to=end, codes=tuple(requested or ())),
+            max_rows=self.kernel.policy_registry.require(
+                "std.financial_balance_sheet_standard"
+            ).max_read_rows,
+        )
+        return [str(row["stock_code"]) for row in rows]
+
+    def publish_debt_to_assets_partition(
+        self, rows: Iterable[dict[str, Any]], codes: Iterable[str],
+        output_start: date, output_end: date, context: RunContext,
+        target: str = "feature.debt_to_assets_v1",
+    ) -> int:
+        materialized = list(rows)
+        if not materialized:
+            return 0
+        scope = WorkScope(
+            date_from=output_start, date_to=output_end, codes=tuple(codes),
+            dimensions={"date_column": "report_date", "code_column": "ts_code"},
+        )
+        return self.kernel.rebuild.publish(
+            context=context, scope=scope, target=target,
+            producer=lambda _scope: materialized,
             mode=RebuildMode.SCOPED_MERGE,
         )
 

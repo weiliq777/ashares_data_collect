@@ -28,9 +28,13 @@ from data_collect.data_access.repository.research_snapshot_repository import (
     ResearchSnapshotRepository,
 )
 from data_collect.data_access.repository.pit_validation_repository import PitValidationRepository
+from data_collect.data_access.corporate_action_evidence import (
+    quality_report_has_current_ex_date_evidence,
+)
 from data_collect.data_access.research_contract import (
     FOUNDATION_SCHEMA_VERSION,
     FOUNDATION_SCHEMA_VERSIONS,
+    INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION,
     STRATEGY_NEUTRAL_SCHEMA_VERSION,
     assert_strategy_neutral_inputs,
     is_foundation_schema,
@@ -155,8 +159,16 @@ def _inputs_for_schema(schema_version: str):
     from data_collect.data_access.repository.research_snapshot_repository import ResearchSnapshotRepository
     if not is_foundation_schema(schema_version):
         return INPUTS
-    definitions = ResearchSnapshotRepository.foundation_inputs(INPUTS)
-    if schema_version == STRATEGY_NEUTRAL_SCHEMA_VERSION:
+    definitions = ResearchSnapshotRepository.foundation_inputs(
+        INPUTS,
+        independent_factors=(
+            schema_version == INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION
+        ),
+    )
+    if schema_version in {
+        STRATEGY_NEUTRAL_SCHEMA_VERSION,
+        INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION,
+    }:
         assert_strategy_neutral_inputs(definitions)
     return definitions
 
@@ -262,8 +274,12 @@ def _quality_report(
     # once per Snapshot; build/validate still perform cutoff-specific checks.
     if is_foundation_schema(schema_version) and baseline is not None:
         stored = baseline.quality_report
-        if isinstance(stored, dict) and stored.get("failures") == {}:
-            return dict(stored), baseline.quality_report_hash
+        if not quality_report_has_current_ex_date_evidence(stored):
+            raise RuntimeError(
+                "validated foundation release has stale or incomplete corporate-action "
+                "evidence; revalidate a new release before building Research Snapshots"
+            )
+        return dict(stored), baseline.quality_report_hash
     from data_collect.jobs.tushare_release import _quality_gate
 
     report = _quality_gate(

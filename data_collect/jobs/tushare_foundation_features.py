@@ -10,10 +10,20 @@ import os
 import re
 import uuid
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta
-from typing import Any, Iterable
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from data_collect.alpha_research.contracts import SOURCE_QUALITY_EVIDENCE_VERSION
+from data_collect.data_access import DataAccessKernel, RunContext
+from data_collect.data_access.policy_catalog import build_default_registry
+from data_collect.data_access.repository.financial_repository import (
+    FinancialRepository,
+)
+from data_collect.data_access.repository.financial_projection_repository import (
+    FinancialProjectionSelection,
+)
 from data_collect.features.financial_v2 import (
     DIVIDEND_PERCENTILE_MIN_OBSERVATIONS,
     VALUATION_WINDOW_COMPLETENESS_TOLERANCE_DAYS,
@@ -32,12 +42,6 @@ from data_collect.features.financial_v2 import (
     safe_margin,
     ttm_bridge,
 )
-from data_collect.data_access import DataAccessKernel, RunContext
-from data_collect.data_access.policy_catalog import build_default_registry
-from data_collect.data_access.repository.financial_repository import (
-    FinancialRepository,
-)
-
 
 logger = logging.getLogger(__name__)
 CONTRACT_VERSION = "feature-contract-v2.0"
@@ -142,10 +146,15 @@ def _checkpoint(
         kernel.close()
 
 
-def _load_events(codes: list[str], warmup_start: date, output_end: date) -> list[dict[str, Any]]:
+def _load_events(
+    codes: list[str],
+    warmup_start: date,
+    output_end: date,
+    projection: FinancialProjectionSelection | None = None,
+) -> list[dict[str, Any]]:
     kernel, repository, context = _financial_access()
     try:
-        return repository.load_events(codes, warmup_start, output_end, context)
+        return repository.load_events(codes, warmup_start, output_end, context, projection)
     finally:
         kernel.close()
 
@@ -298,22 +307,58 @@ def _dependent_report_dates(state, changed: dict[str, Any]) -> set[date]:
     return affected & visible_income_dates
 
 
-def _lineage(rows: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], str, datetime | None]:
+def _lineage(
+    rows: Iterable[dict[str, Any]],
+    *,
+    factor_inputs: dict[str, Iterable[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any], str, datetime | None]:
     unique = {}
     observed = []
     for row in rows:
-        key = f"{row['dataset']}:{row.get('source_record_key')}:{row.get('record_version')}"
-        unique[key] = {
+        projection_version = row.get("projection_version")
+        projection_identity = f":{projection_version}" if projection_version else ""
+        key = f"{row['dataset']}:{row.get('source_record_key')}:{row.get('record_version')}{projection_identity}"
+        item = unique.setdefault(key, {
             "dataset": row["dataset"],
             "source_record_key": row.get("source_record_key"),
             "record_version": row.get("record_version"),
             "payload_hash": row.get("payload_hash"),
             "vintage_quality": row.get("vintage_quality"),
-        }
+            "source_quality_status": row.get("quality_status"),
+            "used_by": [],
+        })
+        if projection_version:
+            item["projection_version"] = projection_version
+            item["projection_content_sha256"] = row.get("projection_content_sha256")
+        if item["source_quality_status"] != row.get("quality_status"):
+            item["source_quality_status"] = "CONFLICTING_SOURCE_QUALITY_STATUS"
         if row.get("source_observed_at") is not None:
             observed.append(row["source_observed_at"])
+    for factor_name, inputs in (factor_inputs or {}).items():
+        for row in inputs:
+            projection_version = row.get("projection_version")
+            projection_identity = f":{projection_version}" if projection_version else ""
+            key = f"{row['dataset']}:{row.get('source_record_key')}:{row.get('record_version')}{projection_identity}"
+            if key not in unique:
+                raise ValueError(f"factor input is absent from financial lineage: {key}")
+            unique[key]["used_by"].append(factor_name)
+    for item in unique.values():
+        item["used_by"] = sorted(set(item["used_by"]))
+    unique["__quality_evidence__"] = {
+        "version": SOURCE_QUALITY_EVIDENCE_VERSION,
+    }
     payload = json.dumps(unique, sort_keys=True, ensure_ascii=False, default=str)
     return unique, hashlib.sha256(payload.encode("utf-8")).hexdigest(), max(observed) if observed else None
+
+
+def _source_quality_status(rows: Iterable[dict[str, Any]]) -> str:
+    materialized = list(rows)
+    if not materialized or any(
+        str(row.get("quality_status") or "").strip().upper() not in {"VALID", "PASS"}
+        for row in materialized
+    ):
+        return "SOURCE_COMPONENT_QUALITY_NOT_VALID"
+    return "VALID"
 
 
 def _pit_evidence_level(rows: Iterable[dict[str, Any]]) -> str:
@@ -327,6 +372,132 @@ def _pit_evidence_level(rows: Iterable[dict[str, Any]]) -> str:
     if qualities == {"SOURCE_ANNOUNCEMENT_ASSUMED"}:
         return "SOURCE_ANNOUNCEMENT_ASSUMED"
     return "MIXED_SOURCE_AND_WAREHOUSE_OBSERVED"
+
+
+def calculate_debt_to_assets_features(
+    events: Iterable[dict[str, Any]], output_start: date, output_end: date,
+) -> list[dict[str, Any]]:
+    """Calculate balance-sheet leverage independently of income/cash-flow rows.
+
+    Each output represents one immutable balance-sheet source version. The
+    source availability timestamp and identity are copied from that exact
+    Standard row; no income-report join or global financial quality status is
+    used to decide whether this factor can be evaluated.
+    """
+    if output_start > output_end:
+        raise ValueError("output_start must not exceed output_end")
+    selected: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for raw in events:
+        if raw.get("dataset") != "balance":
+            continue
+        report_date = raw.get("report_date")
+        if isinstance(report_date, str):
+            report_date = date.fromisoformat(report_date[:10])
+        if not isinstance(report_date, date) or not output_start <= report_date <= output_end:
+            continue
+        identity = (
+            str(raw.get("ts_code") or ""), report_date,
+            raw.get("data_available_timestamp"),
+            str(raw.get("source_record_key") or ""),
+            raw.get("record_version"), str(raw.get("payload_hash") or ""),
+        )
+        selected[identity] = raw
+
+    output = []
+    for identity, source in sorted(selected.items(), key=lambda item: tuple(map(str, item[0]))):
+        report_date = identity[1]
+        values = source.get("values") or {}
+        assets = finite(values.get("total_assets"))
+        liabilities = finite(values.get("total_liab"))
+        ratio = None
+        reason = None
+        if assets is None or liabilities is None:
+            reason = "MISSING_TOTAL_ASSETS_OR_LIABILITIES"
+        elif assets <= 0:
+            reason = "TOTAL_ASSETS_MUST_BE_POSITIVE"
+        elif liabilities < 0:
+            reason = "TOTAL_LIABILITIES_MUST_BE_NONNEGATIVE"
+        else:
+            ratio = round((liabilities / assets) * 100.0, 4)
+
+        source_quality = str(source.get("quality_status") or "").strip().upper()
+        if reason is None and str(source.get("report_type") or "").strip() != "1":
+            reason = "REPORT_TYPE_NOT_SUPPORTED_OR_MISSING"
+        if reason is None and period_kind(report_date, source.get("end_type")) is None:
+            reason = "REPORT_PERIOD_TYPE_INVALID"
+        source_key = str(source.get("source_record_key") or "").strip() or None
+        source_hash = str(source.get("payload_hash") or "").strip().lower() or None
+        source_version = source.get("record_version")
+        if reason is None and source_quality not in {"VALID", "PASS"}:
+            reason = "SOURCE_QUALITY_NOT_VALID"
+        if reason is None and (
+            not source_key or source_version is None
+            or source_hash is None or len(source_hash) != 64
+        ):
+            reason = "SOURCE_IDENTITY_INCOMPLETE"
+        available_at = source.get("data_available_timestamp")
+        if isinstance(available_at, str):
+            try:
+                available_at = datetime.fromisoformat(available_at)
+            except ValueError:
+                available_at = None
+        if reason is None and not isinstance(available_at, datetime):
+            reason = "AVAILABILITY_TIMESTAMP_MISSING"
+        if reason is None and (
+            available_at.tzinfo is None or available_at.utcoffset() is None
+        ):
+            reason = "AVAILABILITY_TIMESTAMP_TIMEZONE_MISSING"
+        factor_quality = "VALID" if reason is None else (
+            "WARNING" if ratio is not None else "MISSING"
+        )
+        fingerprint_payload = {
+            "contract": "debt-to-assets-v1",
+            "ts_code": source.get("ts_code"),
+            "report_date": report_date,
+            "data_available_timestamp": available_at,
+            "source_record_key": source_key,
+            "record_version": source_version,
+            "payload_hash": source_hash,
+            "total_assets": assets,
+            "total_liab": liabilities,
+            "debt_to_assets": ratio,
+            "quality_status": factor_quality,
+            "quality_reason": reason,
+            "source_quality_status": source_quality or "UNKNOWN",
+            "vintage_quality": source.get("vintage_quality"),
+        }
+        if source.get("projection_version"):
+            fingerprint_payload["source_projection_version"] = source["projection_version"]
+            fingerprint_payload["projection_content_sha256"] = source.get("projection_content_sha256")
+        fingerprint = hashlib.sha256(json.dumps(
+            fingerprint_payload, sort_keys=True, separators=(",", ":"),
+            default=str, allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        feature_row = {
+            "ts_code": source.get("ts_code"),
+            "report_date": report_date,
+            "data_available_timestamp": available_at,
+            "source_observed_at": source.get("source_observed_at"),
+            "report_type": source.get("report_type"),
+            "comp_type": source.get("comp_type"),
+            "end_type": source.get("end_type"),
+            "total_liab": liabilities,
+            "total_assets": assets,
+            "debt_to_assets": ratio,
+            "quality_status": factor_quality,
+            "quality_reason": reason,
+            "source_quality_status": source_quality or "UNKNOWN",
+            "vintage_quality": source.get("vintage_quality"),
+            "source_record_key": source_key,
+            "record_version": source_version,
+            "payload_hash": source_hash,
+            "source_fingerprint": fingerprint,
+            "feature_contract_version": "debt-to-assets-v1",
+        }
+        if source.get("projection_version"):
+            feature_row["source_projection_version"] = source["projection_version"]
+        output.append(feature_row)
+    return output
 
 
 def _build_feature(state, ts_code: str, report_date: date, event_time) -> dict[str, Any] | None:
@@ -368,7 +539,7 @@ def _build_feature(state, ts_code: str, report_date: date, event_time) -> dict[s
         q_result, ttm_result, rows = _bridge(
             state, dataset, field, report_date, kind, comp_type
         )
-        bridges[name] = (q_result, ttm_result)
+        bridges[name] = (q_result, ttm_result, rows)
         lineage_rows.extend(rows)
 
     prior_balance = _latest(
@@ -407,6 +578,7 @@ def _build_feature(state, ts_code: str, report_date: date, event_time) -> dict[s
     )
     if prior_income:
         lineage_rows.append(prior_income)
+    growth_inputs = [row for row in (income, prior_income) if row]
     revenue_growth = safe_growth(_value(income, "revenue"), _value(prior_income, "revenue"))
     profit_growth = safe_growth(
         _value(income, "net_profit_parent"), _value(prior_income, "net_profit_parent")
@@ -467,8 +639,9 @@ def _build_feature(state, ts_code: str, report_date: date, event_time) -> dict[s
     )
     cashflow_status = "VALID" if complete and ocf_reason == "VALID" else ocf_reason
     growth_status = (
-        "VALID" if revenue_growth is not None and profit_growth is not None
-        else "INSUFFICIENT_HISTORY"
+        "INSUFFICIENT_HISTORY"
+        if revenue_growth is None or profit_growth is None
+        else _source_quality_status(growth_inputs)
     )
     profit_recovery = None
     if stats["profit_window_complete"]:
@@ -477,9 +650,25 @@ def _build_feature(state, ts_code: str, report_date: date, event_time) -> dict[s
             and bridges["parent"][1].value is not None
             and bridges["parent"][1].value > 0
         )
-    lineage, fingerprint, observed_at = _lineage(lineage_rows)
+    roe_inputs = [
+        *bridges["parent"][2],
+        *[row for row in (balance, prior_balance) if row],
+    ]
+    lineage, fingerprint, observed_at = _lineage(
+        lineage_rows,
+        factor_inputs={
+            "roe_ttm": roe_inputs,
+            "revenue_growth_yoy": growth_inputs,
+            "profit_growth_yoy": growth_inputs,
+        },
+    )
+    if roe_reason == "VALID" and _source_quality_status(roe_inputs) != "VALID":
+        roe_reason = "SOURCE_COMPONENT_QUALITY_NOT_VALID"
     total_assets, total_liab = _value(balance, "total_assets"), _value(balance, "total_liab")
-    debt_to_assets = safe_margin(total_liab, total_assets)
+    debt_ratio = safe_margin(total_liab, total_assets)
+    # Match fina_indicator and strategy thresholds, which express this field
+    # in percentage points; safe_margin is otherwise a unitless ratio.
+    debt_to_assets = None if debt_ratio is None else round(debt_ratio * 100.0, 4)
 
     return {
         "ts_code": ts_code,
@@ -613,6 +802,7 @@ def rebuild_company_financial_v2(
     requested_codes: list[str] | None = None,
     target_table: str = TARGET_TABLE,
     batch_stocks: int = DEFAULT_FEATURE_BATCH_STOCKS,
+    projection: FinancialProjectionSelection | None = None,
 ) -> dict[str, int]:
     if batch_stocks <= 0:
         raise ValueError("batch_stocks 必须为正整数")
@@ -624,10 +814,14 @@ def rebuild_company_financial_v2(
             repository.completed_checkpoint_keys(run_id, "company_financial_v2", context)
             if run_id else set()
         )
+        projection_checkpoint = (
+            f":{projection.projection_version}:{projection.manifest_sha256[:12]}"
+            if projection else ""
+        )
         attempted = written = completed = 0
         for offset in range(0, len(codes), batch_stocks):
             batch = codes[offset : offset + batch_stocks]
-            partition_key = f"{batch[0]}..{batch[-1]}"
+            partition_key = f"{batch[0]}..{batch[-1]}{projection_checkpoint}"
             if run_id and partition_key in completed_keys:
                 completed += 1
                 continue
@@ -636,7 +830,7 @@ def rebuild_company_financial_v2(
                     run_id, "company_financial_v2", partition_key, "RUNNING", context
                 )
             try:
-                events = _load_events(batch, warmup_start, output_end)
+                events = _load_events(batch, warmup_start, output_end, projection)
                 rows = calculate_features(events, output_start, output_end)
                 result_hash = hashlib.sha256(
                     json.dumps(
@@ -666,6 +860,94 @@ def rebuild_company_financial_v2(
                     )
                 raise
         return {"stocks": len(codes), "partitions": completed, "attempted": attempted, "written": written}
+    finally:
+        kernel.close()
+
+
+def rebuild_debt_to_assets_features(
+    run_id: str | None,
+    output_start: date,
+    output_end: date,
+    requested_codes: list[str] | None = None,
+    target_table: str = "feature.debt_to_assets_v1",
+    batch_stocks: int = DEFAULT_FEATURE_BATCH_STOCKS,
+    projection: FinancialProjectionSelection | None = None,
+) -> dict[str, int]:
+    """Build the independent D/A Feature directly from balance-sheet versions."""
+    if batch_stocks <= 0:
+        raise ValueError("batch_stocks 必须为正整数")
+    _target(target_table)
+    kernel, repository, context = _financial_access(run_id)
+    try:
+        codes = repository.balance_sheet_codes(
+            output_start, output_end, context, requested_codes,
+        )
+        completed_keys = (
+            repository.completed_checkpoint_keys(
+                run_id, "debt_to_assets_v1", context,
+            )
+            if run_id else set()
+        )
+        projection_checkpoint = (
+            f":{projection.projection_version}:{projection.manifest_sha256[:12]}"
+            if projection else ""
+        )
+        attempted = written = completed = 0
+        for offset in range(0, len(codes), batch_stocks):
+            batch = codes[offset:offset + batch_stocks]
+            partition_key = f"{batch[0]}..{batch[-1]}{projection_checkpoint}"
+            if run_id and partition_key in completed_keys:
+                completed += 1
+                continue
+            if run_id:
+                repository.save_checkpoint(
+                    run_id, "debt_to_assets_v1", partition_key, "RUNNING", context,
+                )
+            try:
+                events = repository.load_events(
+                    batch, output_start, output_end, context, projection,
+                )
+                rows = calculate_debt_to_assets_features(
+                    events, output_start, output_end,
+                )
+                result_hash = hashlib.sha256(json.dumps(
+                    rows, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), default=str, allow_nan=False,
+                ).encode("utf-8")).hexdigest()
+                count = repository.publish_debt_to_assets_partition(
+                    rows, batch, output_start, output_end, context, target_table,
+                )
+                if run_id:
+                    repository.save_checkpoint(
+                        run_id, "debt_to_assets_v1", partition_key,
+                        "COMPLETED", context, len(rows), count, result_hash,
+                    )
+                attempted += len(rows)
+                written += count
+                completed += 1
+            except Exception as exc:
+                if run_id:
+                    repository.save_checkpoint(
+                        run_id, "debt_to_assets_v1", partition_key,
+                        "FAILED", context, error=str(exc)[:1000],
+                    )
+                raise
+        return {
+            "stocks": len(codes), "partitions": completed,
+            "attempted": attempted, "written": written,
+        }
+    finally:
+        kernel.close()
+
+
+def create_debt_to_assets_smoke_target(run_id: str) -> str:
+    suffix = run_id.replace("-", "")[:12]
+    table = f"debt_to_assets_v1_smoke_{suffix}"
+    kernel, repository, context = _financial_access(run_id)
+    try:
+        return repository.create_feature_target(
+            "feature.debt_to_assets_v1", f"feature.{table}", context,
+        )
     finally:
         kernel.close()
 
@@ -965,11 +1247,25 @@ def main():
     parser.add_argument("--codes", nargs="*")
     parser.add_argument("--target-table", default=TARGET_TABLE)
     parser.add_argument("--batch-stocks", type=int, default=DEFAULT_FEATURE_BATCH_STOCKS)
+    parser.add_argument("--financial-projection-version")
+    parser.add_argument("--financial-projection-manifest-sha256")
     args = parser.parse_args()
+    if bool(args.financial_projection_version) != bool(args.financial_projection_manifest_sha256):
+        parser.error(
+            "financial projection selection requires both --financial-projection-version "
+            "and --financial-projection-manifest-sha256"
+        )
+    projection = (
+        FinancialProjectionSelection(
+            args.financial_projection_version,
+            args.financial_projection_manifest_sha256,
+        )
+        if args.financial_projection_version else None
+    )
     result = rebuild_company_financial_v2(
         args.run_id, date.fromisoformat(args.warmup_start),
         date.fromisoformat(args.output_start), date.fromisoformat(args.output_end),
-        args.codes, args.target_table, args.batch_stocks,
+        args.codes, args.target_table, args.batch_stocks, projection,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

@@ -1,4 +1,7 @@
+from datetime import date, datetime
 from pathlib import Path
+
+import pytest
 
 from data_collect.data_access import DataAccessKernel, WorkScope
 from data_collect.data_access.policy_catalog import build_default_registry
@@ -58,6 +61,67 @@ def test_financial_standard_and_compatibility_upserts_pass_kernel_policy_check()
     )
     assert any("std.financial_income_standard" in item["sql"] for item in connection.executed)
     assert any("std.stock_financial_indicator" in item["sql"] for item in connection.executed)
+
+
+def test_financial_standard_repository_reads_exact_bounded_raw_versions(monkeypatch):
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=FakeConnection
+    )
+    repository = FinancialStandardRepository(kernel)
+    captured = {}
+    monkeypatch.setattr(
+        kernel.read,
+        "_repository_query",
+        lambda *args: captured.update(args=args) or [{
+            "record_id": 123,
+            "logical_business_key": "000001.SZ:20210630:1:1:2",
+            "payload": {"ts_code": "000001.SZ", "end_date": "20210630"},
+            "payload_hash": "a" * 64,
+            "fetched_at": datetime(2021, 8, 1),
+            "ambiguous_same_day_revision": False,
+        }],
+    )
+
+    rows = repository.raw_versions_by_ids(
+        "income", [123, 123], _context(), date(2021, 6, 30), date(2021, 6, 30),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["_record_id"] == 123
+    assert rows[0]["_payload_hash"] == "a" * 64
+    assert rows[0]["_ambiguous_same_day_revision"] is False
+    assert captured["args"][1] == "tushare_financial_raw_version"
+    assert captured["args"][3] == ("income", [123])
+    assert "r.record_id=ANY(%s)" in captured["args"][2]
+    assert "other.payload_hash <> r.payload_hash" in captured["args"][2]
+    assert captured["args"][4].date_from == date(2021, 6, 30)
+    assert captured["args"][4].date_to == date(2021, 6, 30)
+    assert captured["args"][5] == 200
+    kernel.close()
+
+
+def test_financial_standard_repository_rejects_unbounded_raw_lookup():
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=FakeConnection
+    )
+    repository = FinancialStandardRepository(kernel)
+    with pytest.raises(ValueError):
+        repository.raw_versions_by_ids(
+            "fina_indicator", [123], _context(), date(2021, 6, 30), date(2021, 6, 30),
+        )
+    with pytest.raises(ValueError):
+        repository.raw_versions_by_ids(
+            "income", list(range(1, 202)), _context(), date(2021, 6, 30), date(2021, 6, 30),
+        )
+    with pytest.raises(ValueError):
+        repository.raw_versions_by_ids(
+            "income", [0], _context(), date(2021, 6, 30), date(2021, 6, 30),
+        )
+    with pytest.raises(ValueError):
+        repository.raw_versions_by_ids(
+            "income", [123], _context(), None, None,
+        )
+    kernel.close()
 
 
 def test_fina_indicator_same_day_revision_is_not_dropped():

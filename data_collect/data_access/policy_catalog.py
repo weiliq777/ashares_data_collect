@@ -200,6 +200,37 @@ def build_default_registry() -> DatasetPolicyRegistry:
             ),
             # ---- Observation（观察域）与可选 PIT 行业输入 ----
             DatasetPolicy(
+                name="pit.financial_standard_projection_run",
+                write_modes=frozenset([WriteMode.BULK_INSERT]),
+                primary_key=("projection_version",),
+                require_scope=True,
+                update_allowed=False,
+                delete_allowed=False,
+                scan_policy=ScanPolicy.SCOPE_REQUIRED,
+                direct_read_allowed=False,
+            ),
+            DatasetPolicy(
+                name="pit.financial_standard_projection_batch",
+                write_modes=frozenset([WriteMode.BULK_INSERT]),
+                primary_key=("projection_version", "source_dataset", "batch_number"),
+                require_scope=True,
+                update_allowed=False,
+                delete_allowed=False,
+                scan_policy=ScanPolicy.SCOPE_REQUIRED,
+                direct_read_allowed=False,
+            ),
+            DatasetPolicy(
+                name="pit.financial_standard_projection",
+                write_modes=frozenset([WriteMode.BULK_INSERT]),
+                primary_key=("projection_version", "source_dataset", "standard_id"),
+                require_scope=True,
+                update_allowed=False,
+                delete_allowed=False,
+                scan_policy=ScanPolicy.SCOPE_REQUIRED,
+                direct_read_allowed=False,
+                max_read_rows=100_000,
+            ),
+            DatasetPolicy(
                 name="pit.industry_membership_history",
                 write_modes=frozenset([WriteMode.UPSERT, WriteMode.BULK_INSERT, WriteMode.REBUILD]),
                 primary_key=("source", "source_record_key", "record_version"),
@@ -967,6 +998,7 @@ def build_default_registry() -> DatasetPolicyRegistry:
         "backtest.fill", "backtest.position_lot", "backtest.position_daily",
         "backtest.cash_ledger", "backtest.performance_daily", "backtest.metric",
         "feature.company_financial_v1", "feature.company_financial_v2",
+        "feature.debt_to_assets_v1",
         "feature.valuation_daily_v1", "feature.price_adjustment_factor_asof",
         "feature.price_daily_v1", "feature.price_daily_v2",
         "feature.shareholder_return_v1", "foundation.market_rule_effective",
@@ -983,6 +1015,7 @@ def build_default_registry() -> DatasetPolicyRegistry:
     partition_overrides = {
         "feature.company_financial_v1": ("report_date",),
         "feature.company_financial_v2": ("report_date",),
+        "feature.debt_to_assets_v1": ("report_date",),
         "feature.shareholder_return_v1": ("asof_date",),
     }
     for name in concrete_targets:
@@ -996,6 +1029,8 @@ def build_default_registry() -> DatasetPolicyRegistry:
                 inherited,
                 name=name,
                 partition_key=partition_overrides.get(name, inherited.partition_key),
+                primary_key=("source_fingerprint",)
+                if name == "feature.debt_to_assets_v1" else inherited.primary_key,
             )
         )
     return r

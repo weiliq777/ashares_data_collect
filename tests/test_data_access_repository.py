@@ -14,14 +14,14 @@ import pytest
 from data_collect.data_access import DataAccessKernel
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.policy_catalog import build_default_registry
-from data_collect.data_access.repository.security_repository import SecurityRepository
-from data_collect.data_access.repository.pit_repository import PitRepository
 from data_collect.data_access.repository.market_repository import MarketRepository
+from data_collect.data_access.repository.pit_repository import PitRepository
 from data_collect.data_access.repository.release_repository import ReleaseRepository
 from data_collect.data_access.repository.research_snapshot_repository import (
     ResearchBaseline,
     ResearchSnapshotRepository,
 )
+from data_collect.data_access.repository.security_repository import SecurityRepository
 from tests._fake_db import FakeConnection
 
 
@@ -436,6 +436,74 @@ def test_dataset_runtime_pages_are_bounded_by_requested_evaluation_window():
     assert observation_query["params"] == (
         "dataset-1", start, end, date(2025, 1, 31), "000001.SZ",
     )
+
+
+def test_dataset_runtime_pages_can_filter_to_a_deterministic_security_sample():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = DatasetRepository(kernel)
+    codes = ("000001.SZ", "600000.SH")
+    start, end = date(2025, 1, 2), date(2025, 1, 3)
+
+    repository.bar_page(
+        "dataset-1", ctx(), limit=100, date_from=start, date_to=end, codes=codes,
+    )
+    repository.observation_page(
+        "dataset-1", ("research_date", "ts_code", "raw_close"), ctx(),
+        limit=100, date_from=start, date_to=end, codes=codes,
+    )
+
+    bar_query = next(
+        row for row in conn.executed
+        if "FROM backtest.dataset_execution_bar" in row["sql"]
+    )
+    observation_query = next(
+        row for row in conn.executed
+        if "JOIN research.stock_snapshot_daily s" in row["sql"]
+    )
+    assert "ts_code=ANY(%s)" in bar_query["sql"]
+    assert "s.ts_code=ANY(%s)" in observation_query["sql"]
+    assert bar_query["params"] == ("dataset-1", start, end, list(codes))
+    assert observation_query["params"] == (
+        "dataset-1", start, end, list(codes),
+    )
+
+
+def test_frozen_snapshot_reader_can_filter_to_a_deterministic_security_sample():
+    from data_collect.data_access.repository.snapshot_repository import SnapshotRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = SnapshotRepository(kernel)
+
+    repository.read_frozen_rows(
+        "snapshot-1", ctx(), limit=30, codes=("000001.SZ", "600000.SH"),
+    )
+
+    query = conn.executed[-1]
+    assert "ts_code=ANY(%s)" in query["sql"]
+    assert query["params"] == ("snapshot-1", ["000001.SZ", "600000.SH"])
+
+
+def test_dataset_baseline_read_includes_release_schema_and_quality_evidence():
+    from data_collect.data_access.repository.dataset_repository import DatasetRepository
+
+    conn = FakeConnection()
+    kernel = DataAccessKernel(
+        policy_registry=build_default_registry(), connection_factory=lambda: conn
+    )
+    repository = DatasetRepository(kernel)
+
+    assert repository.baseline("release-1", ctx()) is None
+    query = conn.executed[-1]["sql"]
+    assert "schema_version" in query
+    assert "quality_report" in query
 
 
 def test_dataset_research_snapshot_contracts_are_joined_in_one_bounded_read():

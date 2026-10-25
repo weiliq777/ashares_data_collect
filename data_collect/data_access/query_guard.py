@@ -28,8 +28,9 @@ _OPERATION_TO_WRITE_MODE = {
 class QueryGuard:
     """执行前守卫。任何违反契约的操作在这里被确定性拒绝。"""
 
-    def __init__(self, registry: DatasetPolicyRegistry) -> None:
+    def __init__(self, registry: DatasetPolicyRegistry, *, read_only: bool = False) -> None:
         self._registry = registry
+        self._read_only = read_only
 
     def check(self, plan: SqlPlan) -> None:
         """按 §5.2 规则表逐条检查；违反抛 PolicyViolation / GuardViolation。"""
@@ -37,6 +38,11 @@ class QueryGuard:
             raise TypeError("QueryGuard requires SqlPlan")
         policy = self._registry.require(plan.target)
         op = plan.operation
+
+        if self._read_only and op is not Operation.READ:
+            raise GuardViolation(
+                f"read-only audit kernel rejects database operation: {op.value}"
+            )
 
         # Schema defaults are useful for read compatibility during migration,
         # but they must never authorize an unregistered write target. Every

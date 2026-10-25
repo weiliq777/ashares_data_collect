@@ -1,9 +1,11 @@
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
+import data_collect.jobs.tushare_foundation_features as foundation_features
 from data_collect.features.financial_v2 import (
     DIVIDEND_PERCENTILE_MIN_OBSERVATIONS,
     annual_window_stats,
@@ -15,14 +17,16 @@ from data_collect.features.financial_v2 import (
     safe_growth,
     ttm_bridge,
 )
+from data_collect.jobs.tushare_financial_raw_to_standard import transform
 from data_collect.jobs.tushare_foundation_features import (
     _dependent_report_dates,
     _latest,
+    _lineage,
     _pit_evidence_level,
+    calculate_debt_to_assets_features,
+    calculate_features,
     calculate_valuation_features,
 )
-import data_collect.jobs.tushare_foundation_features as foundation_features
-from data_collect.jobs.tushare_financial_raw_to_standard import transform
 
 
 def test_period_kind_requires_end_type_to_match_calendar_period():
@@ -130,14 +134,189 @@ def test_gross_margin_never_falls_back_to_total_operating_cost():
     assert 'bridges["total_cogs"]' not in block
 
 
-def test_debt_ratio_never_mixes_vendor_percent_with_decimal_ratio():
-    source = Path("data_collect/jobs/tushare_foundation_features.py").read_text(
-        encoding="utf-8"
-    )
-    block = source.split("total_assets, total_liab", 1)[1].split(
-        'return {', 1
+@pytest.mark.parametrize(
+    ("ts_code", "available_at", "total_liab", "total_assets", "expected_percent"),
+    [
+        (
+            "688426.SH",
+            datetime(2023, 8, 30, 16, 0, tzinfo=ZoneInfo("UTC")),
+            165_171_823.69,
+            1_916_363_186.94,
+            8.619,
+        ),
+        (
+            "688448.SH",
+            datetime(2023, 8, 29, 16, 0, tzinfo=ZoneInfo("UTC")),
+            365_572_388.12,
+            1_309_653_787.13,
+            27.9137,
+        ),
+    ],
+)
+def test_debt_to_assets_uses_percentage_points_from_balance_sheet(
+    ts_code, available_at, total_liab, total_assets, expected_percent,
+):
+    report_date = date(2023, 6, 30)
+
+    def event(dataset, values):
+        return {
+            "dataset": dataset,
+            "ts_code": ts_code,
+            "report_date": report_date,
+            "data_available_timestamp": available_at,
+            "source_observed_at": available_at,
+            "report_type": "1",
+            "comp_type": "1",
+            "end_type": "2",
+            "source_record_key": f"{dataset}:{ts_code}:{report_date}",
+            "record_version": 1,
+            "payload_hash": "a" * 64,
+            "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+            "quality_status": "VALID",
+            "values": values,
+        }
+
+    income = event("income", {
+        "revenue": 100.0,
+        "oper_cost": 50.0,
+        "total_cogs": 50.0,
+        "net_profit_consolidated": 10.0,
+        "net_profit_parent": 10.0,
+    })
+    balance = event("balance", {
+        "total_assets": total_assets,
+        "total_liab": total_liab,
+        "parent_equity_end": 100.0,
+        "total_equity_end": 100.0,
+    })
+
+    feature = calculate_features(
+        [income, balance], report_date, report_date,
     )[0]
-    assert '_value(indicator, "debt_to_assets")' not in block
+
+    assert feature["debt_to_assets"] == pytest.approx(expected_percent)
+
+
+@pytest.mark.parametrize(
+    ("ts_code", "available_at", "total_liab", "total_assets", "expected"),
+    [
+        (
+            "688426.SH", datetime(2023, 8, 30, 16, 0, tzinfo=ZoneInfo("UTC")),
+            165_171_823.69, 1_916_363_186.94, 8.619,
+        ),
+        (
+            "688448.SH", datetime(2023, 8, 29, 16, 0, tzinfo=ZoneInfo("UTC")),
+            365_572_388.12, 1_309_653_787.13, 27.9137,
+        ),
+    ],
+)
+def test_debt_to_assets_feature_does_not_require_an_income_report(
+    ts_code, available_at, total_liab, total_assets, expected,
+):
+    balance = {
+        "dataset": "balance", "ts_code": ts_code,
+        "report_date": date(2023, 6, 30),
+        "data_available_timestamp": available_at,
+        "source_observed_at": datetime(2026, 8, 3, 15, 0),
+        "report_type": "1", "comp_type": "1", "end_type": "2",
+        "source_record_key": f"{ts_code}:2023-06-30:1:1:2",
+        "record_version": 12, "payload_hash": "b" * 64,
+        "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+        "quality_status": "VALID",
+        "values": {"total_liab": total_liab, "total_assets": total_assets},
+    }
+
+    features = calculate_debt_to_assets_features(
+        [balance], date(2023, 6, 30), date(2023, 6, 30),
+    )
+
+    assert len(features) == 1
+    assert features[0]["debt_to_assets"] == expected
+    assert features[0]["quality_status"] == "VALID"
+    assert features[0]["source_record_key"] == balance["source_record_key"]
+    assert features[0]["record_version"] == 12
+    assert features[0]["payload_hash"] == "b" * 64
+
+
+def test_debt_to_assets_keeps_warning_evidence_without_marking_it_valid():
+    warning = {
+        "dataset": "balance", "ts_code": "000001.SZ",
+        "report_date": date(2023, 6, 30),
+        "data_available_timestamp": datetime(2023, 8, 1, 8, 0, tzinfo=ZoneInfo("UTC")),
+        "report_type": "1", "comp_type": "1", "end_type": "2",
+        "source_record_key": "balance-warning", "record_version": 1,
+        "payload_hash": "c" * 64, "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+        "quality_status": "WARNING",
+        "values": {"total_liab": 35, "total_assets": 100},
+    }
+
+    feature = calculate_debt_to_assets_features(
+        [warning], date(2023, 6, 30), date(2023, 6, 30),
+    )[0]
+
+    assert feature["debt_to_assets"] == 35.0
+    assert feature["quality_status"] == "WARNING"
+    assert feature["quality_reason"] == "SOURCE_QUALITY_NOT_VALID"
+    assert feature["source_quality_status"] == "WARNING"
+
+
+def test_debt_to_assets_preserves_report_period_for_each_source_version():
+    dates = (
+        (date(2023, 3, 31), "1"),
+        (date(2023, 6, 30), "2"),
+        (date(2023, 9, 30), "3"),
+        (date(2023, 12, 31), "4"),
+    )
+    balances = [
+        {
+            "dataset": "balance", "ts_code": "000001.SZ",
+            "report_date": report_date,
+            "data_available_timestamp": datetime(
+                report_date.year, report_date.month, report_date.day, 8, 0,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+            "report_type": "1", "comp_type": "1", "end_type": end_type,
+            "source_record_key": f"000001.SZ:{report_date}:{end_type}",
+            "record_version": index + 1, "payload_hash": str(index + 1) * 64,
+            "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+            "quality_status": "VALID",
+            "values": {"total_liab": 35, "total_assets": 100},
+        }
+        for index, (report_date, end_type) in enumerate(dates)
+    ]
+
+    features = calculate_debt_to_assets_features(
+        balances, date(2023, 1, 1), date(2023, 12, 31),
+    )
+
+    assert [feature["report_date"] for feature in features] == [
+        report_date for report_date, _ in dates
+    ]
+    assert [feature["quality_status"] for feature in features] == ["VALID"] * 4
+    assert [feature["quality_reason"] for feature in features] == [None] * 4
+
+
+def test_debt_to_assets_rejects_a_report_period_end_type_mismatch():
+    balance = {
+        "dataset": "balance", "ts_code": "000001.SZ",
+        "report_date": date(2023, 3, 31),
+        "data_available_timestamp": datetime(
+            2023, 4, 20, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"),
+        ),
+        "report_type": "1", "comp_type": "1", "end_type": "4",
+        "source_record_key": "balance:20230331:wrong-end-type",
+        "record_version": 3, "payload_hash": "d" * 64,
+        "quality_status": "VALID", "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+        "values": {"total_liab": 35.0, "total_assets": 100.0},
+    }
+
+    feature = calculate_debt_to_assets_features(
+        [balance], date(2023, 1, 1), date(2023, 12, 31),
+    )[0]
+
+    assert feature["debt_to_assets"] == 35.0
+    assert feature["quality_status"] == "WARNING"
+    assert feature["quality_reason"] == "REPORT_PERIOD_TYPE_INVALID"
 
 
 def test_dividend_percentile_counts_zero_as_a_valid_observation():
@@ -189,11 +368,140 @@ def test_cashflow_standard_does_not_use_reconciliation_profit_as_primary_profit(
 
 def test_financial_feature_input_enforces_one_cutoff_for_all_four_sources():
     source = Path("data_collect/data_access/repository/financial_repository.py").read_text(encoding="utf-8")
-    loader = source.split("_EVENTS_SQL", 1)[1].split("def load_events", 1)[0]
+    loader = source.split("    _EVENTS_SQL =", 1)[1].split(
+        "    _PROJECTED_EVENTS_SQL =", 1,
+    )[0]
     assert loader.count("data_available_timestamp <") == 4
     assert loader.count(
         "(%s::date + 1)::timestamp AT TIME ZONE 'Asia/Shanghai'"
     ) == 4
+    assert loader.count("quality_status") >= 4
+
+
+def test_financial_component_lineage_preserves_source_quality_and_factor_dependencies():
+    income = {
+        "dataset": "income", "source_record_key": "income:20230630",
+        "record_version": 7, "payload_hash": "a" * 64,
+        "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+        "quality_status": "VALID",
+    }
+    cashflow = {
+        "dataset": "cashflow", "source_record_key": "cashflow:20230630",
+        "record_version": 8, "payload_hash": "b" * 64,
+        "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+        "quality_status": "WARNING",
+    }
+
+    lineage, _fingerprint, _observed_at = _lineage(
+        [income, cashflow],
+        factor_inputs={"revenue_growth_yoy": [income]},
+    )
+
+    assert lineage["__quality_evidence__"]["version"] == "financial-source-quality-v1"
+    assert lineage["income:income:20230630:7"]["source_quality_status"] == "VALID"
+    assert lineage["income:income:20230630:7"]["used_by"] == ["revenue_growth_yoy"]
+    assert lineage["cashflow:cashflow:20230630:8"]["source_quality_status"] == "WARNING"
+    assert lineage["cashflow:cashflow:20230630:8"]["used_by"] == []
+
+
+def test_growth_quality_does_not_inherit_unrelated_cashflow_source_warning():
+    from data_collect.alpha_research.factors import factor_value
+
+    signal_date = date(2023, 8, 21)
+    current_time = datetime(2023, 8, 20, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def event(dataset, period, end_type, available, values, quality="VALID"):
+        key = f"{dataset}:{period.isoformat()}"
+        return {
+            "dataset": dataset, "ts_code": "000001.SZ", "report_date": period,
+            "data_available_timestamp": available, "source_observed_at": available,
+            "report_type": "1", "comp_type": "1", "end_type": end_type,
+            "source_record_key": key, "record_version": 1,
+            "payload_hash": (str(len(key)) * 64)[:64],
+            "vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+            "quality_status": quality, "values": values,
+        }
+
+    def income_event(period, end_type, available, revenue, profit):
+        return event("income", period, end_type, available, {
+            "revenue": revenue, "oper_cost": revenue * 0.5,
+            "total_cogs": revenue * 0.5,
+            "net_profit_consolidated": profit * 1.2,
+            "net_profit_parent": profit,
+        })
+
+    def cashflow_event(period, end_type, available, quality="VALID"):
+        return event("cashflow", period, end_type, available,
+                     {"operating_cashflow_ytd": 40.0}, quality)
+
+    def balance_event(period, end_type, available, quality="VALID"):
+        return event("balance", period, end_type, available, {
+            "parent_equity_end": 500.0, "total_equity_end": 550.0,
+            "total_assets": 1000.0, "total_liab": 450.0,
+        }, quality)
+
+    rows = [
+        income_event(date(2022, 3, 31), "1", datetime(2022, 4, 20, 16, tzinfo=ZoneInfo("Asia/Shanghai")), 30, 5),
+        income_event(date(2022, 6, 30), "2", datetime(2022, 8, 20, 16, tzinfo=ZoneInfo("Asia/Shanghai")), 80, 12),
+        income_event(date(2022, 12, 31), "4", datetime(2023, 3, 25, 16, tzinfo=ZoneInfo("Asia/Shanghai")), 150, 22),
+        income_event(date(2023, 6, 30), "2", current_time, 100, 15),
+        cashflow_event(date(2022, 3, 31), "1", datetime(2022, 4, 20, 16, tzinfo=ZoneInfo("Asia/Shanghai"))),
+        cashflow_event(date(2022, 6, 30), "2", datetime(2022, 8, 20, 16, tzinfo=ZoneInfo("Asia/Shanghai"))),
+        cashflow_event(date(2022, 12, 31), "4", datetime(2023, 3, 25, 16, tzinfo=ZoneInfo("Asia/Shanghai"))),
+        cashflow_event(date(2023, 6, 30), "2", current_time, quality="WARNING"),
+        balance_event(date(2022, 6, 30), "2", datetime(2022, 8, 20, 16, tzinfo=ZoneInfo("Asia/Shanghai"))),
+        balance_event(date(2023, 6, 30), "2", current_time),
+    ]
+    feature = calculate_features(rows, date(2023, 6, 30), date(2023, 6, 30))[0]
+    factor_row = {
+        "research_date": signal_date,
+        "financial_feature_contract_version": feature["feature_contract_version"],
+        "financial_data_available_timestamp": feature["data_available_timestamp"],
+        "financial_vintage_quality": feature["pit_evidence_level"],
+        "financial_component_lineage": feature["component_lineage"],
+        "revenue_growth_yoy": feature["revenue_growth_yoy"],
+        "profit_growth_yoy": feature["profit_growth_yoy"],
+        "growth_quality_status": feature["growth_quality_status"],
+    }
+
+    value = factor_value("revenue_growth_yoy", factor_row)
+
+    assert value.status == "VALID"
+    assert value.value == pytest.approx(0.25)
+    assert feature["roe_quality_status"] == "VALID"
+    assert feature["growth_quality_status"] == "VALID"
+
+    ambiguous_income = [dict(row) for row in rows]
+    ambiguous_income[3] = {**ambiguous_income[3], "quality_status": "WARNING"}
+    income_feature = calculate_features(
+        ambiguous_income, date(2023, 6, 30), date(2023, 6, 30),
+    )[0]
+    income_row = {
+        **factor_row,
+        "financial_component_lineage": income_feature["component_lineage"],
+        "revenue_growth_yoy": income_feature["revenue_growth_yoy"],
+        "growth_quality_status": income_feature["growth_quality_status"],
+    }
+    assert income_feature["growth_quality_status"] == "SOURCE_COMPONENT_QUALITY_NOT_VALID"
+    assert factor_value("revenue_growth_yoy", income_row).reason == (
+        "FINANCIAL_SOURCE_COMPONENT_QUALITY_NOT_VALID"
+    )
+
+    ambiguous_balance = [dict(row) for row in rows]
+    ambiguous_balance[-1] = {**ambiguous_balance[-1], "quality_status": "WARNING"}
+    balance_feature = calculate_features(
+        ambiguous_balance, date(2023, 6, 30), date(2023, 6, 30),
+    )[0]
+    roe_row = {
+        **factor_row,
+        "financial_component_lineage": balance_feature["component_lineage"],
+        "roe_ttm": balance_feature["roe_ttm"],
+        "roe_quality_status": balance_feature["roe_quality_status"],
+    }
+    assert balance_feature["roe_quality_status"] == "SOURCE_COMPONENT_QUALITY_NOT_VALID"
+    assert factor_value("roe_ttm", roe_row).reason == (
+        "FINANCIAL_SOURCE_COMPONENT_QUALITY_NOT_VALID"
+    )
 
 
 def test_indicator_company_type_link_is_asof_bounded():
@@ -537,9 +845,6 @@ def test_v2_snapshot_preserves_explicit_missing_lineage():
     assert "LEFT JOIN feature.valuation_daily_v1 v" in v2
     assert "s.ts_code || ':' || s.research_date::text || ':missing'" in v2
     assert "data_available_timestamp <" in v2
-    validation = Path(
-        "data_collect/data_access/repository/foundation_quality_repository.py"
-    ).read_text(encoding="utf-8")
     assert "f.data_available_timestamp" in v2
     assert "f.report_date <= s.research_date" in v2
     assert "dv_ttm_percentile_5y<0" in Path(

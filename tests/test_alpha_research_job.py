@@ -1,9 +1,14 @@
-from datetime import date, timedelta
 import json
+from datetime import date, timedelta
 
-from data_collect.alpha_research.contracts import FACTOR_INPUT_FIELDS
-from data_collect.data_access.repository.alpha_research_repository import FrozenResearchIdentity
 import data_collect.jobs.alpha_research as alpha_job
+from data_collect.alpha_research.contracts import (
+    FACTOR_INPUT_FIELDS,
+    SOURCE_QUALITY_EVIDENCE_VERSION,
+)
+from data_collect.data_access.repository.alpha_research_repository import (
+    FrozenResearchIdentity,
+)
 
 
 class _Kernel:
@@ -75,7 +80,14 @@ class _Adapter:
             "financial_feature_contract_version": "feature-contract-v2.0",
             "financial_data_available_timestamp": "2025-01-01T17:00:00+08:00",
             "financial_vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
-            "financial_component_lineage": {"income:report:1": {"payload_hash": "a" * 64}},
+            "financial_component_lineage": {
+                "__quality_evidence__": {"version": SOURCE_QUALITY_EVIDENCE_VERSION},
+                "income:report:1": {
+                    "payload_hash": "a" * 64,
+                    "source_quality_status": "VALID",
+                    "used_by": ["roe_ttm", "revenue_growth_yoy", "profit_growth_yoy"],
+                },
+            },
         }
         _Adapter.instance = self
 

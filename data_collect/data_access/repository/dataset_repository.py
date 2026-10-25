@@ -45,6 +45,12 @@ class DatasetRepository(BaseRepository):
         "ttm_complete", "dv_ttm", "dv_ttm_percentile_5y", "dv_ttm_source",
         "dv_window_start", "dv_window_end", "dv_observation_days", "dv_window_complete",
         "financial_component_lineage", "financial_source_fingerprint",
+        "debt_to_assets_quality_status", "debt_to_assets_quality_reason",
+        "debt_to_assets_data_available_timestamp", "debt_to_assets_source_observed_at",
+        "debt_to_assets_vintage_quality", "debt_to_assets_source_quality_status",
+        "debt_to_assets_source_record_key", "debt_to_assets_source_record_version",
+        "debt_to_assets_source_payload_hash", "debt_to_assets_feature_contract_version",
+        "debt_to_assets_report_date",
     })
     OBSERVATION_COVERAGE_FIELDS = (
         "raw_close", "return_20d", "return_60d", "ma20", "ma60",
@@ -585,7 +591,8 @@ class DatasetRepository(BaseRepository):
         rows = self.kernel.read._repository_query(
             context, "ops.tushare_data_release",
             """SELECT status, baseline_domain, baseline_cutoff_date, quality_report_hash,
-                              source_manifest_hash, source_manifest
+                              source_manifest_hash, source_manifest, schema_version,
+                              quality_report
                          FROM ops.tushare_data_release
                         WHERE release_tag=%s""",
             (baseline_tag,), WorkScope(partition=f"baseline:{baseline_tag}"), 2,
@@ -1164,10 +1171,11 @@ class DatasetRepository(BaseRepository):
     def bar_page(
         self, dataset_id: str, context: RunContext,
         last_key: tuple | None = None, limit: int = 10_000,
-        date_from=None, date_to=None,
+        date_from=None, date_to=None, *, codes: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("bar page limit must be between 1 and 50000")
+        selected_codes = tuple(sorted({str(code) for code in (codes or ()) if str(code)}))
         components = self.composition_components(dataset_id, context)
         if components:
             if date_from is not None and date_to is not None and date_from == date_to:
@@ -1176,7 +1184,7 @@ class DatasetRepository(BaseRepository):
                     return []
                 return self.bar_page(
                     str(component["component_dataset_id"]), context, last_key, limit,
-                    date_from=date_from, date_to=date_to,
+                    date_from=date_from, date_to=date_to, codes=selected_codes,
                 )
             keyset = "" if last_key is None else " AND (b.trade_date, b.ts_code) > (%s, %s)"
             bounds = ""
@@ -1187,6 +1195,9 @@ class DatasetRepository(BaseRepository):
             if date_to is not None:
                 bounds += " AND b.trade_date <= %s"
                 params += (date_to,)
+            if selected_codes:
+                bounds += " AND b.ts_code=ANY(%s)"
+                params += (list(selected_codes),)
             if last_key is not None:
                 params += tuple(last_key)
             return self.kernel.read._repository_query(
@@ -1204,7 +1215,10 @@ class DatasetRepository(BaseRepository):
                  ORDER BY b.trade_date, b.ts_code LIMIT {int(limit)}
                 """,
                 params,
-                WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to),
+                WorkScope(
+                    partition=dataset_id, date_from=date_from, date_to=date_to,
+                    codes=selected_codes or None,
+                ),
                 limit,
             )
         keyset = "" if last_key is None else " AND (trade_date, ts_code) > (%s, %s)"
@@ -1216,6 +1230,9 @@ class DatasetRepository(BaseRepository):
         if date_to is not None:
             bounds += " AND trade_date <= %s"
             params += (date_to,)
+        if selected_codes:
+            bounds += " AND ts_code=ANY(%s)"
+            params += (list(selected_codes),)
         if last_key is not None:
             params += tuple(last_key)
         return self.kernel.read._repository_query(
@@ -1227,13 +1244,18 @@ class DatasetRepository(BaseRepository):
                          FROM backtest.dataset_execution_bar
                         WHERE dataset_id=%s {bounds} {keyset}
                         ORDER BY trade_date, ts_code LIMIT {int(limit)}""",
-            params, WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to), limit,
+            params,
+            WorkScope(
+                partition=dataset_id, date_from=date_from, date_to=date_to,
+                codes=selected_codes or None,
+            ),
+            limit,
         )
 
     def observation_page(
         self, dataset_id: str, columns: Sequence[str], context: RunContext,
         last_key: tuple | None = None, limit: int = 10_000,
-        date_from=None, date_to=None,
+        date_from=None, date_to=None, *, codes: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0 or limit > 50_000:
             raise ValueError("observation page limit must be between 1 and 50000")
@@ -1244,6 +1266,7 @@ class DatasetRepository(BaseRepository):
                 f"{sorted(invalid_columns) if invalid_columns else 'empty selection'}"
             )
         selected = ", ".join(f"s.{column}" for column in columns)
+        selected_codes = tuple(sorted({str(code) for code in (codes or ()) if str(code)}))
         components = self.composition_components(dataset_id, context)
         if components:
             if date_from is not None and date_to is not None and date_from == date_to:
@@ -1263,6 +1286,9 @@ class DatasetRepository(BaseRepository):
             if date_to is not None:
                 bounds += " AND s.research_date <= %s"
                 params += (date_to,)
+            if selected_codes:
+                bounds += " AND s.ts_code=ANY(%s)"
+                params += (list(selected_codes),)
             if last_key is not None:
                 params += tuple(last_key)
             return self.kernel.read._repository_query(
@@ -1279,7 +1305,10 @@ class DatasetRepository(BaseRepository):
                  ORDER BY s.research_date, s.ts_code LIMIT {int(limit)}
                 """,
                 params,
-                WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to),
+                WorkScope(
+                    partition=dataset_id, date_from=date_from, date_to=date_to,
+                    codes=selected_codes or None,
+                ),
                 limit,
             )
         keyset = "" if last_key is None else " AND (s.research_date, s.ts_code) > (%s, %s)"
@@ -1291,6 +1320,9 @@ class DatasetRepository(BaseRepository):
         if date_to is not None:
             bounds += " AND s.research_date <= %s"
             params += (date_to,)
+        if selected_codes:
+            bounds += " AND s.ts_code=ANY(%s)"
+            params += (list(selected_codes),)
         if last_key is not None:
             params += tuple(last_key)
         return self.kernel.read._repository_query(
@@ -1302,7 +1334,12 @@ class DatasetRepository(BaseRepository):
                         AND s.research_date=m.research_date
                       WHERE m.dataset_id=%s{bounds}{keyset}
                       ORDER BY s.research_date, s.ts_code LIMIT {int(limit)}""",
-            params, WorkScope(partition=dataset_id, date_from=date_from, date_to=date_to), limit,
+            params,
+            WorkScope(
+                partition=dataset_id, date_from=date_from, date_to=date_to,
+                codes=selected_codes or None,
+            ),
+            limit,
         )
 
     def load_dividends(self, dataset_id: str, context: RunContext) -> list[tuple]:

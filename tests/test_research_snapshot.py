@@ -19,6 +19,10 @@ from data_collect.data_access.repository.research_snapshot_repository import (
     ResearchBaseline,
     ResearchSnapshotRepository,
 )
+from data_collect.data_access.research_contract import (
+    INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION,
+    STRATEGY_NEUTRAL_SCHEMA_VERSION,
+)
 from data_collect.jobs.research_snapshot import freeze_snapshots_batch
 
 
@@ -313,6 +317,37 @@ def test_foundation_snapshot_rejects_legacy_release_contract():
         )
 
 
+@pytest.mark.parametrize(
+    "quality_report",
+    [
+        None,
+        {"failures": {}},
+        {
+            "failures": {},
+            "corporate_action_evidence_version": "corporate-action-ex-date-evidence-v2",
+        },
+    ],
+)
+def test_foundation_snapshot_does_not_reuse_release_with_old_ex_date_audit(
+    monkeypatch, quality_report,
+):
+    baseline = ResearchBaseline(
+        "foundation", date(2026, 8, 21), "validated", "quality", "source",
+        {}, research_snapshot.FOUNDATION_FEATURE_CONTRACT, quality_report,
+    )
+    monkeypatch.setattr(
+        research_snapshot,
+        "_quality_gate",
+        lambda *args, **kwargs: pytest.fail("stale baseline evidence must not be reused or recomputed"),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="stale or incomplete corporate-action evidence"):
+        research_snapshot._quality_report(
+            date(2026, 8, 21), research_snapshot.FOUNDATION_SCHEMA_VERSION, baseline,
+        )
+
+
 def test_series_quality_evidence_keeps_its_real_coverage_cutoff():
     stored = {"cutoff_date": "2026-08-06", "failures": {}}
     assert research_snapshot._stored_quality_cutoff(
@@ -417,6 +452,41 @@ def test_foundation_inputs_declare_v1_compatibility_and_v2_financial_sources():
     # The base materialization still reads V1 compatibility fields; keeping
     # that source in the manifest prevents a hidden input dependency.
     assert "FROM feature.company_financial_v1 c" in _stock_snapshot_sql()
+
+
+def test_v22_adds_an_independent_debt_to_assets_input_and_snapshot_projection():
+    v21_sources = {
+        (item["schema"], item["table"])
+        for item in _inputs_for_schema(STRATEGY_NEUTRAL_SCHEMA_VERSION)
+    }
+    v22_definitions = _inputs_for_schema(INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION)
+    v22_sources = {(item["schema"], item["table"]) for item in v22_definitions}
+    v22_factor_input = next(
+        item for item in v22_definitions if item["table"] == "debt_to_assets_v1"
+    )
+
+    assert ("feature", "debt_to_assets_v1") not in v21_sources
+    assert ("feature", "debt_to_assets_v1") in v22_sources
+    assert "source_record_key" in v22_factor_input["columns"]
+    assert "source_quality_status" in v22_factor_input["columns"]
+    assert "signal close (15:00 Asia/Shanghai)" in v22_factor_input["predicate"]
+    assert "TIME '15:00'" in v22_factor_input["where"]
+    assert v22_factor_input["params"](date(2023, 9, 22)) == (
+        date(2023, 9, 22), date(2023, 9, 22),
+    )
+
+    old_sql = ResearchSnapshotRepository.foundation_snapshot_sql()
+    v22_sql = ResearchSnapshotRepository.foundation_snapshot_sql(
+        independent_factors=True,
+    )
+    v22_batch_sql = ResearchSnapshotRepository.foundation_snapshot_batch_sql(
+        independent_factors=True,
+    )
+    assert "feature.debt_to_assets_v1" not in old_sql
+    assert "feature.debt_to_assets_v1" in v22_sql
+    assert "s.research_date + TIME '15:00'" in v22_sql
+    assert "debt_to_assets_source_payload_hash=EXCLUDED.debt_to_assets_source_payload_hash" in v22_sql
+    assert v22_batch_sql.count("%s") == 3
 
 
 def test_snapshot_input_manifest_accepts_only_the_explicit_legacy_foundation_set():

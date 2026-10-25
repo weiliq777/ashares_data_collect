@@ -21,6 +21,10 @@ from data_collect.data_access.repository.raw_standard_repository import RawStand
 from data_collect.data_access.repository.financial_vip_repository import FinancialVipRepository
 from data_collect.data_access.repository.quality_inspection_repository import QualityInspectionRepository
 from data_collect.data_access.repository.financial_standard_repository import FinancialStandardRepository
+from data_collect.data_access.repository.financial_projection_repository import (
+    FinancialProjectionRepository,
+    FinancialProjectionSelection,
+)
 from data_collect.data_access.repository.foundation_quality_repository import FoundationQualityRepository
 from data_collect.data_access.repository.fina_indicator_repository import FinaIndicatorRepository
 from data_collect.data_access.repository.snapshot_series_repository import SnapshotSeriesRepository
@@ -64,6 +68,8 @@ __all__ = [
     "FinancialVipRepository",
     "QualityInspectionRepository",
     "FinancialStandardRepository",
+    "FinancialProjectionRepository",
+    "FinancialProjectionSelection",
     "FoundationQualityRepository",
     "FinaIndicatorRepository",
     "SnapshotSeriesRepository",

@@ -2,6 +2,9 @@ import math
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
+from data_collect.alpha_research.contracts import SOURCE_QUALITY_EVIDENCE_VERSION
 from data_collect.alpha_research.factors import factor_value
 
 
@@ -13,13 +16,42 @@ def _financial_row(**overrides):
             2025, 8, 18, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"),
         ),
         "financial_vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
-        "financial_component_lineage": {"income:key:1": {"payload_hash": "a" * 64}},
+        "financial_component_lineage": {
+            "__quality_evidence__": {"version": SOURCE_QUALITY_EVIDENCE_VERSION},
+            "income:key:1": {
+                "payload_hash": "a" * 64,
+                "source_quality_status": "VALID",
+                "used_by": ["roe_ttm", "revenue_growth_yoy", "profit_growth_yoy"],
+            },
+        },
         "roe_ttm": 0.15,
         "roe_quality_status": "VALID",
         "ttm_complete": False,
         "revenue_growth_yoy": 0.3,
         "profit_growth_yoy": 0.2,
         "growth_quality_status": "VALID",
+    }
+    row.update(overrides)
+    return row
+
+
+def _debt_to_assets_row(**overrides):
+    row = {
+        "research_date": date(2025, 8, 18),
+        "debt_to_assets": 8.619,
+        "debt_to_assets_quality_status": "VALID",
+        "debt_to_assets_quality_reason": None,
+        "debt_to_assets_data_available_timestamp": datetime(
+            2025, 8, 18, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"),
+        ),
+        "debt_to_assets_source_observed_at": datetime(2025, 8, 17, 12, 0),
+        "debt_to_assets_vintage_quality": "SOURCE_ANNOUNCEMENT_ASSUMED",
+        "debt_to_assets_source_quality_status": "VALID",
+        "debt_to_assets_source_record_key": "balance:000001.SZ:2025-06-30",
+        "debt_to_assets_source_record_version": 42,
+        "debt_to_assets_source_payload_hash": "a" * 64,
+        "debt_to_assets_feature_contract_version": "debt-to-assets-v1",
+        "debt_to_assets_report_date": date(2025, 6, 30),
     }
     row.update(overrides)
     return row
@@ -34,7 +66,7 @@ def test_factor_quality_gates_and_directional_inputs_are_explicit():
         "roe_ttm": 0.15,
         "ttm_complete": True,
         "roe_quality_status": "VALID",
-        "debt_to_assets": 0.35,
+        **_debt_to_assets_row(),
         "revenue_growth_yoy": 0.3,
         "profit_growth_yoy": 0.2,
         "growth_quality_status": "VALID",
@@ -49,6 +81,7 @@ def test_factor_quality_gates_and_directional_inputs_are_explicit():
     assert factor_value("pe_percentile_5y", row).value == 0.2
     assert factor_value("roe_ttm", _financial_row()).value == 0.15
     assert factor_value("revenue_growth_yoy", _financial_row()).value == 0.3
+    assert factor_value("debt_to_assets", row).value == 8.619
     assert abs(factor_value("close_vs_ma60", row).value - 0.1) < 1e-12
     assert factor_value("return_20d", row).value == 0.08
     assert factor_value("volume_ratio_20d", row).status == "VALID"
@@ -101,6 +134,43 @@ def test_financial_factors_fail_closed_on_unverified_pit_evidence():
     ).reason == "FINANCIAL_COMPONENT_LINEAGE_MISSING"
 
 
+def test_financial_factors_fail_closed_when_source_quality_evidence_is_absent():
+    row = _financial_row(
+        financial_component_lineage={"income:key:1": {"payload_hash": "a" * 64}},
+    )
+
+    value = factor_value("revenue_growth_yoy", row)
+
+    assert value.status == "INVALID"
+    assert value.reason == "FINANCIAL_SOURCE_QUALITY_EVIDENCE_MISSING"
+
+
+def test_financial_factor_checks_quality_only_for_its_declared_source_components():
+    row = _financial_row(
+        financial_component_lineage={
+            "__quality_evidence__": {"version": SOURCE_QUALITY_EVIDENCE_VERSION},
+            "income:key:1": {
+                "payload_hash": "a" * 64,
+                "source_quality_status": "VALID",
+                "used_by": ["revenue_growth_yoy", "profit_growth_yoy"],
+            },
+            "cashflow:key:1": {
+                "payload_hash": "b" * 64,
+                "source_quality_status": "WARNING",
+                "used_by": ["roe_ttm"],
+            },
+        },
+    )
+
+    growth = factor_value("revenue_growth_yoy", row)
+    roe = factor_value("roe_ttm", row)
+
+    assert growth.status == "VALID"
+    assert growth.value == 0.3
+    assert roe.status == "INVALID"
+    assert roe.reason == "FINANCIAL_SOURCE_COMPONENT_QUALITY_NOT_VALID"
+
+
 def test_roe_uses_its_own_quality_status_without_global_ttm_gate():
     value = factor_value(
         "roe_ttm",
@@ -115,6 +185,84 @@ def test_roe_uses_its_own_quality_status_without_global_ttm_gate():
     )
     assert invalid.status == "INVALID"
     assert invalid.reason == "ROE_QUALITY_STATUS_NOT_VALID"
+
+
+def test_debt_to_assets_uses_only_balance_source_quality_and_pit_evidence():
+    value = factor_value("debt_to_assets", _debt_to_assets_row())
+    assert value.status == "VALID"
+    assert value.value == 8.619
+    assert value.reason == "PIT_SOURCE_ANNOUNCEMENT_ASSUMED"
+
+    warning = factor_value(
+        "debt_to_assets",
+        _debt_to_assets_row(
+            debt_to_assets_quality_status="WARNING",
+            debt_to_assets_quality_reason="SOURCE_QUALITY_NOT_VALID",
+            debt_to_assets_source_quality_status="WARNING",
+        ),
+    )
+    assert warning.status == "INVALID"
+    assert warning.reason == "SOURCE_QUALITY_NOT_VALID"
+
+    late = factor_value(
+        "debt_to_assets",
+        _debt_to_assets_row(
+            debt_to_assets_data_available_timestamp=datetime(
+                2025, 8, 18, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        ),
+    )
+    assert late.reason == "DEBT_TO_ASSETS_NOT_AVAILABLE_BY_SIGNAL_CLOSE"
+
+    missing_identity = factor_value(
+        "debt_to_assets", _debt_to_assets_row(debt_to_assets_source_record_key=None),
+    )
+    assert missing_identity.reason == "DEBT_TO_ASSETS_SOURCE_IDENTITY_INCOMPLETE"
+
+    wrong_contract = factor_value(
+        "debt_to_assets",
+        _debt_to_assets_row(debt_to_assets_feature_contract_version="feature-contract-v2.0"),
+    )
+    assert wrong_contract.reason == "DEBT_TO_ASSETS_FEATURE_VERSION_NOT_SUPPORTED"
+
+    warehouse_late = factor_value(
+        "debt_to_assets",
+        _debt_to_assets_row(
+            debt_to_assets_vintage_quality="WAREHOUSE_OBSERVED_ONLY",
+            debt_to_assets_source_observed_at=datetime(
+                2025, 8, 18, 15, 1, tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+        ),
+    )
+    assert warehouse_late.reason == "DEBT_TO_ASSETS_SOURCE_NOT_OBSERVED_BY_SIGNAL_CLOSE"
+
+    future_report = factor_value(
+        "debt_to_assets",
+        _debt_to_assets_row(debt_to_assets_report_date=date(2025, 8, 19)),
+    )
+    assert future_report.reason == "DEBT_TO_ASSETS_REPORT_DATE_AFTER_SIGNAL"
+
+
+@pytest.mark.parametrize(
+    ("source_record_version", "source_payload_hash", "expected_reason"),
+    (
+        (None, "a" * 64, "DEBT_TO_ASSETS_SOURCE_IDENTITY_INCOMPLETE"),
+        (1, "z" * 64, "DEBT_TO_ASSETS_SOURCE_IDENTITY_INVALID"),
+    ),
+)
+def test_debt_to_assets_rejects_incomplete_or_invalid_source_identity(
+    source_record_version, source_payload_hash, expected_reason,
+):
+    value = factor_value(
+        "debt_to_assets",
+        _debt_to_assets_row(
+            debt_to_assets_source_record_version=source_record_version,
+            debt_to_assets_source_payload_hash=source_payload_hash,
+        ),
+    )
+
+    assert value.status == "INVALID"
+    assert value.reason == expected_reason
 
 
 def test_momentum_requires_the_frozen_point_in_time_total_return_coordinate():

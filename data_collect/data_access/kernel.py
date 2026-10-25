@@ -47,13 +47,22 @@ class DataAccessKernel:
         connection_factory: Callable[[], object] | None = None,
         checkpoint_store: CheckpointStore | None = None,
         capture_release_changes: bool | None = None,
+        read_only_audit: bool = False,
     ) -> None:
         # A supplied connection factory is the explicit fake/test seam. A
         # custom checkpoint store does not make the database connection fake;
         # production kernels must still record the Run Manifest in that case.
-        production_kernel = connection_factory is None
+        if read_only_audit and connection_factory is not None:
+            raise ValueError("read_only_audit cannot be combined with a custom connection_factory")
+        production_kernel = connection_factory is None and not read_only_audit
+        if read_only_audit:
+            from data_collect.data_access.schema import (
+                connect_read_only_audit_with_safety_limits,
+            )
+
+            connection_factory = connect_read_only_audit_with_safety_limits
         self.policy_registry = policy_registry or DatasetPolicyRegistry()
-        self.query_guard = QueryGuard(self.policy_registry)
+        self.query_guard = QueryGuard(self.policy_registry, read_only=read_only_audit)
         transaction_config = transaction_config or TransactionConfig()
         requested_chunk = chunk_config or ChunkConfig()
         effective_chunk = ChunkConfig(

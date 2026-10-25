@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Iterator
+from typing import ClassVar, Iterator
 
 from data_collect.data_access.context import RunContext, WorkScope
 from data_collect.data_access.repository.base import BaseRepository
@@ -14,6 +14,189 @@ class FinancialStandardRepository(BaseRepository):
         "std.financial_balance_sheet_standard",
         "std.financial_cash_flow_standard",
     })
+
+    RAW_DATASETS = frozenset({"income", "balancesheet", "cashflow"})
+
+    STANDARD_TABLES: ClassVar[dict[str, tuple[str, str]]] = {
+        "income": ("std.financial_income_standard", "financial_id"),
+        "balance_sheet": ("std.financial_balance_sheet_standard", "financial_id"),
+        "cash_flow": ("std.financial_cash_flow_standard", "financial_id"),
+    }
+
+    def raw_versions_by_ids(
+        self,
+        dataset: str,
+        record_ids: list[int],
+        context: RunContext,
+        report_start,
+        report_end,
+        page_limit: int = 200,
+    ) -> list[dict]:
+        """Read a bounded set of exact immutable Raw versions for reconciliation.
+
+        This is intentionally keyed by persisted record IDs. It does not choose
+        a replacement version by business key and cannot be used as a broad
+        financial history scan.
+        """
+        if dataset not in self.RAW_DATASETS:
+            raise ValueError(f"unsupported financial Raw dataset: {dataset}")
+        if not 0 < page_limit <= 500:
+            raise ValueError("raw version lookup limit must be between 1 and 500")
+        ids = tuple(dict.fromkeys(int(record_id) for record_id in record_ids))
+        if not ids:
+            return []
+        if len(ids) > page_limit or any(record_id <= 0 for record_id in ids):
+            raise ValueError("raw version lookup requires positive IDs within the bounded limit")
+        if report_start is None or report_end is None or report_start > report_end:
+            raise ValueError("raw version lookup requires a valid report date range")
+
+        scope = WorkScope(
+            date_from=report_start,
+            date_to=report_end,
+            partition=f"financial-raw-record-ids:{dataset}",
+            dimensions={"record_id_count": len(ids)},
+        )
+        query = """SELECT r.record_id, r.business_key AS logical_business_key,
+                          r.payload, r.payload_hash, r.fetched_at,
+                          EXISTS (
+                              SELECT 1 FROM tushare_financial_raw_version other
+                               WHERE other.dataset=r.dataset
+                                 AND other.business_key=r.business_key
+                                 AND COALESCE(other.f_ann_date, other.ann_date)
+                                     IS NOT DISTINCT FROM COALESCE(r.f_ann_date, r.ann_date)
+                                 AND other.payload_hash <> r.payload_hash
+                          ) AS ambiguous_same_day_revision
+                     FROM tushare_financial_raw_version r
+                    WHERE r.dataset=%s AND r.record_id=ANY(%s)
+                    ORDER BY r.record_id"""
+        rows = self.kernel.read._repository_query(
+            context,
+            "tushare_financial_raw_version",
+            query,
+            (dataset, list(ids)),
+            scope,
+            page_limit,
+        )
+        result = []
+        for row in rows:
+            payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+            payload.update({
+                "_record_id": row["record_id"],
+                "_logical_business_key": row["logical_business_key"],
+                "_payload_hash": row["payload_hash"],
+                "_fetched_at": row["fetched_at"],
+                "_ambiguous_same_day_revision": row["ambiguous_same_day_revision"],
+            })
+            result.append(payload)
+        return result
+
+    def standard_rows_by_ids(
+        self,
+        source_dataset: str,
+        standard_ids: list[int],
+        context: RunContext,
+        report_start,
+        report_end,
+        page_limit: int = 200,
+    ) -> list[dict]:
+        """Read exact Standard rows for a bounded source identity manifest."""
+        table_identity = self.STANDARD_TABLES.get(source_dataset)
+        if table_identity is None:
+            raise ValueError(f"unsupported financial Standard dataset: {source_dataset}")
+        if not 0 < page_limit <= 500:
+            raise ValueError("Standard row lookup limit must be between 1 and 500")
+        ids = tuple(dict.fromkeys(int(value) for value in standard_ids))
+        if not ids:
+            return []
+        if len(ids) > page_limit or any(value <= 0 for value in ids):
+            raise ValueError("Standard lookup requires positive IDs within the bounded limit")
+        if report_start is None or report_end is None or report_start > report_end:
+            raise ValueError("Standard lookup requires a valid report date range")
+        table, id_column = table_identity
+        scope = WorkScope(
+            date_from=report_start,
+            date_to=report_end,
+            partition=f"financial-standard-record-ids:{source_dataset}",
+            dimensions={"record_id_count": len(ids)},
+        )
+        rows = self.kernel.read._repository_query(
+            context,
+            table,
+            f"""SELECT s.{id_column} AS requested_standard_id,
+                       to_jsonb(s) AS standard_row
+                  FROM {table} s
+                 WHERE s.{id_column}=ANY(%s)
+                   AND s.report_date BETWEEN %s AND %s
+                 ORDER BY s.{id_column}""",
+            (list(ids), report_start, report_end),
+            scope,
+            page_limit,
+        )
+        result = []
+        for row in rows:
+            values = row["standard_row"]
+            if not isinstance(values, dict):
+                raise TypeError("Standard row JSON projection did not return an object")
+            values["_standard_id"] = int(row["requested_standard_id"])
+            result.append(values)
+        return result
+
+    def standard_rows_by_source_identities(
+        self,
+        source_dataset: str,
+        source_record_keys: list[str],
+        record_versions: list[int],
+        context: RunContext,
+        report_start,
+        report_end,
+        page_limit: int = 500,
+    ) -> list[dict]:
+        """Read a bounded set of rows by the immutable Standard source identity."""
+        table_identity = self.STANDARD_TABLES.get(source_dataset)
+        if table_identity is None:
+            raise ValueError(f"unsupported financial Standard dataset: {source_dataset}")
+        if len(source_record_keys) != len(record_versions):
+            raise ValueError("source keys and record versions must have equal lengths")
+        if not 0 < page_limit <= 500 or len(source_record_keys) > page_limit:
+            raise ValueError("Standard source identity lookup limit must be in 1..500")
+        if not source_record_keys:
+            return []
+        if any(not key for key in source_record_keys) or any(int(value) <= 0 for value in record_versions):
+            raise ValueError("Standard source identities must be non-empty and versioned")
+        if report_start is None or report_end is None or report_start > report_end:
+            raise ValueError("Standard lookup requires a valid report date range")
+        table, id_column = table_identity
+        scope = WorkScope(
+            date_from=report_start,
+            date_to=report_end,
+            partition=f"financial-standard-source-identities:{source_dataset}",
+            dimensions={"identity_count": len(source_record_keys)},
+        )
+        rows = self.kernel.read._repository_query(
+            context,
+            table,
+            f"""WITH requested AS (
+                       SELECT * FROM unnest(%s::text[], %s::bigint[])
+                           AS r(source_record_key, record_version)
+                   )
+                   SELECT s.{id_column} AS requested_standard_id,
+                          to_jsonb(s) AS standard_row
+                     FROM {table} s
+                     JOIN requested r USING (source_record_key, record_version)
+                    WHERE s.report_date BETWEEN %s AND %s
+                    ORDER BY s.{id_column}""",
+            (source_record_keys, [int(value) for value in record_versions], report_start, report_end),
+            scope,
+            page_limit,
+        )
+        result = []
+        for row in rows:
+            values = row["standard_row"]
+            if not isinstance(values, dict):
+                raise TypeError("Standard row JSON projection did not return an object")
+            values["_standard_id"] = int(row["requested_standard_id"])
+            result.append(values)
+        return result
 
     def iter_version_rows(
         self,

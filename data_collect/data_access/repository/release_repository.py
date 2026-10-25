@@ -7,15 +7,28 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from data_collect.data_access.context import Operation, RunContext, SqlPlan, WorkScope
-from data_collect.data_access.repository.base import BaseRepository
-from data_collect.data_access.repository.foundation_quality_repository import FoundationQualityRepository
-from data_collect.data_access.repository.quality_inspection_repository import QualityInspectionRepository
+from data_collect.data_access.corporate_action_evidence import (
+    EX_DATE_EVIDENCE_VERSION,
+    summarize_missing_ex_date_scope,
+)
 from data_collect.data_access.release_delta_impact import (
     DeltaImpactPlan,
     resolve_delta_impact,
 )
-from data_collect.data_access.repository.market_activity_repository import MarketActivityRepository
-from data_collect.market_activity.contracts import MarketActivityReport, MarketActivityRequest
+from data_collect.data_access.repository.base import BaseRepository
+from data_collect.data_access.repository.foundation_quality_repository import (
+    FoundationQualityRepository,
+)
+from data_collect.data_access.repository.market_activity_repository import (
+    MarketActivityRepository,
+)
+from data_collect.data_access.repository.quality_inspection_repository import (
+    QualityInspectionRepository,
+)
+from data_collect.market_activity.contracts import (
+    MarketActivityReport,
+    MarketActivityRequest,
+)
 from data_collect.market_activity.monitor import MarketActivityMonitor
 
 
@@ -23,6 +36,15 @@ class ReleaseRepository(BaseRepository):
     _MANIFEST_WINDOW_DAYS = 180
     RESEARCH_DOMAIN = "RESEARCH"
     MARKET_ACTIVITY_DOMAIN = "MARKET_ACTIVITY"
+
+    @staticmethod
+    def _five_year_window_start(cutoff: date) -> date:
+        try:
+            five_year_start = cutoff.replace(year=cutoff.year - 5)
+        except ValueError:
+            # A Feb 29 cutoff has no matching date in the year five years ago.
+            five_year_start = cutoff.replace(year=cutoff.year - 5, day=28)
+        return max(date(2021, 8, 2), five_year_start)
 
     @classmethod
     def _baseline_domain(cls, schema_version: str | None) -> str:
@@ -275,7 +297,76 @@ class ReleaseRepository(BaseRepository):
             window_start = window_end + timedelta(days=1)
         return result
 
-    def quality_gate(self, cutoff: date | None, include_foundation_v2: bool, context: RunContext) -> dict:
+    def _missing_ex_date_scope(
+        self, scope_start: date, scope_end: date, context: RunContext,
+    ) -> dict:
+        schema_rows = self.kernel.read._repository_query(
+            context,
+            "std.dividend_event",
+            """SELECT field.key AS column_name
+                 FROM (
+                       SELECT to_jsonb(event) AS record
+                         FROM std.dividend_event AS event
+                        ORDER BY dividend_id
+                        LIMIT 1
+                      ) AS sample
+                 CROSS JOIN LATERAL jsonb_object_keys(sample.record) AS field(key)
+                ORDER BY field.key""",
+            (),
+            WorkScope(partition="release:dividend-event-schema"),
+            100,
+        )
+        schema_columns = {
+            str(row["column_name"]) for row in schema_rows
+        } if schema_rows else None
+        raw_rows = self.kernel.read._repository_query(
+            context,
+            "std.dividend_event",
+            """SELECT to_jsonb(event) AS event_record
+                 FROM std.dividend_event AS event
+                WHERE implementation_status='实施' AND ex_date IS NULL
+                ORDER BY ts_code, report_date, source_record_key, record_version""",
+            (),
+            WorkScope(
+                partition=f"release:dividend-ex-date-scope:{scope_start}:{scope_end}",
+                dimensions={
+                    "scope_start_date": scope_start.isoformat(),
+                    "scope_end_date": scope_end.isoformat(),
+                    "query_population": "all_global_missing_ex_date_rows",
+                },
+            ),
+            100_000,
+        )
+        rows = []
+        for wrapped in raw_rows:
+            record = wrapped.get("event_record")
+            if not isinstance(record, dict):
+                raise TypeError(
+                    "dividend-event scope query did not return a JSON object"
+                )
+            rows.append(record)
+        return summarize_missing_ex_date_scope(
+            rows,
+            scope_start=scope_start,
+            scope_end=scope_end,
+            schema_columns=schema_columns,
+        )
+
+    def quality_gate(
+        self,
+        cutoff: date | None,
+        include_foundation_v2: bool,
+        context: RunContext,
+        *,
+        scope_start: date | None = None,
+    ) -> dict:
+        if include_foundation_v2:
+            if cutoff is None:
+                raise ValueError("foundation v2 release quality requires cutoff")
+            if scope_start is None:
+                scope_start = self._five_year_window_start(cutoff)
+            elif scope_start > cutoff:
+                raise ValueError("corporate-action scope_start must not exceed cutoff")
         quality = QualityInspectionRepository(self.kernel)
         # The v2 foundation deliberately replaces the legacy v1 revenue
         # feature.  Do not rescan that obsolete compatibility table on every
@@ -308,6 +399,11 @@ class ReleaseRepository(BaseRepository):
             "release:dividend-duplicates",
         )
         missing_ex_date = self._scalar("std.dividend_event", "SELECT COUNT(*) AS value FROM std.dividend_event WHERE implementation_status='实施' AND ex_date IS NULL", context, "release:dividend-ex-date")
+        ex_date_scope = None
+        if scope_start is not None:
+            if cutoff is None:
+                raise ValueError("scoped corporate-action quality requires cutoff")
+            ex_date_scope = self._missing_ex_date_scope(scope_start, cutoff, context)
         failures = {}
         for name, value in invariants.items():
             if (isinstance(value, dict) or value != 0) and not (include_foundation_v2 and name == "financial_feature_missing_revenue_mapping"):
@@ -317,21 +413,55 @@ class ReleaseRepository(BaseRepository):
                 failures[f"checkpoint:{name}"] = value
         if lifecycle or duplicates:
             failures.update({"lifecycle_overlap": lifecycle, "dividend_business_key_duplicates": duplicates})
-        if missing_ex_date:
+        if ex_date_scope is None and missing_ex_date:
             failures["implementation_without_ex_date"] = missing_ex_date
+        elif ex_date_scope is not None and ex_date_scope["unresolved_count"]:
+            failures["implementation_without_ex_date_scope_unresolved"] = (
+                ex_date_scope["unresolved_count"]
+            )
+        if (
+            ex_date_scope is not None
+            and ex_date_scope.get("schema_contract_status") != "PASS"
+        ):
+            failures["implementation_without_ex_date_scope_schema"] = (
+                ex_date_scope.get("schema_contract_issues")
+                if ex_date_scope.get("schema_contract_issues") is not None
+                else "unable to inspect dividend-event columns"
+            )
+        if (
+            ex_date_scope is not None
+            and ex_date_scope["global_missing_count"] != missing_ex_date
+        ):
+            failures["implementation_without_ex_date_scope_count_mismatch"] = {
+                "global_count": missing_ex_date,
+                "classified_count": ex_date_scope["global_missing_count"],
+            }
         foundation = None
         run_count = None
         if include_foundation_v2:
             if cutoff is None:
                 raise ValueError("foundation v2 release quality requires cutoff")
-            start = max(date(2021, 8, 2), cutoff.replace(year=cutoff.year - 5))
+            start = self._five_year_window_start(cutoff)
             foundation = FoundationQualityRepository(self.kernel).inspect_foundation_v2(start, cutoff, context)
             run_count = self._scalar("ops.foundation_rebuild_run", "SELECT COUNT(*) AS value FROM ops.foundation_rebuild_run WHERE run_mode='PRODUCTION' AND status='VALIDATED' AND contract_version='feature-contract-v2.0' AND output_start<=%s AND output_end>=%s", context, "release:foundation-run", (start, cutoff))
             for name, value in foundation["failures"].items():
                 failures[f"foundation_v2:{name}"] = value
             if run_count <= 0:
                 failures["foundation_v2:validated_production_run"] = 0
-        return {"cutoff_date": cutoff.isoformat() if cutoff else None, "invariants": invariants, "skipped_invariants": sorted(skipped_invariants), "checkpoints": checkpoints, "lifecycle_overlap": lifecycle, "dividend_business_key_duplicates": duplicates, "implementation_without_ex_date": missing_ex_date, "foundation_v2": foundation, "foundation_v2_validated_run_count": run_count, "failures": failures}
+        return {
+            "cutoff_date": cutoff.isoformat() if cutoff else None,
+            "invariants": invariants,
+            "skipped_invariants": sorted(skipped_invariants),
+            "checkpoints": checkpoints,
+            "lifecycle_overlap": lifecycle,
+            "dividend_business_key_duplicates": duplicates,
+            "implementation_without_ex_date": missing_ex_date,
+            "implementation_without_ex_date_scope": ex_date_scope,
+            "corporate_action_evidence_version": EX_DATE_EVIDENCE_VERSION,
+            "foundation_v2": foundation,
+            "foundation_v2_validated_run_count": run_count,
+            "failures": failures,
+        }
 
     def market_activity_quality_gate(
         self,
@@ -526,7 +656,16 @@ class ReleaseRepository(BaseRepository):
                 "source_manifest": manifest,
                 "source_manifest_hash": manifest_hash,
             }
-        gate = self.quality_gate(cutoff, schema_version == "feature-contract-v2.0", context)
+        include_foundation_v2 = schema_version == "feature-contract-v2.0"
+        scope_start = None
+        if include_foundation_v2:
+            scope_start = self._five_year_window_start(cutoff)
+        gate = self.quality_gate(
+            cutoff,
+            include_foundation_v2,
+            context,
+            scope_start=scope_start,
+        )
         if gate["failures"]:
             raise RuntimeError(f"release quality gate failed: {gate['failures']}")
         encoded = json.dumps(gate, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)

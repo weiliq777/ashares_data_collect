@@ -1,14 +1,20 @@
 """Pure PIT factor extraction with explicit missing-data reasons."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, time
 import json
 import math
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import date, datetime, time
+from typing import Any
 from zoneinfo import ZoneInfo
 
-from data_collect.alpha_research.contracts import FACTOR_BY_NAME, FactorSpec
+from data_collect.alpha_research.contracts import (
+    DEBT_TO_ASSETS_FEATURE_CONTRACT_VERSION,
+    FACTOR_BY_NAME,
+    SOURCE_QUALITY_EVIDENCE_VERSION,
+    FactorSpec,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +59,12 @@ def _financial_pit_failure(row: Mapping[str, Any]) -> str | None:
             lineage = None
     if not isinstance(lineage, Mapping) or not lineage:
         return "FINANCIAL_COMPONENT_LINEAGE_MISSING"
+    evidence = lineage.get("__quality_evidence__")
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("version") != SOURCE_QUALITY_EVIDENCE_VERSION
+    ):
+        return "FINANCIAL_SOURCE_QUALITY_EVIDENCE_MISSING"
 
     signal_day = row.get("research_date")
     if isinstance(signal_day, datetime):
@@ -66,7 +78,7 @@ def _financial_pit_failure(row: Mapping[str, Any]) -> str | None:
     available_at = row.get("financial_data_available_timestamp")
     if isinstance(available_at, str):
         try:
-            available_at = datetime.fromisoformat(available_at.replace("Z", "+00:00"))
+            available_at = datetime.fromisoformat(available_at)
         except ValueError:
             return "FINANCIAL_AVAILABILITY_TIMESTAMP_INVALID"
     if not isinstance(available_at, datetime):
@@ -81,10 +93,41 @@ def _financial_pit_failure(row: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _financial_source_quality_failure(
+    row: Mapping[str, Any], factor_name: str,
+) -> str | None:
+    lineage = row.get("financial_component_lineage")
+    if isinstance(lineage, str):
+        try:
+            lineage = json.loads(lineage)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "FINANCIAL_COMPONENT_LINEAGE_MISSING"
+    if not isinstance(lineage, Mapping):
+        return "FINANCIAL_COMPONENT_LINEAGE_MISSING"
+    required = [
+        component for key, component in lineage.items()
+        if key != "__quality_evidence__"
+        and isinstance(component, Mapping)
+        and factor_name in (component.get("used_by") or ())
+    ]
+    if not required:
+        return "FINANCIAL_SOURCE_COMPONENT_LINEAGE_MISSING"
+    if any(
+        str(component.get("source_quality_status") or "").strip().upper()
+        not in {"VALID", "PASS"}
+        for component in required
+    ):
+        return "FINANCIAL_SOURCE_COMPONENT_QUALITY_NOT_VALID"
+    return None
+
+
 def _financial_factor_value(spec: FactorSpec, row: Mapping[str, Any]) -> FactorValue:
     pit_failure = _financial_pit_failure(row)
     if pit_failure is not None:
         return FactorValue(spec.name, None, "INVALID", pit_failure)
+    source_quality_failure = _financial_source_quality_failure(row, spec.name)
+    if source_quality_failure is not None:
+        return FactorValue(spec.name, None, "INVALID", source_quality_failure)
 
     field = spec.name
     value = _finite(row.get(field))
@@ -109,6 +152,94 @@ def _financial_factor_value(spec: FactorSpec, row: Mapping[str, Any]) -> FactorV
         if growth_status == "INSUFFICIENT_HISTORY" else None
     )
     return FactorValue(spec.name, value, "VALID", reason)
+
+
+def _debt_to_assets_value(spec: FactorSpec, row: Mapping[str, Any]) -> FactorValue:
+    version = row.get("debt_to_assets_feature_contract_version")
+    if version != DEBT_TO_ASSETS_FEATURE_CONTRACT_VERSION:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_FEATURE_VERSION_NOT_SUPPORTED")
+
+    status = str(row.get("debt_to_assets_quality_status") or "").strip().upper()
+    if status not in {"VALID", "PASS"}:
+        reason = str(row.get("debt_to_assets_quality_reason") or "").strip()
+        return FactorValue(
+            spec.name, None, "INVALID",
+            reason or "DEBT_TO_ASSETS_QUALITY_STATUS_NOT_VALID",
+        )
+    if str(row.get("debt_to_assets_source_quality_status") or "").strip().upper() not in {"VALID", "PASS"}:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_SOURCE_QUALITY_NOT_VALID")
+
+    source_key = str(row.get("debt_to_assets_source_record_key") or "").strip()
+    source_version = row.get("debt_to_assets_source_record_version")
+    source_hash = str(row.get("debt_to_assets_source_payload_hash") or "").strip().lower()
+    if not source_key or source_version is None or len(source_hash) != 64:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_SOURCE_IDENTITY_INCOMPLETE")
+    try:
+        int(source_version)
+        int(source_hash, 16)
+    except (TypeError, ValueError, OverflowError):
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_SOURCE_IDENTITY_INVALID")
+
+    signal_day = row.get("research_date")
+    if isinstance(signal_day, datetime):
+        signal_day = signal_day.date()
+    elif not isinstance(signal_day, date):
+        try:
+            signal_day = date.fromisoformat(str(signal_day)[:10])
+        except (TypeError, ValueError):
+            return FactorValue(spec.name, None, "INVALID", "SIGNAL_DATE_MISSING_OR_INVALID")
+
+    available_at = row.get("debt_to_assets_data_available_timestamp")
+    if isinstance(available_at, str):
+        try:
+            available_at = datetime.fromisoformat(available_at)
+        except ValueError:
+            return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_AVAILABILITY_TIMESTAMP_INVALID")
+    if not isinstance(available_at, datetime):
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_AVAILABILITY_TIMESTAMP_MISSING")
+    if available_at.tzinfo is None or available_at.utcoffset() is None:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_AVAILABILITY_TIMEZONE_MISSING")
+    signal_close = datetime.combine(
+        signal_day, time(15, 0), tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+    if available_at.astimezone(ZoneInfo("Asia/Shanghai")) >= signal_close:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_NOT_AVAILABLE_BY_SIGNAL_CLOSE")
+
+    report_day = row.get("debt_to_assets_report_date")
+    if isinstance(report_day, datetime):
+        report_day = report_day.date()
+    elif not isinstance(report_day, date):
+        try:
+            report_day = date.fromisoformat(str(report_day)[:10])
+        except (TypeError, ValueError):
+            return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_REPORT_DATE_MISSING")
+    if report_day > signal_day:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_REPORT_DATE_AFTER_SIGNAL")
+
+    vintage = str(row.get("debt_to_assets_vintage_quality") or "").strip().upper()
+    if vintage == "SOURCE_ANNOUNCEMENT_ASSUMED":
+        evidence_reason = "PIT_SOURCE_ANNOUNCEMENT_ASSUMED"
+    elif vintage == "WAREHOUSE_OBSERVED_ONLY":
+        observed_at = row.get("debt_to_assets_source_observed_at")
+        if isinstance(observed_at, str):
+            try:
+                observed_at = datetime.fromisoformat(observed_at)
+            except ValueError:
+                return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_SOURCE_OBSERVED_TIMESTAMP_INVALID")
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo is None:
+            return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_SOURCE_OBSERVED_TIMESTAMP_MISSING")
+        if observed_at.astimezone(ZoneInfo("Asia/Shanghai")) >= signal_close:
+            return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_SOURCE_NOT_OBSERVED_BY_SIGNAL_CLOSE")
+        evidence_reason = "PIT_WAREHOUSE_OBSERVED"
+    else:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_PIT_EVIDENCE_UNSUPPORTED")
+
+    value = _finite(row.get("debt_to_assets"))
+    if value is None:
+        return FactorValue(spec.name, None, "MISSING", "DEBT_TO_ASSETS_VALUE_MISSING_OR_NONFINITE")
+    if value < 0:
+        return FactorValue(spec.name, None, "INVALID", "DEBT_TO_ASSETS_MUST_BE_NONNEGATIVE")
+    return FactorValue(spec.name, value, "VALID", evidence_reason)
 
 
 def _price_coordinate_failure(row: Mapping[str, Any]) -> str | None:
@@ -147,12 +278,16 @@ def _raw_value(spec: FactorSpec, row: Mapping[str, Any]) -> FactorValue:
 
     if spec.name in {"roe_ttm", "revenue_growth_yoy", "profit_growth_yoy"}:
         return _financial_factor_value(spec, row)
+    if spec.name == "debt_to_assets":
+        return _debt_to_assets_value(spec, row)
 
-    if spec.name in {"return_20d", "return_60d", "close_vs_ma60"}:
-        if _price_coordinate_failure(row) is not None:
-            return FactorValue(
-                spec.name, None, "INVALID", "PRICE_COORDINATE_NOT_SUPPORTED",
-            )
+    if (
+        spec.name in {"return_20d", "return_60d", "close_vs_ma60"}
+        and _price_coordinate_failure(row) is not None
+    ):
+        return FactorValue(
+            spec.name, None, "INVALID", "PRICE_COORDINATE_NOT_SUPPORTED",
+        )
 
     field = "adj_close_base" if spec.name == "close_vs_ma60" else spec.name
     if spec.name == "close_vs_ma60":

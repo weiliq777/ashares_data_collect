@@ -38,9 +38,13 @@ from data_collect.backtest.dataset_composition import (
     validate_component_coverage,
 )
 from data_collect.jobs.research_snapshot import (
+    FOUNDATION_FEATURE_CONTRACT,
     FOUNDATION_SCHEMA_VERSION,
     SCHEMA_VERSION as RESEARCH_SCHEMA_VERSION,
     _sha256_file,
+)
+from data_collect.data_access.corporate_action_evidence import (
+    quality_report_has_current_ex_date_evidence,
 )
 from data_collect.ops.market_coverage import assert_market_coverage_range_publishable
 from data_collect.data_access import DataAccessKernel, RunContext
@@ -58,10 +62,11 @@ from data_collect.data_access.research_contract import (
 
 SCHEMA_VERSION = "backtest-dataset-v2"
 ADAPTER_VERSION = "research-to-backtest-v2"
-FEATURE_VERSION = "research-foundation-features-v3"
-SUPPORTED_RESEARCH_SCHEMA_VERSIONS = frozenset(
-    {RESEARCH_SCHEMA_VERSION, FOUNDATION_SCHEMA_VERSION, STRATEGY_NEUTRAL_SCHEMA_VERSION}
-)
+FEATURE_VERSION = "research-foundation-features-v4"
+SUPPORTED_RESEARCH_SCHEMA_VERSIONS = frozenset({
+    RESEARCH_SCHEMA_VERSION, FOUNDATION_SCHEMA_VERSION,
+    STRATEGY_NEUTRAL_SCHEMA_VERSION, "research-v2.2",
+})
 HASH_ALGORITHM = "sha256"
 MARKET_COVERAGE_POLICY = "validated_baseline_quality_report_equivalent_for_dates_without_gate"
 FOUNDATION_CONTRACT_BATCH_SIZE = 10
@@ -172,6 +177,53 @@ def _format_foundation_contract_failure(
     )
 
 
+def _assert_single_research_schema(schema_versions: Iterable[str]) -> str:
+    declared_versions = [str(value or "").strip() for value in schema_versions]
+    if not declared_versions or any(not value for value in declared_versions):
+        raise ValueError(
+            "Every Research Snapshot must declare a schema version"
+        )
+    versions = set(declared_versions)
+    if len(versions) != 1:
+        raise ValueError(
+            "Dataset requires exactly one Research Snapshot schema version; "
+            f"actual={sorted(versions)}"
+        )
+    schema_version = next(iter(versions))
+    if schema_version not in SUPPORTED_RESEARCH_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"Research Snapshot schema_version 不兼容: {schema_version!r}"
+        )
+    return schema_version
+
+
+def _assert_dataset_snapshot_identity(
+    rows: Sequence[dict[str, Any]],
+    baseline_tag: str,
+    baseline: dict[str, Any],
+) -> str:
+    """Require one Snapshot schema and one exact validated-baseline identity."""
+    if not rows:
+        raise ValueError("Dataset 至少需要一个 Research Snapshot")
+    schema_version = _assert_single_research_schema(
+        row.get("schema_version") for row in rows
+    )
+    for row in rows:
+        if row.get("data_baseline_tag") != baseline_tag:
+            raise ValueError(
+                "Dataset 基线必须与所有 Research Snapshot 的 data_baseline_tag 一致"
+            )
+        if row.get("baseline_quality_report_hash") != baseline.get("quality_report_hash"):
+            raise ValueError(
+                "Research Snapshot 绑定的基线质量哈希与 Dataset 基线不一致"
+            )
+        if row.get("baseline_source_manifest_hash") != baseline.get("source_manifest_hash"):
+            raise ValueError(
+                "Research Snapshot 绑定的 Raw 来源边界与 Dataset 基线不一致"
+            )
+    return schema_version
+
+
 def _foundation_contract_audit_is_present(manifest: dict[str, Any]) -> bool:
     """Return whether a Dataset validation recorded the Foundation gate.
 
@@ -213,7 +265,12 @@ SELECTED_COLUMNS = {
         "roe_5y_min", "roe_5y_all_above_15", "ocf_report_count_3y",
         "ocf_positive_years_3y", "ocf_3y_all_positive", "quarterly_report_count_4q",
         "q_sales_yoy_above_30_quarters_4q", "q_sales_yoy_4q_all_above_30",
-        "debt_to_assets",
+        "debt_to_assets", "debt_to_assets_quality_status",
+        "debt_to_assets_quality_reason", "debt_to_assets_data_available_timestamp",
+        "debt_to_assets_source_observed_at", "debt_to_assets_vintage_quality",
+        "debt_to_assets_source_quality_status", "debt_to_assets_source_record_key",
+        "debt_to_assets_source_record_version", "debt_to_assets_source_payload_hash",
+        "debt_to_assets_feature_contract_version", "debt_to_assets_report_date",
         "financial_feature_contract_version", "financial_data_available_timestamp",
         "net_profit_consolidated_ttm", "net_profit_parent_ttm",
         "operating_cashflow_ttm", "ocf_to_net_profit_consolidated_ttm",
@@ -222,6 +279,12 @@ SELECTED_COLUMNS = {
         "roe_quality_status", "growth_quality_status", "ttm_complete",
         "dv_ttm", "dv_ttm_percentile_5y", "dv_observation_days",
         "dv_window_complete", "financial_component_lineage",
+        "debt_to_assets_quality_status", "debt_to_assets_quality_reason",
+        "debt_to_assets_data_available_timestamp", "debt_to_assets_source_observed_at",
+        "debt_to_assets_vintage_quality", "debt_to_assets_source_quality_status",
+        "debt_to_assets_source_record_key", "debt_to_assets_source_record_version",
+        "debt_to_assets_source_payload_hash", "debt_to_assets_feature_contract_version",
+        "debt_to_assets_report_date",
         "financial_source_fingerprint",
     ],
     "execution": [
@@ -419,6 +482,16 @@ def _check_baseline(
         kernel.close()
     if not row or row["status"] != "validated":
         raise ValueError(f"数据基线不存在或未 validated: {baseline_tag}")
+    if (
+        row.get("schema_version") == FOUNDATION_FEATURE_CONTRACT
+        and not quality_report_has_current_ex_date_evidence(
+            row.get("quality_report")
+        )
+    ):
+        raise ValueError(
+            "Foundation 数据基线缺少当前版本、完整的除权日范围审计；"
+            f"必须重新验证 Release 后才能创建 Dataset: {baseline_tag}"
+        )
     if row["baseline_cutoff_date"] < evaluation_end:
         raise ValueError(f"数据基线截止日 {row['baseline_cutoff_date']} 早于回测结束日 {evaluation_end}")
     actual_quality_report_hash = str(row["quality_report_hash"]).strip() if row["quality_report_hash"] else ""
@@ -573,16 +646,9 @@ def create_dataset(
             raise ValueError(f"Dataset 缺少 {len(missing)} 个交易日 Snapshot，首日={missing[0]}")
         if any(row["status"] != "FROZEN" for row in rows):
             raise ValueError("Backtest Dataset 只能引用 FROZEN Research Snapshot")
-        schema_versions = {row["schema_version"] for row in rows}
-        if not schema_versions <= SUPPORTED_RESEARCH_SCHEMA_VERSIONS:
-            raise ValueError(f"Research Snapshot schema_version 不兼容: {sorted(schema_versions)}")
-        if len(schema_versions) > 1 and not all(
-            is_foundation_schema(version) for version in schema_versions
-        ):
-            raise ValueError(
-                "Dataset 只能混合 Foundation Research Snapshot schema；"
-                f"实际={sorted(schema_versions)}"
-            )
+        schema_version = _assert_dataset_snapshot_identity(
+            rows, baseline_tag, baseline,
+        )
         foundation_contract_issues = _foundation_contract_issues(
             rows, repository, context,
         )
@@ -590,19 +656,11 @@ def create_dataset(
             raise RuntimeError(
                 _format_foundation_contract_failure(foundation_contract_issues)
             )
-        if any(row["data_baseline_tag"] != baseline_tag for row in rows):
-            raise ValueError("Dataset 基线必须与所有 Research Snapshot 的 data_baseline_tag 一致")
-        if any(row["baseline_quality_report_hash"] != baseline["quality_report_hash"] for row in rows):
-            raise ValueError("Research Snapshot 绑定的基线质量哈希与 Dataset 基线不一致")
-        if any(row["baseline_source_manifest_hash"] != baseline["source_manifest_hash"] for row in rows):
-            raise ValueError("Research Snapshot 绑定的 Raw 来源边界与 Dataset 基线不一致")
         if not any(evaluation_start <= day <= evaluation_end for day in dates):
             raise ValueError("没有覆盖 evaluation 区间的 Research Snapshot")
         availability_rules = dict(AVAILABILITY_RULES)
-        availability_rules["research_snapshot_schema_versions"] = sorted(schema_versions)
-        availability_rules["research_snapshot_schema_policy"] = (
-            "same_schema_or_mixed_foundation_schema_versions"
-        )
+        availability_rules["research_snapshot_schema_versions"] = [schema_version]
+        availability_rules["research_snapshot_schema_policy"] = "single_schema_version_per_materialized_dataset"
         manifest = {
             "dataset_id": dataset_id, "dataset_version": dataset_version, "dataset_name": dataset_name,
             "data_baseline_tag": baseline_tag, "baseline_quality_report_hash": baseline["quality_report_hash"],
@@ -1340,10 +1398,15 @@ def _validate_dataset_unlocked(dataset_id: str) -> dict[str, Any]:
         contract_schemas = {
             str(row["research_schema_version"]) for row in contract_rows
         }
+        try:
+            _assert_single_research_schema(contract_schemas)
+        except ValueError as exc:
+            issues.append(str(exc))
         foundation_contract_quality = {
             "status": (
                 "PASS"
                 if contract_rows
+                and len(contract_schemas) == 1
                 and all(is_foundation_schema(schema) for schema in contract_schemas)
                 and not foundation_contract_issues
                 else "NOT_APPLICABLE"
@@ -1495,6 +1558,7 @@ def freeze_dataset(
             contract_schemas = {
                 str(row["research_schema_version"]) for row in contract_rows
             }
+            _assert_single_research_schema(contract_schemas)
             if contract_rows and all(is_foundation_schema(schema) for schema in contract_schemas):
                 if not _foundation_contract_audit_is_present(manifest):
                     raise RuntimeError(

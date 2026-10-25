@@ -1,17 +1,24 @@
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from data_collect.jobs.backtest_dataset import (
     FEATURE_VERSION,
     SUPPORTED_RESEARCH_SCHEMA_VERSIONS,
+    _assert_dataset_snapshot_identity,
     _assert_build_code_current,
     _foundation_contract_audit_is_present,
     _foundation_contract_issues,
+    _check_baseline,
     missing_snapshot_dates,
 )
 from data_collect.jobs.backtest_run import _scenario_id_for_capital
 from data_collect.jobs.research_snapshot import FOUNDATION_SCHEMA_VERSION, SCHEMA_VERSION
-from data_collect.data_access.research_contract import STRATEGY_NEUTRAL_SCHEMA_VERSION
+from data_collect.data_access.research_contract import (
+    INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION,
+    STRATEGY_NEUTRAL_SCHEMA_VERSION,
+)
 
 
 def test_backtest_scenario_identity_tracks_initial_capital():
@@ -161,6 +168,7 @@ def test_dataset_accepts_current_and_foundation_research_contracts():
         SCHEMA_VERSION,
         FOUNDATION_SCHEMA_VERSION,
         STRATEGY_NEUTRAL_SCHEMA_VERSION,
+        INDEPENDENT_FINANCIAL_FACTOR_SCHEMA_VERSION,
     }
     source = Path("data_collect/jobs/backtest_dataset.py").read_text(encoding="utf-8")
     assert "financial_data_available_timestamp" in source
@@ -168,6 +176,89 @@ def test_dataset_accepts_current_and_foundation_research_contracts():
     assert "ocf_to_net_profit_consolidated_ttm" in source
     assert "financial_source_fingerprint" in source
     assert len(FEATURE_VERSION) <= 80
+
+
+def test_materialized_dataset_requires_one_snapshot_schema_and_exact_baseline():
+    baseline = {
+        "quality_report_hash": "quality-hash",
+        "source_manifest_hash": "source-hash",
+    }
+    rows = [
+        {
+            "schema_version": "research-v2.1",
+            "data_baseline_tag": "foundation_v2_20260821",
+            "baseline_quality_report_hash": "quality-hash",
+            "baseline_source_manifest_hash": "source-hash",
+        },
+        {
+            "schema_version": "research-v2.1",
+            "data_baseline_tag": "foundation_v2_20260821",
+            "baseline_quality_report_hash": "quality-hash",
+            "baseline_source_manifest_hash": "source-hash",
+        },
+    ]
+
+    assert _assert_dataset_snapshot_identity(
+        rows, "foundation_v2_20260821", baseline,
+    ) == "research-v2.1"
+
+    with pytest.raises(ValueError, match="exactly one Research Snapshot schema"):
+        _assert_dataset_snapshot_identity(
+            [rows[0], {**rows[1], "schema_version": "research-v2.0"}],
+            "foundation_v2_20260821",
+            baseline,
+        )
+    with pytest.raises(ValueError, match="Every Research Snapshot"):
+        _assert_dataset_snapshot_identity(
+            [rows[0], {**rows[1], "schema_version": None}],
+            "foundation_v2_20260821",
+            baseline,
+        )
+    with pytest.raises(ValueError, match="data_baseline_tag"):
+        _assert_dataset_snapshot_identity(
+            [rows[0], {**rows[1], "data_baseline_tag": "other-baseline"}],
+            "foundation_v2_20260821",
+            baseline,
+        )
+    with pytest.raises(ValueError, match="质量哈希"):
+        _assert_dataset_snapshot_identity(
+            [rows[0], {**rows[1], "baseline_quality_report_hash": "other-hash"}],
+            "foundation_v2_20260821",
+            baseline,
+        )
+    with pytest.raises(ValueError, match="Raw 来源边界"):
+        _assert_dataset_snapshot_identity(
+            [rows[0], {**rows[1], "baseline_source_manifest_hash": "other-hash"}],
+            "foundation_v2_20260821",
+            baseline,
+        )
+
+
+def test_new_foundation_dataset_rejects_release_without_current_corporate_action_evidence(
+    monkeypatch,
+):
+    from data_collect.jobs import backtest_dataset
+
+    class FakeKernel:
+        def close(self):
+            pass
+
+    class FakeRepository:
+        def baseline(self, baseline_tag, context):
+            return {
+                "status": "validated",
+                "schema_version": "feature-contract-v2.0",
+                "quality_report": {"failures": {}},
+            }
+
+    monkeypatch.setattr(
+        backtest_dataset,
+        "_read_service",
+        lambda label: (FakeKernel(), FakeRepository(), object()),
+    )
+
+    with pytest.raises(ValueError, match="当前版本、完整的除权日范围审计"):
+        _check_baseline("foundation", date(2026, 8, 21))
 
 
 def test_dataset_foundation_gate_is_bounded_and_ignores_legacy_schema(monkeypatch):

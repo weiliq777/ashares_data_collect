@@ -17,8 +17,10 @@ from data_collect.jobs.tushare_foundation_features import (
     DEFAULT_FEATURE_BATCH_STOCKS,
     create_run,
     create_smoke_target,
+    create_debt_to_assets_smoke_target,
     create_valuation_smoke_target,
     rebuild_company_financial_v2,
+    rebuild_debt_to_assets_features,
     rebuild_valuation_features,
 )
 from data_collect.jobs.tushare_foundation_quality import inspect_foundation_v2
@@ -59,6 +61,8 @@ def assert_migration_applied() -> None:
         ("std", "valuation_daily", "dv_ttm_vendor"),
         ("feature", "valuation_daily_v1", "dv_ttm_percentile_5y"),
         ("feature", "company_financial_v2", "feature_contract_version"),
+        ("feature", "debt_to_assets_v1", "source_fingerprint"),
+        ("research", "stock_snapshot_daily", "debt_to_assets_quality_status"),
         ("ops", "foundation_rebuild_run", "run_id"),
     }
     kernel, repository, context = _pipeline_access()
@@ -235,14 +239,18 @@ def run_smoke(output_end: date | None = None) -> dict:
         try:
             standard = _standard_partition(run_id, codes, output_end, include_valuation=True)
             company_target = create_smoke_target(run_id)
+            debt_target = create_debt_to_assets_smoke_target(run_id)
             valuation_target = create_valuation_smoke_target(run_id)
             company = rebuild_company_financial_v2(run_id, WARMUP_START, OUTPUT_START, output_end, codes, company_target, 5)
+            debt_to_assets = rebuild_debt_to_assets_features(
+                run_id, OUTPUT_START, output_end, codes, debt_target, 5,
+            )
             valuation = rebuild_valuation_features(run_id, WARMUP_START, OUTPUT_START, output_end, codes, valuation_target)
             quality = inspect_foundation_v2(max(OUTPUT_START, output_end - timedelta(days=730)), output_end, codes, company_target, valuation_target)
             if not quality["passed"]:
                 raise RuntimeError(f"foundation smoke quality failed: {quality['failures']}")
             _mark_run(run_id, "VALIDATED")
-            return {"run_id": run_id, "codes": codes, "output_end": output_end.isoformat(), "company_target": company_target, "valuation_target": valuation_target, "standard": standard, "company": company, "valuation": valuation, "quality": quality}
+            return {"run_id": run_id, "codes": codes, "output_end": output_end.isoformat(), "company_target": company_target, "debt_to_assets_target": debt_target, "valuation_target": valuation_target, "standard": standard, "company": company, "debt_to_assets": debt_to_assets, "valuation": valuation, "quality": quality}
         except Exception as exc:
             _mark_run(run_id, "FAILED", str(exc)[:2000])
             raise
@@ -302,12 +310,17 @@ def run_production_derived(
                 "reason": "warmup is read-only input, not published output",
             }
             company = rebuild_company_financial_v2(run_id, WARMUP_START, OUTPUT_START, output_end, target_table="feature.company_financial_v2", batch_stocks=batch_stocks)
+            debt_to_assets = rebuild_debt_to_assets_features(
+                run_id, OUTPUT_START, output_end,
+                target_table="feature.debt_to_assets_v1",
+                batch_stocks=batch_stocks,
+            )
             valuation = rebuild_valuation_features(run_id, WARMUP_START, OUTPUT_START, output_end, target_table="feature.valuation_daily_v1")
             quality = inspect_foundation_v2(OUTPUT_START, output_end, None, "feature.company_financial_v2", "feature.valuation_daily_v1")
             if not quality["passed"]:
                 raise RuntimeError(f"production foundation quality failed: {quality['failures']}")
             _mark_run(run_id, "VALIDATED")
-            return {"run_id": run_id, "standard_partitions": len(standard), "valuation_standard": valuation_standard, "warmup": warmup, "company": company, "valuation": valuation, "quality": quality}
+            return {"run_id": run_id, "standard_partitions": len(standard), "valuation_standard": valuation_standard, "warmup": warmup, "company": company, "debt_to_assets": debt_to_assets, "valuation": valuation, "quality": quality}
         except Exception as exc:
             _mark_run(run_id, "FAILED", str(exc)[:2000])
             raise

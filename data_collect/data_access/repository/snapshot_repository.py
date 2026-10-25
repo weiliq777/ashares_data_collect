@@ -53,16 +53,31 @@ class SnapshotRepository(BaseRepository):
             raise ValueError(f"unknown Research Snapshot: {snapshot_id}")
         return rows[0]
 
-    def read_frozen_rows(self, snapshot_id: str, context: RunContext, limit: int = 100_000) -> list[dict[str, Any]]:
+    def read_frozen_rows(
+        self,
+        snapshot_id: str,
+        context: RunContext,
+        limit: int = 100_000,
+        *,
+        codes: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        selected_codes = tuple(sorted({str(code) for code in (codes or ()) if str(code)}))
+        code_filter = " AND ts_code=ANY(%s)" if selected_codes else ""
+        params: tuple[Any, ...] = (snapshot_id,)
+        if selected_codes:
+            params += (list(selected_codes),)
         return self.kernel.read._repository_query(
             context=context,
             source="research.stock_snapshot_daily",
             sql="""
                 SELECT * FROM research.stock_snapshot_daily
                  WHERE snapshot_id=%s
+            """ + code_filter + """
                  ORDER BY research_date, ts_code
             """,
-            params=(snapshot_id,), scope=WorkScope(partition=str(snapshot_id)), max_rows=limit,
+            params=params,
+            scope=WorkScope(partition=str(snapshot_id), codes=selected_codes or None),
+            max_rows=limit,
         )
 
     def publish_rows(self, target: str, rows: Iterable[dict[str, Any]], snapshot_id: str, context: RunContext) -> int:
